@@ -297,13 +297,16 @@ def test_concurrency_budget_bounds_worker_count_without_serializing_every_read(s
 
 def test_wait_deadline_includes_time_in_admission_queue(store, monkeypatch):
     sid = store.create_session()["id"]
-    _, release, calls = block_execute(monkeypatch)
+    started, release, calls = block_execute(monkeypatch)
 
     async def scenario():
         harness = ToolHarness(store, timeout_seconds=0.03, max_concurrency=1)
         try:
             first = await harness.run(sid, "get_dealership_info", {}, "occupies-worker")
             assert first["error"] == "operation_pending"
+            # Admission can outlast the short caller deadline on a busy host.
+            # Establish worker occupancy before testing the next request's wait.
+            assert await asyncio.to_thread(started.wait, 2)
             queued = await asyncio.wait_for(
                 harness.run(sid, "get_dealership_info", {}, "queued-read"), timeout=0.5,
             )
