@@ -1,0 +1,41 @@
+# Standalone companion. No voice-service restart or public port is needed.
+name: servicevoice-call-evaluations
+services:
+  call-evaluator:
+    image: servicevoice-call-evaluator:live-v1
+    build:
+      context: ../..
+      dockerfile: deploy/lightsail/Dockerfile.evaluator
+      args:
+        SERVICEVOICE_BASE_IMAGE: ${SERVICEVOICE_BASE_IMAGE:-servicevoice-app:lightsail}
+    env_file:
+      - path: ${SERVICEVOICE_EVAL_ENV_FILE:-/etc/servicevoice/evaluation.env}
+        format: raw
+    environment:
+      SERVICEVOICE_EVAL_SOURCE_DB: /evidence/servicevoice.sqlite3
+      SERVICEVOICE_EVAL_OUTBOX: /evaluations/outbox.sqlite3
+      SERVICEVOICE_EVAL_PROJECT: servicevoice-live-calls
+      SERVICEVOICE_ENVIRONMENT: production
+    volumes:
+      - evaluation-evidence:/evidence:ro
+      - evaluation-data:/evaluations
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 48
+    mem_limit: 256m
+    cpus: 0.25
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "2"}
+volumes:
+  evaluation-evidence:
+    external: true
+    name: servicevoice-lightsail_application-data
+  evaluation-data:

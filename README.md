@@ -90,3 +90,64 @@ The Linux-specific deployment package tests run in a separate GitHub Actions job
 | `integrations/` | Vapi setup, optional advisor MCP and isolated telephony lab |
 
 This public repository contains a clean source snapshot. Credentials, customer/caller records, audio, private experiment URLs, deployment archives and local operational history are excluded. Third-party browser dependencies retain their own licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Automatic live-call reviews
+
+The optional post-call worker reviews completed calls automatically and sends
+private scores and voice timing to the `servicevoice-live-calls` LangSmith
+project. It runs separately from voice generation and mounts the scheduler
+volume read-only. The voice process receives no evaluation Vapi API key.
+
+It checks factual grounding, action truthfulness, caller intent versus saved
+booking details, confirmation order and explicit assent, literal reference
+consistency, and available Vapi turn/stage latency. Deterministic checks cannot
+prove human consent; semantic grades are advisory. Missing evidence is uncertain
+with a null score, never a pass. Calls without measured response turns do not
+receive zero-millisecond latency. No prompts, transcripts, customer details,
+tool arguments, raw judge prose or provider signatures are exported to LangSmith.
+The Gemini reviewer receives minimised text evidence; this redaction is not a
+general DLP guarantee.
+
+For Lightsail, copy `deploy/lightsail/evaluation.env.example` to a private,
+owner-only `/etc/servicevoice/evaluation.env`, fill existing provider credentials,
+and set the exact assistant UUID. The separate companion can reuse the locked
+`servicevoice-app:lightsail` image already deployed:
+
+```bash
+docker compose -f deploy/lightsail/compose.evaluations.yaml build
+docker compose -f deploy/lightsail/compose.evaluations.yaml up -d --no-build
+```
+
+This compose file assumes the existing `servicevoice-lightsail_application-data`
+volume and `/data/servicevoice.sqlite3` database. Review those paths before using
+it on another deployment or after a restore. It adds no public port and needs no
+voice-server restart. Retain its separate evaluation-data volume: it holds the
+durable queue, cached reviews, leases and model-attempt allowance. Restarting or
+retrying an upload does not repeat an already cached model judgment.
+
+For an explicit local worker, configure a private environment file with
+`SERVICEVOICE_EVAL_SOURCE_DB`, `SERVICEVOICE_EVAL_OUTBOX`, the existing Vapi,
+Gemini and LangSmith keys, workspace UUID and `VAPI_EVAL_ASSISTANT_ID`, then run:
+
+```powershell
+python -m app.live_evaluations --env-file PATH_TO_PRIVATE_ENV
+```
+
+Only the selected assistant and locally bound calls are eligible. Provider
+reconciliation also catches calls ending before backend binding; these cannot
+claim verified booking outcomes. Full call-list time windows are partitioned
+rather than assuming API sort order. Unavailable provider records are excluded,
+not counted as successes. Reviews normally follow hang-up by about one or two
+minutes; provider outages and queued calls can take longer.
+
+In LangSmith, inspect `voice.call.review` with the current
+`live-call-review-v2` tag. `voice.review.coverage` records immutable worker-status
+snapshots. v1 records are retained as earlier revisions; the v2 latency correction
+reuses frozen semantic grades without another model request. The separate
+reference datasets/experiments remain offline regression evaluations.
+
+The default allowance is 200 post-call model attempts per UTC month per worker,
+including failed attempts, and at most three attempts per call. Budget exhaustion
+produces a visible uncertain semantic review. Feedback explicitly avoids
+requesting extended trace retention; this is not a guarantee about account-wide
+billing. These checks do not establish audio accuracy or zero hallucinations.
