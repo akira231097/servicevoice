@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#173d38">
+  <meta name="description" content="Local advisor request review for the fictional Cedar Service interview demo.">
+  <title>ServiceVoice · Local advisor inbox</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23173d38'/%3E%3Cpath d='M11 17v6m6-12v18m6-15v12m6-9v6' stroke='%23a7e3cb' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/advisor.css">
+  <script type="module" src="/static/advisor.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#inbox">Skip to advisor requests</a>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="/">Service<span>Voice</span><small>THE AUTOMOTIVE SERVICE DESK</small></a><a class="back-link" href="/">← Service desk</a></div></header>
+  <main class="workspace">
+    <section class="intro"><div><p class="eyebrow">CEDAR SERVICE · LOCAL OPERATIONS</p><h1>A next step someone can finish.</h1><p class="intro-copy">Review saved advisor requests with the caller’s available context.</p></div><span class="local-badge">LOCAL DEMO INBOX</span></section>
+    <aside class="boundary-note"><strong>Review status stays local.</strong> This inbox does not contact anyone, transfer a call, or schedule a callback. Resolving a request records your review; it does not change an appointment.</aside>
+    <p id="connection-status" class="connection-status" role="status">Opening the local inbox…</p>
+    <div class="inbox-layout" id="inbox">
+      <section class="card queue-panel" aria-labelledby="queue-title">
+        <div class="panel-heading"><div><p class="eyebrow">SAVED REQUESTS</p><h2 id="queue-title">Advisor inbox</h2></div><button id="refresh-list" class="button secondary" type="button" disabled>Refresh list</button></div>
+        <div class="filter-row"><label for="status-filter">Status</label><select id="status-filter" disabled><option value="open">Open</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option><option value="all">All requests</option></select></div>
+        <p id="list-error" class="error-message" role="alert" hidden></p>
+        <p id="list-status" class="muted" role="status">Loading requests…</p>
+        <div id="case-list" class="case-list" aria-label="Saved advisor requests"></div>
+        <nav class="pagination" aria-label="Request pages"><button id="previous-page" class="button secondary" type="button" disabled>← Previous</button><span id="page-label">Page 1</span><button id="next-page" class="button secondary" type="button" disabled>Next →</button></nav>
+      </section>
+      <section class="card detail-panel" aria-labelledby="detail-title">
+        <div class="panel-heading"><div><p class="eyebrow">CASE REVIEW</p><h2 id="detail-title">Select a request</h2></div><button id="refresh-case" class="button secondary" type="button" hidden>Refresh case</button></div>
+        <p id="detail-status" class="muted" role="status">Choose a request to review the context and record a next step.</p>
+        <p id="detail-error" class="error-message" role="alert" hidden></p>
+        <div id="case-detail"></div>
+        <form id="review-form" class="review-form" hidden>
+          <h3>Record your review</h3>
+          <p class="muted">Your label identifies this local note. It is not a verified login or staff identity.</p>
+          <label for="operator-label">Local operator label <span aria-hidden="true">*</span></label><input id="operator-label" name="operator" maxlength="80" required autocomplete="off" placeholder="For example, Demo advisor">
+          <label for="review-note">Review note <span class="muted">— required to resolve</span></label><textarea id="review-note" name="note" rows="4" maxlength="2000" placeholder="What was reviewed, and what remains to be done?"></textarea>
+          <p id="review-warning" class="review-warning" hidden></p>
+          <div class="review-actions"><button id="mark-in-progress" class="button primary" type="button">Mark in progress</button><button id="resolve-case" class="button primary" type="button">Resolve locally</button><button id="reopen-case" class="button secondary" type="button">Reopen</button></div>
+          <p class="muted draft-note">Unsaved notes remain on this page if a save fails. Refreshing or closing the browser discards drafts.</p>
+        </form>
+      </section>
+    </div>
+    <footer>Fictional dealership · Requests are stored in the local demo database · Refresh to see another operator’s changes</footer>
+  </main>
+  <noscript><p class="error-message">Enable JavaScript to open the local advisor inbox.</p></noscript>
+</body>
+</html>

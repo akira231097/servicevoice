@@ -1,0 +1,22 @@
+{
+  "message": {
+    "type": "tool-calls",
+    "call": {
+      "id": "00000000-0000-4000-8000-000000000123",
+      "type": "webCall",
+      "assistantOverrides": {
+        "variableValues": {
+          "session_id": "REPLACE_WITH_SERVER_ISSUED_SESSION_ID",
+          "session_token": "REPLACE_WITH_SERVER_ISSUED_SESSION_CAPABILITY"
+        }
+      }
+    },
+    "toolCallList": [
+      {
+        "id": "tool-call-example-123",
+        "type": "function",
+        "function": {"name": "REPLACE_WITH_ACTUAL_TOOL_NAME", "arguments": {}}
+      }
+    ]
+  }
+}

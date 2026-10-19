@@ -1,0 +1,8 @@
+# Explicit public ACME issuance supports a static public IPv4 without buying DNS.
+# Short-lived certificates must renew automatically; retain caddy-data.
+tls {
+	issuer acme {
+		dir https://acme-v02.api.letsencrypt.org/directory
+		profile shortlived
+	}
+}

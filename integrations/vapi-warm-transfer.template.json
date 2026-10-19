@@ -1,0 +1,26 @@
+{
+  "type": "transferCall",
+  "destinations": [
+    {
+      "type": "number",
+      "number": "REPLACE_WITH_APPROVED_E164_TEST_DESTINATION",
+      "description": "Approved human service advisor test destination. Phone assistant only.",
+      "message": "I'll try to connect you with a service advisor.",
+      "transferPlan": {
+        "mode": "warm-transfer-wait-for-operator-to-speak-first-and-then-say-summary",
+        "timeout": 20,
+        "summaryPlan": {
+          "enabled": true,
+          "timeoutSeconds": 8,
+          "messages": [
+            {
+              "role": "system",
+              "content": "Brief the receiving advisor in at most three sentences. Include the caller's service need, known vehicle, confirmed appointment status, and handoff reason. Use only verified conversation facts. Distinguish requested from booked. Never invent an appointment or diagnosis."
+            },
+            {"role": "user", "content": "Conversation: {{transcript}}"}
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+name: servicevoice-local
+services:
+  servicevoice:
+    image: servicevoice-app:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["--mode", "local"]
+    environment:
+      SERVICEVOICE_DB: /data/servicevoice.sqlite3
+      SERVICEVOICE_LOCAL_PEER: ${SERVICEVOICE_LOCAL_PEER:-172.30.88.1}
+      SERVICEVOICE_TELEPHONY_ENABLED: "off"
+      SERVICEVOICE_JEV_FAQ: "off"
+      SERVICEVOICE_LANGSMITH_ENABLED: "off"
+      SERVICEVOICE_ENVIRONMENT: local
+    ports:
+      - "127.0.0.1:8875:8001"
+      - "127.0.0.1:8876:8000"
+    volumes:
+      - sandbox-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    init: true
+    restart: "no"
+    stop_grace_period: 40s
+    networks: [sandbox]
+networks:
+  sandbox:
+    # Normal dedicated bridge: Docker29 does not publish ports on internal
+    # networks. No provider credentials are supplied in this local sandbox.
+    ipam:
+      config:
+        - subnet: 172.30.88.0/24
+          gateway: 172.30.88.1
+volumes:
+  sandbox-data:

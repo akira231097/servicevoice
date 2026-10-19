@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "servicevoice-advisor": {
+      "command": "C:/path/to/servicevoice/.venv/Scripts/python.exe",
+      "args": [
+        "-B",
+        "C:/path/to/servicevoice/scripts/advisor_mcp_server.py",
+        "--db",
+        "C:/path/to/initialized/servicevoice.sqlite3"
+      ],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}

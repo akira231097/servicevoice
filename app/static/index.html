@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#132f36">
+  <meta name="description" content="ServiceVoice — an independent automotive service voice agent interview prototype.">
+  <title>ServiceVoice · Service desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23132f36'/%3E%3Cpath d='M11 17v6m6-12v18m6-15v12m6-9v6' stroke='%23a7e3cb' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#conversation">Skip to conversation</a>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="ServiceVoice home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>Service<span class="brand-light">Voice</span><small>THE AUTOMOTIVE SERVICE DESK</small></span></a>
+      <div class="header-right"><span class="prototype-label">Independent interview prototype</span><button id="reset-button" class="button button-header" type="button" disabled><span aria-hidden="true">↻</span> New session</button></div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="intro" aria-labelledby="page-title">
+      <div><p class="eyebrow"><span class="small-dot"></span> CEDAR SERVICE · FICTIONAL DEALERSHIP</p><h1 id="page-title">Good service starts<br class="mobile-break"> with a conversation.</h1><p class="intro-copy">A helpful service advisor. A clear next step. Every action visible.</p></div>
+      <div class="system-status"><span class="status-dot" id="server-dot"></span><div><strong id="server-status">Connecting to service desk</strong><span id="timezone">Loading local configuration…</span></div></div>
+    </section>
+
+    <section class="mode-bar" aria-label="Conversation mode">
+      <div class="mode-switch" role="group" aria-label="Choose a mode"><button id="rehearsal-mode" class="mode-button selected" aria-pressed="true" type="button" disabled><span aria-hidden="true">⌨</span> Rehearsal</button><button id="live-mode" class="mode-button" aria-pressed="false" type="button" disabled><svg aria-hidden="true" viewBox="0 0 20 20"><rect x="7" y="2" width="6" height="10" rx="3"/><path d="M4 9a6 6 0 0 0 12 0M10 15v3M7 18h6"/></svg> Live voice</button></div>
+      <p id="mode-description">Scripted text rehearsal · no API key needed</p><span class="mode-pill" id="mode-pill">LOCAL WORKFLOW</span>
+    </section>
+
+    <div id="notice" class="notice" role="alert" hidden><span id="notice-text"></span><button id="dismiss-notice" type="button" aria-label="Dismiss notification">×</button></div>
+
+    <div class="dashboard">
+      <aside class="journey-column" aria-label="Service journey and availability">
+        <section class="card journey-card"><div class="section-heading"><h2>Service journey</h2><span class="tiny-label">01 — 04</span></div><p class="section-description">A little structure. A natural conversation.</p><ol class="journey" id="journey"><li data-step="0"><span class="step-number">1</span><div><strong>Understand the need</strong><p>Service and preferred date</p></div></li><li data-step="1"><span class="step-number">2</span><div><strong>Find the right time</strong><p>Check actual availability</p></div></li><li data-step="2"><span class="step-number">3</span><div><strong>Review the details</strong><p>Customer, vehicle, and consent</p></div></li><li data-step="3"><span class="step-number">4</span><div><strong>Make it official</strong><p>A verified appointment result</p></div></li></ol><div class="journey-note"><span aria-hidden="true">◇</span><p>Bookings and changes need your confirmation.</p></div></section>
+        <section class="card slots-card"><div class="section-heading"><h2>Available times</h2><span class="count-pill" id="slots-count">0</span></div><p class="section-description" id="slots-description">Times appear after an availability search.</p><div id="slots" class="slot-list"><div class="empty-slot"><span class="calendar-icon" aria-hidden="true">▦</span><p>No times searched yet</p><small>Start with a service and a date.</small></div></div></section>
+        <p class="aside-footnote">Demo inventory is stored locally.<br>All times use the dealership’s timezone.</p>
+      </aside>
+
+      <section class="card conversation-card" id="conversation" aria-labelledby="conversation-title">
+        <div class="conversation-heading"><div class="advisor-avatar" aria-hidden="true"><span class="mini-wave"><i></i><i></i><i></i><i></i></span></div><div><h2 id="conversation-title">Your service advisor</h2><p id="advisor-state" role="status">Preparing your session…</p></div><span class="conversation-badge" id="conversation-badge">TEXT REHEARSAL</span></div>
+        <div class="voice-panel" id="voice-panel" hidden>
+          <div class="voice-visual" id="voice-visual" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+          <h3 id="voice-title">Meet your voice advisor</h3><p id="voice-description">Speak naturally, ask questions, and interrupt when you need to.</p>
+          <div class="voice-controls"><button class="button button-primary" id="start-voice" type="button">Start voice conversation <span aria-hidden="true">↗</span></button><button class="button button-secondary" id="mute-button" type="button" aria-pressed="false" hidden>Mute microphone</button><button class="button button-danger" id="end-button" type="button" hidden>End call</button></div>
+          <p class="voice-fineprint" id="voice-fineprint">Microphone access starts only when you choose Start. Five-minute demo limit.</p>
+          <ul class="setup-list" id="setup-list" hidden></ul>
+        </div>
+        <div class="transcript" id="transcript" role="log" aria-label="Conversation transcript" aria-live="polite" aria-relevant="additions text" tabindex="0"><div class="conversation-empty"><p>One moment. Your service desk is getting ready.</p></div></div>
+        <div class="live-caption" id="live-caption" role="status" hidden></div>
+        <div class="conversation-bottom" id="rehearsal-controls">
+          <div class="quick-prompts" id="quick-prompts" aria-label="Suggested messages"><button type="button" data-message="I need an oil change">Oil change <span aria-hidden="true">↗</span></button><button type="button" data-message="What are your hours?">Hours <span aria-hidden="true">↗</span></button><button type="button" data-message="I would like to speak with an advisor">Human advisor <span aria-hidden="true">↗</span></button></div>
+          <form id="message-form" class="composer"><label class="sr-only" for="message-input">Your message</label><textarea id="message-input" rows="1" maxlength="2000" placeholder="Tell us what your vehicle needs…" disabled></textarea><button id="send-button" class="send-button" type="submit" aria-label="Send message" disabled><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m5 12 7-7 7 7M12 5v14"/></svg></button></form>
+          <div class="composer-footer"><span id="composer-hint">Enter to send · Shift + Enter for a new line</span><button id="sample-details" type="button">Use sample details</button></div>
+        </div>
+        <div class="live-footer" id="live-footer" hidden><span class="small-dot"></span><span>Live captions from Vapi · tool results verified by the service desk</span></div>
+      </section>
+
+      <aside class="results-column" aria-label="Outcome, activity, and measurements">
+        <section class="card outcome-card"><div class="section-heading"><h2>The next step</h2><span class="tiny-label" id="outcome-label">AWAITING DETAILS</span></div><div id="outcome" class="outcome"><div class="outcome-icon" aria-hidden="true">↗</div><h3>Let’s make a plan.</h3><p>Your appointment or advisor request will appear here when it’s verified.</p></div><div class="panel-actions"><button id="refresh-result" type="button" hidden>Refresh result</button></div></section>
+        <section class="card activity-card"><div class="section-heading"><h2>Behind the conversation</h2><span class="count-pill" id="activity-count">0</span></div><p class="section-description">Real tool calls. Visible results.</p><div id="activity" class="activity-list"><div class="empty-activity"><span aria-hidden="true">⌁</span><p>No tools called yet.</p><small>The advisor’s actions will appear here.</small></div></div></section>
+        <section class="card metrics-card"><div class="section-heading"><h2>Session measures</h2><span class="tiny-label">OBSERVED</span></div><dl class="metrics-grid"><div><dt>Tool p50 / p95</dt><dd id="tool-latency">— / —<span>ms</span></dd></div><div><dt>Event gap <span title="p50/p95 browser arrival times from user speech stopped to SDK remote audio detection. Excludes endpointing and speaker playback. Not acoustic end-of-speech to first audible audio.">p50 / p95</span></dt><dd id="voice-latency">— / —<span>ms</span></dd></div><div><dt>Call duration</dt><dd id="call-duration">—</dd></div><div><dt>Interruptions</dt><dd id="interruptions">—</dd></div></dl><p class="metrics-note" id="metrics-note">Voice measures populate only during a live call. No estimated scores.</p><div class="panel-actions"><button id="export-metrics" type="button" disabled>Export timing evidence</button></div></section>
+      </aside>
+    </div>
+
+    <footer class="page-footer"><p><span class="footer-mark" aria-hidden="true">◈</span> Built for clear conversations and accountable actions.</p><a href="/advisor" target="_blank" rel="noopener" aria-label="Open local advisor inbox in a new tab">Local advisor inbox ↗</a><details id="demo-details"><summary>About this prototype</summary><div><p>Cedar Service is fictional. Rehearsal uses a scripted dialogue, with real local scheduling rules. Live voice uses Vapi when configured.</p><p>Use sample customer details for the demo. Live audio and transcripts are processed by your configured voice providers. Browser session credentials stay in memory.</p><ul id="limitations"></ul></div></details></footer>
+  </main>
+  <noscript><p class="notice">Enable JavaScript to use the service desk.</p></noscript>
+</body>
+</html>

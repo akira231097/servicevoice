@@ -1,0 +1,1230 @@
+"""Bounded Vapi -> Gemini 3.8 streaming bridge with durable tool signatures.
+
+No tool executes here. The scheduler remains the authority for effects. Raw
+request/response bodies, credentials and thought signatures are never logged.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from contextlib import closing, suppress
+from copy import deepcopy
+from dataclasses import dataclass
+import hashlib
+import json
+import secrets
+import sqlite3
+import time
+from uuid import uuid4
+
+import httpx
+from fastapi import HTTPException, Request
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
+
+from .http_boundary import read_json_body
+from .tools import DEFINITIONS, SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, TOOL_SCHEMAS, MAX_TOOL_BATCH
+from .domain import dealership_facts, today
+from .tool_observations import ObservationError, ToolObservationStore
+from .receipt_narration import BoundedSelector, NARRATOR_VERSION
+from .jev_faq import FAQ_VERSION, JevFaqRouter
+from .jev_classifier import JEV_MODEL
+from .issuance_context import user_context
+
+MODEL = "gemini-3.8-flash"
+# A low reasoning setting still spends output budget on hidden reasoning.
+# 1024 truncated a constrained scheduling turn before it could emit a tool.
+# This is a ceiling, not a target response length; voice prose stays concise.
+MAX_OUTPUT_TOKENS = 2048
+GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+TIMING_CAPACITY = 256
+EOF_DRAIN_SECONDS = 0.05
+EOF_DRAIN_BYTES = 16 * 1024
+
+
+class RequestTiming:
+    """Fixed-schema, content-free observations; never retain transport info."""
+    def __init__(self, call_id, started, sink, observer=None, correlation=None):
+        self.started, self.sink, self.finished = started, sink, False
+        self.observer,self.correlation=observer,correlation
+        self.admission_released = False
+        self.generation = None
+        self.outcome = "interrupted"
+        self.row = {
+            "request_id": uuid4().hex,
+            "call_key": hashlib.sha256(call_id.encode()).hexdigest()[:16],
+            "started_at_unix": time.time() - max(0, time.monotonic() - started),
+            "system_prompt_sha256": None,
+            "route": "gemini",
+            "narration_reason": "feature_disabled",
+            "narrator_version": NARRATOR_VERSION,
+            "source_result_sha256": None,
+            "output_text_sha256": None,
+            "output_text_source": None,
+            "jev_faq_version": FAQ_VERSION,
+            "jev_model": JEV_MODEL,
+            "jev_reason": "feature_disabled",
+            "jev_probability": None,
+            "jev_margin": None,
+            "jev_language_probability": None,
+            "outcome": None,
+            "milestones_ms": {key: None for key in (
+                "preflight", "upstream_headers", "first_upstream_event", "first_upstream_text", "first_text",
+                "first_tool_fragment", "upstream_done", "tool_emitted", "total")},
+            "durations_ms": {"tool_signature_persist": None, "upstream_eof_drain": None,
+                             "jev_route": None, "jev_classification": None, "validated_text_hold": None},
+            "usage": {key: None for key in (
+                "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens")},
+            "eof_drain_outcome": "not_attempted",
+            "counts": {key: 0 for key in (
+                "history_messages", "history_tool_results", "upstream_events", "text_chunks",
+                "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests")},
+        }
+
+    def mark(self, milestone):
+        if not self.finished and self.row["milestones_ms"][milestone] is None:
+            self.row["milestones_ms"][milestone] = round(max(0, time.monotonic() - self.started) * 1000, 3)
+
+    async def transport_event(self, event_name, _info):
+        # HTTPCore info can include requests, headers, hostnames and exceptions.
+        # Count only these two fixed event names; never inspect or save info.
+        if self.finished:
+            return
+        if event_name == "connection.connect_tcp.started":
+            self.row["counts"]["tcp_connects"] += 1
+        elif event_name == "connection.start_tls.started":
+            self.row["counts"]["tls_handshakes"] += 1
+
+    def finish(self):
+        if self.finished:
+            return
+        self.mark("total")
+        self.row["outcome"] = self.outcome
+        self.finished = True
+        self.sink.append(deepcopy(self.row))
+        if self.observer is not None:
+            try:self.observer(self.row,self.correlation)
+            except Exception:pass
+
+
+@dataclass(frozen=True)
+class GatewayLimits:
+    concurrency: int = 4
+    messages: int = 100
+    message_chars: int = 12000
+    response_bytes: int = 1024 * 1024
+    event_bytes: int = 128 * 1024
+    tool_calls: int = MAX_TOOL_BATCH
+    argument_chars: int = 8000
+    extra_chars: int = 65536
+    total_seconds: float = 30
+    cleanup_seconds: float = 1
+    supersession_seconds: float = 2
+    signature_ttl: int = 4 * 3600
+    signatures_per_call: int = 128
+    signatures_total: int = 10000
+
+
+class GatewayError(Exception):
+    """Only fixed public codes are emitted; never include provider payloads."""
+    def __init__(self, code, status=422):
+        self.code, self.status = code, status
+        super().__init__(code)
+
+
+class GenerationSuperseded(Exception):
+    """Internal control flow, never a provider-facing error."""
+
+
+class Generation:
+    def __init__(self, call_id, sequence, timing):
+        self.call_id, self.sequence, self.timing = call_id, sequence, timing
+        self.superseded, self.released = asyncio.Event(), asyncio.Event()
+        self.task = None
+        self.response = None
+        self.cleanup_task = None
+        self.disconnected = False
+        self.payload_emitted = False
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def parse_json(value):
+    try:
+        return json.loads(value, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise GatewayError("invalid_json") from exc
+
+
+def tool_identity(tool, limits):
+    if not isinstance(tool, dict):
+        raise GatewayError("invalid_tool_history")
+    tool_id, function = tool.get("id"), tool.get("function")
+    if not isinstance(tool_id, str) or not 1 <= len(tool_id) <= 200 or not isinstance(function, dict):
+        raise GatewayError("invalid_tool_history")
+    name, arguments = function.get("name"), function.get("arguments")
+    if not isinstance(name, str) or name not in DEFINITIONS or not isinstance(arguments, str) or len(arguments) > limits.argument_chars:
+        raise GatewayError("invalid_tool_history")
+    parsed = parse_json(arguments)
+    if not isinstance(parsed, dict):
+        raise GatewayError("invalid_tool_arguments")
+    digest = hashlib.sha256(canonical({"name": name, "arguments": parsed}).encode()).hexdigest()
+    return tool_id, name, arguments, digest
+
+
+def configured_tool_policy(config):
+    """Resolve only trusted local model selection, never incoming call overrides."""
+    profile = (config.get("VAPI_MODEL_PROFILE") or "").strip()
+    if not profile:
+        profile = {"": "baseline", "gpt-4.1-mini": "baseline", "gpt-6-luna": "luna"}.get((config.get("VAPI_MODEL") or "").strip())
+    if profile == "gemini-3.8-flash-custom":
+        return "gemini-issued"
+    if profile in ("baseline", "luna"):
+        return "provider-native"
+    raise GatewayError("tool_policy_configuration", 503)
+
+
+class SignatureStore:
+    def __init__(self, path, limits):
+        self.path, self.limits = str(path), limits
+        with closing(self.connect()) as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS gemini_tool_signatures (
+                provider_call_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                extras TEXT NOT NULL, group_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                group_size INTEGER NOT NULL, expires REAL NOT NULL,
+                PRIMARY KEY(provider_call_id,tool_call_id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS provider_tool_policies (
+                provider_call_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,
+                assistant_id TEXT NOT NULL, policy TEXT NOT NULL)""")
+            db.commit()
+
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=2)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def check_live(self, sid, call_id):
+        with closing(self.connect()) as db:
+            session = db.execute("SELECT ended,created,provider_call_id FROM sessions WHERE id=? AND tenant='cedar-demo'", (sid,)).fetchone()
+        if not session or session["ended"] or session["provider_call_id"] != call_id or time.time() - session["created"] > 4 * 3600:
+            raise GatewayError("inactive_session", 409)
+
+    def require_gemini_policy(self, sid, call_id):
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
+        if not row or row["policy"] != "gemini-issued":
+            raise GatewayError("gateway_policy_mismatch", 409)
+
+    def pin_call_policy(self, sid, call_id, assistant_id, config):
+        """A call cannot downgrade its policy through overrides or later config edits."""
+        def existing(db):
+            row = db.execute("SELECT * FROM provider_tool_policies WHERE provider_call_id=? OR session_id=?", (call_id, sid)).fetchone()
+            if row and (row["provider_call_id"] != call_id or row["session_id"] != sid or row["assistant_id"] != assistant_id):
+                raise GatewayError("tool_policy_binding", 403)
+            return row["policy"] if row else None
+        with closing(self.connect()) as db:
+            policy = existing(db)
+            if policy:
+                return policy  # Ordinary events and status polls take no write lock.
+            db.execute("BEGIN IMMEDIATE")
+            policy = existing(db)
+            if policy:
+                return policy
+            policy = configured_tool_policy(config)
+            db.execute("INSERT INTO provider_tool_policies VALUES (?,?,?,?)", (call_id, sid, assistant_id, policy))
+            db.commit()
+            return policy
+
+    @staticmethod
+    def _existing_exact_operation(db, sid, tool_id, name, normalized):
+        # This is recovery of already admitted work, never permission for a new
+        # effect. Compare the same normalized fingerprints as the two owners.
+        expected = hashlib.sha256(canonical({"name": name, "args": normalized}).encode()).hexdigest()
+        invocation = db.execute("SELECT fingerprint FROM tool_invocations WHERE session_id=? AND call_id=?", (sid, tool_id)).fetchone()
+        result = db.execute("SELECT fingerprint FROM tool_results WHERE session_id=? AND call_id=?", (sid, tool_id)).fetchone()
+        domain_expected = hashlib.sha256(json.dumps({"name": name, "args": normalized}, sort_keys=True).encode()).hexdigest()
+        if invocation and invocation["fingerprint"] != expected or result and result["fingerprint"] != domain_expected:
+            return False
+        return bool(invocation or result)
+
+    def authorize_tool_batch(self, sid, call_id, calls):
+        """Preflight all commands before any effect; this is NOT spoken consent.
+
+        Webhook transport authentication does not prove a tool came from our
+        gateway. A signed call may arrive individually or in a reordered batch,
+        so execution checks each identity without imposing history group order.
+        """
+        with closing(self.connect()) as db:
+            db.execute("BEGIN")
+            policy = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
+            if not policy:
+                raise GatewayError("tool_policy_missing", 403)
+            if policy["policy"] == "provider-native":
+                return
+            if policy["policy"] != "gemini-issued":
+                raise GatewayError("tool_policy_configuration", 503)
+            for tool_id, name, normalized, original in calls:
+                # Existing journal/receipts remain recoverable after signature
+                # expiry or collection. Harness replay cannot execute them anew.
+                if self._existing_exact_operation(db, sid, tool_id, name, normalized):
+                    continue
+                _, _, _, digest = tool_identity({"id": tool_id, "function": {"name": name, "arguments": canonical(original)}}, self.limits)
+                row = db.execute("SELECT fingerprint,expires FROM gemini_tool_signatures WHERE provider_call_id=? AND session_id=? AND tool_call_id=?", (call_id, sid, tool_id)).fetchone()
+                if not row or row["expires"] < time.time():
+                    raise GatewayError("tool_not_issued", 409)
+                if row["fingerprint"] != digest:
+                    raise GatewayError("tool_issue_mismatch", 409)
+
+    def save_group(self, sid, call_id, calls, context=None):
+        from .issuance_context import encode_extras
+        group_id, expires = uuid4().hex, time.time() + self.limits.signature_ttl
+        records = []
+        for index, tool in enumerate(calls):
+            tool_id, _, _, digest = tool_identity(tool, self.limits)
+            extras = tool.get("extra_content", {})
+            if not isinstance(extras, dict) or len(canonical(extras)) > self.limits.extra_chars:
+                raise GatewayError("invalid_tool_signature")
+            try:
+                stored_extras = encode_extras(extras, context)
+            except ValueError:
+                raise GatewayError("invalid_tool_signature") from None
+            records.append((call_id, tool_id, sid, digest, canonical(stored_extras), group_id, index, len(calls), expires))
+        with closing(self.connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("DELETE FROM gemini_tool_signatures WHERE expires<?", (time.time(),))
+                count = db.execute("SELECT COUNT(*) FROM gemini_tool_signatures WHERE provider_call_id=?", (call_id,)).fetchone()[0]
+                total = db.execute("SELECT COUNT(*) FROM gemini_tool_signatures").fetchone()[0]
+                if count + len(records) > self.limits.signatures_per_call or total + len(records) > self.limits.signatures_total:
+                    raise GatewayError("signature_capacity", 429)
+                for record in records:
+                    if db.execute("SELECT 1 FROM gemini_tool_signatures WHERE provider_call_id=? AND tool_call_id=?", record[:2]).fetchone():
+                        raise GatewayError("tool_id_reused", 409)
+                db.executemany("INSERT INTO gemini_tool_signatures VALUES (?,?,?,?,?,?,?,?,?)", records)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+    def restore_group(self, sid, call_id, calls, *, with_context=False):
+        from .issuance_context import decode_extras
+        if not isinstance(calls, list) or not 1 <= len(calls) <= self.limits.tool_calls:
+            raise GatewayError("invalid_tool_history")
+        restored, group, ordinals, contexts = [], None, [], []
+        with closing(self.connect()) as db:
+            for tool in calls:
+                tool_id, name, arguments, digest = tool_identity(tool, self.limits)
+                row = db.execute("SELECT * FROM gemini_tool_signatures WHERE provider_call_id=? AND tool_call_id=? AND session_id=?", (call_id, tool_id, sid)).fetchone()
+                if not row or row["expires"] < time.time():
+                    raise GatewayError("tool_signature_missing", 409)
+                if row["fingerprint"] != digest:
+                    raise GatewayError("tool_signature_mismatch", 409)
+                try:
+                    extras, context = decode_extras(parse_json(row["extras"]))
+                except ValueError:
+                    raise GatewayError("invalid_tool_signature", 409) from None
+                supplied = tool.get("extra_content")
+                if supplied is not None and canonical(supplied) != canonical(extras):
+                    raise GatewayError("tool_signature_mismatch", 409)
+                if group is not None and row["group_id"] != group or row["group_size"] != len(calls):
+                    raise GatewayError("tool_group_mismatch", 409)
+                group = row["group_id"]
+                ordinals.append(row["ordinal"])
+                contexts.append(context)
+                value = {"id": tool_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+                if extras:
+                    value["extra_content"] = extras
+                restored.append(value)
+        if ordinals != list(range(len(calls))):
+            raise GatewayError("tool_group_mismatch", 409)
+        if any(context != contexts[0] for context in contexts):
+            raise GatewayError("tool_group_context_mismatch", 409)
+        return (restored, contexts[0]) if with_context else restored
+
+
+def tool_definitions(requested):
+    if not isinstance(requested, list) or len(requested) > len(DEFINITIONS):
+        raise GatewayError("invalid_tools")
+    names = []
+    for entry in requested:
+        if not isinstance(entry, dict) or entry.get("type") != "function" or not isinstance(entry.get("function"), dict):
+            raise GatewayError("invalid_tools")
+        name = entry["function"].get("name")
+        if not isinstance(name, str) or name not in DEFINITIONS or name in names:
+            raise GatewayError("invalid_tools")
+        names.append(name)
+    # Caller-provided schemas/descriptions cannot grant a new tool or behavior.
+    return [deepcopy(schema) for schema in TOOL_SCHEMAS if schema["function"]["name"] in names]
+
+
+def render_system_prompt(local_date=None):
+    """Render one trusted system policy and fresh public facts from one date."""
+    local_date = today() if local_date is None else local_date
+    facts = dealership_facts(local_date)
+    prompt = SYSTEM_PROMPT.replace("{{current_date}}", facts["today"]).replace("{{timezone}}", facts["timezone"])
+    return prompt + "\n<trusted_dealership_facts>\n" + canonical(facts) + "\n</trusted_dealership_facts>"
+
+
+def normalize_causal_tool_history(messages, groups):
+    """Move verified late tool blocks before later user instructions.
+
+    Vapi can append an old tool/result pair after a newer caller turn. Its
+    durable server-issued anchor identifies the exact preceding user prefix.
+    Only complete, already authenticated groups enter here. Every group's
+    anchor must match, otherwise retain the original order (legacy history and
+    changed/merged ASR segments cannot be safely reconstructed).
+
+    This does not authenticate spoken assent or revoke already executed tools.
+    No text, user order, opaque provider extras or observed result is rewritten.
+    """
+    if not groups:
+        return messages
+    user_indices=[index for index,message in enumerate(messages) if message["role"]=="user"]
+    prefixes={count:user_context(messages[:index+1]) for count,index in enumerate(user_indices,1)}
+    moves,removed={},set()
+    for start,size,context in groups:
+        preceding=sum(index<start for index in user_indices)
+        if context is None or context!=prefixes.get(context["user_count"]) or context["user_count"]>preceding:
+            return messages
+        if context["user_count"]==preceding:
+            continue
+        if messages[start].get("content"):
+            # Some provider messages merge a tool call with spoken captions.
+            # The user-prefix anchor dates the command, not that prose. Do not
+            # move or drop ambiguous speech to reconstruct a command's place.
+            return messages
+        # The caller's next turn is the boundary, not an inferred timestamp or
+        # an untrusted natural-language claim about when an action happened.
+        boundary=user_indices[context["user_count"]]
+        block=messages[start:start+size+1]
+        moves.setdefault(boundary,[]).extend(block)
+        removed.update(range(start,start+size+1))
+    if not moves:
+        return messages
+    ordered=[]
+    for index,message in enumerate(messages):
+        ordered.extend(moves.get(index,[]))
+        if index not in removed:
+            ordered.append(message)
+    return ordered
+
+
+def prepare_request(body, sid, call_id, store, limits, observations):
+    if body.get("model") != MODEL or body.get("stream") is not True:
+        raise GatewayError("unsupported_model_or_stream")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not 1 <= len(messages) <= limits.messages:
+        raise GatewayError("invalid_history")
+    cleaned = [{"role": "system", "content": render_system_prompt()}]
+    waiting, used_ids, groups = set(), set(), []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
+            raise GatewayError("invalid_history")
+        role, content = message["role"], message.get("content")
+        if role == "system":
+            continue  # Provider/browser overrides never supply gateway policy.
+        if waiting and role != "tool":
+            raise GatewayError("incomplete_tool_history", 409)
+        if content is not None and (not isinstance(content, str) or len(content) > limits.message_chars):
+            raise GatewayError("invalid_history")
+        value = {"role": role, "content": content or ""}
+        if role == "assistant" and message.get("tool_calls") is not None:
+            if waiting:
+                raise GatewayError("incomplete_tool_history", 409)
+            calls, context = store.restore_group(sid, call_id, message["tool_calls"], with_context=True)
+            groups.append((len(cleaned),len(calls),context))
+            for tool in calls:
+                if tool["id"] in used_ids:
+                    raise GatewayError("repeated_tool_history", 409)
+                used_ids.add(tool["id"])
+                waiting.add(tool["id"])
+            value["tool_calls"] = calls
+        elif message.get("tool_calls") is not None:
+            raise GatewayError("invalid_tool_history")
+        if role == "tool":
+            tool_id = message.get("tool_call_id")
+            if not isinstance(tool_id, str) or tool_id not in waiting:
+                raise GatewayError("orphan_tool_result", 409)
+            waiting.remove(tool_id)
+            value["tool_call_id"] = tool_id
+            # Vapi add-message accepts tool history from the browser. A valid
+            # provider bearer does not authenticate the content of each message.
+            authoritative = observations.lookup(sid, call_id, tool_id, content)
+            value["content"] = canonical(authoritative)
+        elif waiting and role in ("system", "user"):
+            raise GatewayError("incomplete_tool_history", 409)
+        cleaned.append(value)
+    if len(cleaned) == 1:
+        raise GatewayError("invalid_history")
+    if waiting:
+        raise GatewayError("incomplete_tool_history", 409)
+    cleaned=normalize_causal_tool_history(cleaned,groups)
+    tools = tool_definitions(body.get("tools", []))
+    result = {"model": MODEL, "reasoning_effort": "low", "stream": True,
+              "stream_options": {"include_usage": True}, "messages": cleaned, "max_tokens": MAX_OUTPUT_TOKENS}
+    if tools:
+        result.update({"tools": tools, "tool_choice": "auto"})
+    return result
+
+
+def merge_extras(target, incoming):
+    if not isinstance(incoming, dict):
+        raise GatewayError("invalid_tool_signature")
+    for key, value in incoming.items():
+        if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+            merge_extras(target[key], value)
+        elif key in target and target[key] != value:
+            raise GatewayError("conflicting_tool_signature")
+        else:
+            target[key] = deepcopy(value)
+
+
+class ToolAssembler:
+    def __init__(self, limits):
+        self.limits, self.parts = limits, {}
+        self.complete_indices = set()
+
+    def _index(self, fragment):
+        if "index" in fragment:
+            index = fragment["index"]
+            if type(index) is not int or not 0 <= index < self.limits.tool_calls:
+                raise GatewayError("invalid_upstream_tools")
+            return index, False
+        # Google's compatibility stream can emit an entire identified function
+        # without an index. Never guess the target of an unidentified fragment.
+        tool_id, _, _, _ = tool_identity(fragment, self.limits)
+        matches = [index for index, item in self.parts.items() if item["id"] == tool_id]
+        if matches:
+            index = matches[0]
+            if self.parts[index]["function"] != fragment["function"]:
+                raise GatewayError("ambiguous_unindexed_tool")
+            return index, True
+        if sorted(self.parts) != list(range(len(self.parts))) or any(item["id"] is None for item in self.parts.values()):
+            raise GatewayError("ambiguous_unindexed_tool")
+        if len(self.parts) >= self.limits.tool_calls:
+            raise GatewayError("upstream_tool_limit")
+        return len(self.parts), False
+
+    def add(self, fragments):
+        if not isinstance(fragments, list):
+            raise GatewayError("invalid_upstream_tools")
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                raise GatewayError("invalid_upstream_tools")
+            index, repeated_complete = self._index(fragment)
+            item = self.parts.setdefault(index, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}, "extra_content": {}})
+            if "id" in fragment:
+                if not isinstance(fragment["id"], str) or item["id"] not in (None, fragment["id"]):
+                    raise GatewayError("invalid_upstream_tool_id")
+                item["id"] = fragment["id"]
+            if fragment.get("type", "function") != "function":
+                raise GatewayError("invalid_upstream_tools")
+            function = fragment.get("function", {})
+            if not isinstance(function, dict):
+                raise GatewayError("invalid_upstream_tools")
+            if index in self.complete_indices and not repeated_complete and any(function.get(key) for key in ("name", "arguments")):
+                raise GatewayError("ambiguous_unindexed_tool")
+            for key in ("name", "arguments"):
+                if key in function:
+                    if not isinstance(function[key], str):
+                        raise GatewayError("invalid_upstream_tools")
+                    if not repeated_complete:
+                        item["function"][key] += function[key]
+            if "index" not in fragment:
+                self.complete_indices.add(index)
+            if len(item["function"]["name"]) > 64 or len(item["function"]["arguments"]) > self.limits.argument_chars:
+                raise GatewayError("upstream_tool_size")
+            if "extra_content" in fragment:
+                merge_extras(item["extra_content"], fragment["extra_content"])
+            if len(canonical(item["extra_content"])) > self.limits.extra_chars:
+                raise GatewayError("upstream_tool_size")
+
+    def finish(self):
+        if sorted(self.parts) != list(range(len(self.parts))):
+            raise GatewayError("incomplete_upstream_tools")
+        calls = [self.parts[index] for index in sorted(self.parts)]
+        ids = set()
+        for tool in calls:
+            tool_id, _, _, _ = tool_identity(tool, self.limits)
+            if tool_id in ids:
+                raise GatewayError("duplicate_upstream_tool_id")
+            ids.add(tool_id)
+        # Gemini parallel groups sign their first call; later calls can be unsigned.
+        first_extra = calls[0].get("extra_content", {}).get("google", {}) if calls else {}
+        if not isinstance(first_extra, dict) or not isinstance(first_extra.get("thought_signature"), str) or not first_extra["thought_signature"]:
+            raise GatewayError("upstream_signature_missing")
+        return calls
+
+
+def sse(value):
+    return ("data: " + json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n\n").encode()
+
+
+async def sse_events(response, limits, transport=None):
+    transport = transport if transport is not None else {"iterator": response.aiter_bytes(), "buffer_bytes": 0, "received_bytes": 0}
+    lines, buffer, event_size, total, count = [], b"", 0, 0, 0
+    async for part in transport["iterator"]:
+        total += len(part)
+        transport["received_bytes"] = total
+        if total > limits.response_bytes:
+            raise GatewayError("upstream_response_size")
+        buffer += part
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            transport["buffer_bytes"] = len(buffer)
+            event_size += len(raw) + 1
+            if event_size > limits.event_bytes:
+                raise GatewayError("upstream_response_size")
+            try:
+                line = raw.removesuffix(b"\r").decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise GatewayError("invalid_upstream_encoding") from exc
+            if line == "":
+                if lines:
+                    count += 1
+                    if count > 2048:
+                        raise GatewayError("upstream_event_limit")
+                    yield "\n".join(lines)
+                lines, event_size = [], 0
+            elif line.startswith("data:"):
+                lines.append(line[5:].lstrip(" "))
+        if event_size + len(buffer) > limits.event_bytes:
+            raise GatewayError("upstream_response_size")
+    if lines or buffer:
+        raise GatewayError("incomplete_upstream_event")
+
+
+async def drain_sse_tail(transport, limits, timing, remaining):
+    """Optionally reach HTTP EOF after valid DONE so HTTP/1.1 can be reused.
+
+    Extra bytes are discarded, never parsed or forwarded. Failure preserves the
+    prior valid-DONE semantics and leaves cleanup to close the unreusable stream.
+    The original generation deadline still controls all subsequent work.
+    """
+    began = time.monotonic()
+    consumed = transport["buffer_bytes"]
+    outcome = "interrupted"
+    try:
+        if remaining <= 0:
+            outcome = "budget_exhausted"
+            raise TimeoutError()
+        if consumed > EOF_DRAIN_BYTES:
+            outcome = "size_limit"
+        if consumed <= EOF_DRAIN_BYTES:
+            try:
+                async with asyncio.timeout(min(EOF_DRAIN_SECONDS, remaining)):
+                    async for part in transport["iterator"]:
+                        consumed += len(part)
+                        transport["received_bytes"] += len(part)
+                        if consumed > EOF_DRAIN_BYTES or transport["received_bytes"] > limits.response_bytes:
+                            outcome = "size_limit"
+                            break
+                    else:
+                        outcome = "eof"
+            except TimeoutError:
+                outcome = "timeout"
+            except (httpx.HTTPError, OSError):
+                outcome = "read_error"
+    finally:
+        timing.row["durations_ms"]["upstream_eof_drain"] = round((time.monotonic() - began) * 1000, 3)
+        timing.row["counts"]["eof_tail_bytes"] = consumed
+        timing.row["eof_drain_outcome"] = outcome
+
+
+class GeminiGateway:
+    def __init__(self, app, config_loader, bind_call, *, client=None, limits=None):
+        self.limits = limits or GatewayLimits()
+        self.store = SignatureStore(app.state.store.path, self.limits)
+        self.observations = ToolObservationStore(app.state.store.path)
+        self.config_loader, self.bind_call = config_loader, bind_call
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5, read=15, write=5, pool=5), follow_redirects=False,
+            limits=httpx.Limits(max_connections=self.limits.concurrency,
+                               max_keepalive_connections=self.limits.concurrency, keepalive_expiry=60),
+        )
+        self.active, self.closing = set(), False
+        self.owners, self.successors, self.latest_sequences = {}, {}, {}
+        self.request_sequence = 0
+        self.admission = asyncio.Lock()
+        self.timings = deque(maxlen=TIMING_CAPACITY)
+        self.narration = BoundedSelector(app.state.store,capacity=self.limits.concurrency)
+        self.faq = JevFaqRouter(app.state.store,read_capacity=self.limits.concurrency,
+                               connection_capacity=self.limits.concurrency if self.limits.concurrency>4 else 2)
+        self.telemetry = None
+        self.timing_sink = None
+
+    def _observe_timing(self,row,sid):
+        if self.timing_sink is not None:
+            try:self.timing_sink.record(row)
+            except Exception:pass  # Diagnostics must never delay or fail a booking.
+        if self.telemetry is None:return
+        attributes={"route":row["route"],"outcome":row["outcome"],"model":MODEL,
+                    "prompt_sha256":row["system_prompt_sha256"],"prompt_version":SYSTEM_PROMPT_VERSION,
+                    "narrator_version":row["narrator_version"]}
+        for key,value in row["milestones_ms"].items():attributes[key+"_ms"]=value
+        for key,value in row["durations_ms"].items():attributes[key+"_ms"]=value
+        for key,value in row["counts"].items():attributes[key]=value
+        for key,value in row["usage"].items():
+            if type(value) is int:attributes[key]=value
+        self.telemetry.record_event("gateway.request",attributes,correlation=sid,
+            start_unix=row["started_at_unix"],duration_ms=row["milestones_ms"]["total"])
+
+    def latency_snapshot(self, call_id=None):
+        # Internal callers may inspect all rows. HTTP access must supply the
+        # call ID derived from an authorized session, never a caller query ID.
+        call_key = hashlib.sha256(call_id.encode()).hexdigest()[:16] if call_id is not None else None
+        return deepcopy([row for row in self.timings if call_key is None or row["call_key"] == call_key])
+
+    async def start(self):
+        return await self.faq.start()
+
+    async def close(self):
+        self.closing = True
+        self.faq.closing = True
+        for successor in list(self.successors.values()):
+            self._supersede(successor)
+        for owner in list(self.owners.values()):
+            self._supersede(owner)
+        try:
+            await self.client.aclose()
+        finally:
+            await self.faq.close()
+
+    def _release(self, call_id, timing=None):
+        # Event-loop-local, synchronous removal cannot be interrupted midway.
+        # The relay and response owner both clean up. An old response's second
+        # cleanup must not release a newer generation admitted for the same call.
+        if timing is not None:
+            if timing.admission_released:
+                return
+            timing.admission_released = True
+        generation = timing.generation if timing is not None else None
+        if generation is not None:
+            generation.task = None
+            generation.released.set()
+            if self.owners.get(call_id) is generation:
+                self.owners.pop(call_id, None)
+            if self.successors.get(call_id) is generation:
+                self.successors.pop(call_id, None)
+        if call_id not in self.owners and call_id not in self.successors:
+            self.active.discard(call_id)
+
+    def _supersede(self, generation):
+        if generation.superseded.is_set():
+            return
+        generation.superseded.set()
+        task = generation.task
+        if task is not None and not task.done():
+            task.cancel()
+        elif self.owners.get(generation.call_id) is generation:
+            # Covers handle -> unstarted OwnedStream, or a downstream send.
+            # No model work is running in this phase. Retain the lease until
+            # its upstream response really closes, even if cleanup is slow.
+            if generation.response is not None:
+                self._start_owned_cleanup(generation.response, generation)
+            else:
+                generation.timing.outcome = "superseded"
+                self._release(generation.call_id, generation.timing)
+                generation.timing.finish()
+
+    def _obsolete(self, timing):
+        return timing.generation is not None and timing.generation.superseded.is_set()
+
+    def _checkpoint(self, timing):
+        generation = timing.generation
+        if generation is not None and (generation.superseded.is_set() or self.owners.get(generation.call_id) is not generation):
+            raise GenerationSuperseded()
+
+    def _phase(self, timing, active):
+        generation = timing.generation
+        if generation is not None:
+            if active:
+                self._checkpoint(timing)
+                generation.task = asyncio.current_task()
+            elif generation.task is asyncio.current_task():
+                generation.task = None
+
+    def _payload(self, timing):
+        self._checkpoint(timing)
+        if timing.generation is not None:
+            timing.generation.payload_emitted = True
+        # Never cancel an ASGI send outside our generator's exception handler.
+        # After this point this payload has escaped; supersession cannot revoke
+        # an already emitted command or prove whether the caller heard text.
+        self._phase(timing, False)
+
+    async def _neutral_stream(self, request):
+        if await request.is_disconnected():
+            return
+        yield sse({"id":"chatcmpl-"+uuid4().hex,"object":"chat.completion.chunk",
+                   "created":int(time.time()),"model":MODEL,
+                   "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+        yield b"data: [DONE]\n\n"
+
+    def _neutral_response(self, request, call_id, timing):
+        return OwnedStream(self._neutral_stream(request), lambda:self._cleanup_narration(call_id,timing))
+
+    async def _admit(self, request, call_id, timing, sequence):
+        generation = Generation(call_id, sequence, timing)
+        timing.generation = generation
+        async with self.admission:
+            moment = time.monotonic()
+            # Expired requests cannot displace newer work. Recent sequence
+            # records outlive every older request's total budget, then expire.
+            self.latest_sequences = {key:value for key,value in self.latest_sequences.items() if value[1]>moment}
+            prior = self.latest_sequences.get(call_id)
+            if prior is not None and sequence<prior[0]:
+                generation.superseded.set()
+                timing.outcome="superseded"
+                return False
+            if moment-timing.started >= self.limits.total_seconds:
+                timing.outcome="upstream_unavailable";timing.finish()
+                raise HTTPException(504,"Gemini request unavailable.")
+            if self.closing:
+                timing.outcome="capacity_rejected";timing.finish()
+                raise HTTPException(429,"Gateway capacity unavailable.")
+            owner = self.owners.get(call_id)
+            previous = self.successors.get(call_id)
+            if owner is None and previous is None and len(self.active)>=self.limits.concurrency:
+                timing.outcome="capacity_rejected";timing.finish()
+                raise HTTPException(429,"Gateway capacity unavailable.")
+            if call_id not in self.latest_sequences and len(self.latest_sequences)>=self.limits.signatures_total:
+                timing.outcome="capacity_rejected";timing.finish()
+                raise HTTPException(429,"Gateway admission metadata capacity unavailable.")
+            self.latest_sequences[call_id]=(sequence,timing.started+self.limits.total_seconds+self.limits.cleanup_seconds)
+            if previous is not None:
+                self._supersede(previous)
+            if owner is None:
+                self.successors.pop(call_id,None)
+                self.owners[call_id]=generation
+                self.active.add(call_id)
+                self._phase(timing,True)
+                return True
+            self.successors[call_id]=generation
+            self._supersede(owner)
+
+        # Keep the actual running/draining owner's barrier, never a superseded
+        # waiter's barrier. A -> B -> C must still wait for A to really finish.
+        released = asyncio.create_task(owner.released.wait())
+        obsolete = asyncio.create_task(generation.superseded.wait())
+        disconnected = asyncio.Event()
+        watcher = asyncio.create_task(self._watch_disconnect(request,asyncio.current_task(),disconnected,generation))
+        try:
+            remaining = self.limits.total_seconds-(time.monotonic()-timing.started)
+            done,_=await asyncio.wait((released,obsolete),timeout=max(0,min(self.limits.supersession_seconds,remaining)),return_when=asyncio.FIRST_COMPLETED)
+            async with self.admission:
+                if self.closing or obsolete in done or generation.superseded.is_set() or self.successors.get(call_id) is not generation:
+                    generation.superseded.set()
+                    timing.outcome="superseded"
+                    return False
+                if not owner.released.is_set():
+                    generation.superseded.set()
+                    timing.outcome="supersession_wait_expired"
+                    return False
+                self.successors.pop(call_id,None)
+                self.owners[call_id]=generation
+                self.active.add(call_id)
+                self._phase(timing,True)
+                return True
+        finally:
+            disconnected.set();watcher.cancel()
+            for task in (released,obsolete):task.cancel()
+            if self.owners.get(call_id) is not generation:
+                if self.successors.get(call_id) is generation:
+                    self.successors.pop(call_id,None)
+                if call_id not in self.owners and call_id not in self.successors:
+                    self.active.discard(call_id)
+            await asyncio.gather(watcher,released,obsolete,return_exceptions=True)
+
+    def _start_owned_cleanup(self, response, generation):
+        if generation.cleanup_task is None:
+            async def finish():
+                try:
+                    if not response.is_closed:
+                        with suppress(httpx.HTTPError,OSError,RuntimeError):
+                            await response.aclose()
+                finally:
+                    if generation.superseded.is_set():
+                        generation.timing.outcome="superseded_after_release" if generation.payload_emitted else "superseded"
+                    self._release(generation.call_id,generation.timing)
+                    generation.timing.finish()
+            generation.cleanup_task=asyncio.create_task(finish())
+        return generation.cleanup_task
+
+    async def _cleanup(self, response, call_id, timing=None):
+        if timing is not None and timing.generation is not None:
+            task=self._start_owned_cleanup(response,timing.generation)
+            # A timeout stops waiting, not cleanup. Its physical upstream lease
+            # remains occupied until the real close finishes.
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task),timeout=self.limits.cleanup_seconds)
+            return
+        try:
+            if not response.is_closed:
+                with suppress(httpx.HTTPError, OSError, RuntimeError, TimeoutError):
+                    await asyncio.wait_for(response.aclose(), timeout=self.limits.cleanup_seconds)
+        finally:
+            self._release(call_id, timing)
+            if timing is not None:
+                timing.finish()
+
+    async def _watch_disconnect(self, request, owner, stop, generation=None):
+        while not stop.is_set():
+            if await request.is_disconnected():
+                if generation is not None:
+                    generation.disconnected=True
+                owner.cancel()
+                return
+            await asyncio.sleep(0.1)
+
+    async def handle(self, request: Request):
+        received_at = time.monotonic()
+        self.request_sequence += 1
+        sequence = self.request_sequence
+        config = await run_in_threadpool(self.config_loader)
+        secret, key = config.get("GEMINI_GATEWAY_SECRET") or "", config.get("GEMINI_API_KEY") or ""
+        if not isinstance(secret, str) or len(secret) < 32 or not isinstance(key, str) or not key:
+            raise HTTPException(503, "Gemini gateway is not configured.")
+        supplied = request.headers.get("authorization", "")
+        if not secrets.compare_digest(supplied.encode("utf-8"), ("Bearer " + secret).encode("utf-8")):
+            raise HTTPException(401, "Invalid gateway authentication.")
+        body = await read_json_body(request)
+        if not isinstance(body, dict):
+            raise HTTPException(422, "Invalid request object.")
+        call = body.get("call")
+        sid = await run_in_threadpool(self.bind_call, call, body.get("assistant"))
+        call_id = call["id"]
+        timing = RequestTiming(call_id, received_at, self.timings,self._observe_timing,sid)
+        try:
+            # A configured native/default call must never receive custom Gemini
+            # output while retaining the weaker provider-native execution gate.
+            await run_in_threadpool(self.store.require_gemini_policy, sid, call_id)
+            await run_in_threadpool(self.store.check_live, sid, call_id)
+            upstream = await run_in_threadpool(prepare_request, body, sid, call_id, self.store, self.limits, self.observations)
+        except (GatewayError, ObservationError) as exc:
+            timing.outcome = "rejected"
+            timing.finish()
+            raise HTTPException(exc.status, exc.code) from None
+        except sqlite3.Error:
+            timing.outcome = "state_unavailable"
+            timing.finish()
+            raise HTTPException(503, "Gateway state unavailable.") from None
+        timing.mark("preflight")
+        timing.row["system_prompt_sha256"] = hashlib.sha256(upstream["messages"][0]["content"].encode("utf-8")).hexdigest()
+        timing.row["counts"]["history_messages"] = len(upstream["messages"])
+        timing.row["counts"]["history_tool_results"] = sum(message["role"] == "tool" for message in upstream["messages"])
+        try:
+            admitted=await self._admit(request,call_id,timing,sequence)
+        except asyncio.CancelledError:
+            neutral = self._obsolete(timing) and not timing.generation.disconnected
+            timing.outcome="superseded" if neutral else "cancelled"
+            await self._cleanup_narration(call_id,timing)
+            if neutral:return self._neutral_response(request,call_id,timing)
+            raise
+        if not admitted:
+            return self._neutral_response(request,call_id,timing)
+        try:
+            self._phase(timing,True)
+            # A terminal event may have won while this successor waited.
+            await run_in_threadpool(self.store.check_live,sid,call_id)
+            self._checkpoint(timing)
+            return await self._generate(request,config,key,upstream,sid,call_id,received_at,timing)
+        except (asyncio.CancelledError,GenerationSuperseded):
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                timing.outcome="superseded"
+                await self._cleanup_narration(call_id,timing)
+                return self._neutral_response(request,call_id,timing)
+            timing.outcome="cancelled"
+            await self._cleanup_narration(call_id,timing)
+            raise
+        except GatewayError as exc:
+            timing.outcome="rejected"
+            await self._cleanup_narration(call_id,timing)
+            raise HTTPException(exc.status,exc.code) from None
+        except sqlite3.Error:
+            timing.outcome="state_unavailable"
+            await self._cleanup_narration(call_id,timing)
+            raise HTTPException(503,"Gateway state unavailable.") from None
+        except BaseException:
+            await self._cleanup_narration(call_id,timing)
+            raise
+        finally:
+            self._phase(timing,False)
+
+    async def _generate(self,request,config,key,upstream,sid,call_id,started,timing):
+        if config.get("SERVICEVOICE_RECEIPT_NARRATION") == "on":
+            try:
+                decision = await self.narration.choose(sid, call_id, upstream["messages"])
+                self._checkpoint(timing)
+                timing.row["narration_reason"] = decision.reason
+                if decision.text is not None:
+                    timing.row["route"] = "deterministic_receipt"
+                    timing.row["source_result_sha256"] = decision.result_sha256
+                    return OwnedStream(self._narrate(request, decision.text, timing),
+                                       lambda: self._cleanup_narration(call_id, timing))
+            except BaseException as exc:
+                timing.outcome = "superseded" if self._obsolete(timing) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "state_unavailable"
+                await self._cleanup_narration(call_id, timing)
+                raise
+        if config.get("SERVICEVOICE_JEV_FAQ") == "on":
+            faq_started = time.monotonic()
+            watch_stop = asyncio.Event()
+            watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
+            try:
+                def classifier_started():timing.row["counts"]["jev_requests"] = 1
+                decision = await self.faq.choose(sid, call_id, upstream["messages"], config.get("TYPESAFE_API_KEY"), classifier_started)
+                self._checkpoint(timing)
+                timing.row["jev_reason"] = decision.reason
+                timing.row["durations_ms"].update(jev_route=decision.elapsed_ms, jev_classification=decision.classification_ms)
+                timing.row["counts"]["jev_requests"] = decision.requests
+                timing.row.update(jev_probability=decision.probability, jev_margin=decision.margin,
+                                  jev_language_probability=decision.language_probability)
+                if decision.text is not None:
+                    timing.row["route"] = "jev_static_faq"
+                    return OwnedStream(self._narrate(request, decision.text, timing, "servicevoice-jev-faq"),
+                                       lambda: self._cleanup_narration(call_id, timing))
+            except BaseException as exc:
+                timing.outcome = "superseded" if self._obsolete(timing) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "state_unavailable"
+                timing.row["jev_reason"] = timing.outcome
+                timing.row["durations_ms"]["jev_route"] = round((time.monotonic()-faq_started)*1000, 3)
+                await self._cleanup_narration(call_id, timing)
+                raise
+            finally:
+                watch_stop.set()
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):await watcher
+        response = None
+        watch_stop = asyncio.Event()
+        watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
+        try:
+            async with asyncio.timeout(max(0.001, self.limits.total_seconds-(time.monotonic()-started))):
+                provider_request = self.client.build_request("POST", GOOGLE_URL, json=upstream, headers={"Authorization": "Bearer " + key})
+                provider_request.extensions["trace"] = timing.transport_event
+                response = await self.client.send(provider_request, stream=True)
+                timing.generation.response=response
+                self._checkpoint(timing)
+                timing.mark("upstream_headers")
+                if response.status_code != 200 or "text/event-stream" not in response.headers.get("content-type", ""):
+                    raise GatewayError("upstream_unavailable", 502)
+        except BaseException as exc:
+            timing.outcome = "superseded" if self._obsolete(timing) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "upstream_unavailable"
+            if response is not None:
+                await self._cleanup(response, call_id, timing)
+            else:
+                self._release(call_id, timing)
+                timing.finish()
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                raise GenerationSuperseded() from None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise HTTPException(504 if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else 502, "Gemini request unavailable.") from None
+        finally:
+            watch_stop.set()
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+        return OwnedStream(self._relay(request, response, sid, call_id, started, timing,
+                                       issuance_context=user_context(upstream["messages"])),
+                           lambda: self._cleanup(response, call_id, timing))
+
+    async def _cleanup_narration(self, call_id, timing):
+        if timing.generation is not None and timing.generation.response is not None:
+            await self._cleanup(timing.generation.response,call_id,timing)
+            return
+        self._release(call_id, timing)
+        timing.finish()
+
+    async def _narrate(self, request, text, timing, source="servicevoice-receipt"):
+        response_id = "chatcmpl-" + uuid4().hex
+        def chunk(delta, reason=None):
+            return {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                    "model": source, "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+        try:
+            self._phase(timing,True)
+            if await request.is_disconnected():return
+            self._checkpoint(timing)
+            timing.mark("first_text")
+            timing.row["counts"]["text_chunks"] = 1
+            timing.row["counts"]["text_utf8_bytes"] = len(text.encode("utf-8"))
+            # Exact deterministic text offered to the downstream stream, not
+            # proof of playback, pronunciation or assistant-channel captions.
+            timing.row["output_text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            timing.row["output_text_source"] = "static_faq" if source == "servicevoice-jev-faq" else "verified_receipt"
+            self._payload(timing)
+            yield sse(chunk({"role": "assistant", "content": text}))
+            yield sse(chunk({}, "stop"))
+            timing.outcome = "superseded_after_release" if self._obsolete(timing) else "completed"
+            yield b"data: [DONE]\n\n"
+        except (asyncio.CancelledError,GenerationSuperseded):
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                timing.outcome="superseded"
+                self._phase(timing,False)
+                async for part in self._neutral_stream(request):yield part
+                return
+            timing.outcome = "cancelled"
+            raise
+        finally:
+            self._phase(timing,False)
+
+    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None):
+        timing = timing or RequestTiming(call_id, started, self.timings)
+        transport = {"iterator": response.aiter_bytes(), "buffer_bytes": 0, "received_bytes": 0}
+        assembler = ToolAssembler(self.limits)
+        finished, completed, pending_calls, finish_reason = False, False, None, None
+        # A model may put an unsupported success claim before its tool call.
+        # Keep that generation's prose private until its type is known. A tool
+        # generation emits commands only; the following verified result owns
+        # the outcome speech. Text-only generations retain their exact words.
+        text_parts, text_bytes = [], 0
+        response_id = "chatcmpl-" + uuid4().hex
+        watch_stop = asyncio.Event()
+        watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
+        def chunk(delta, reason=None):
+            return {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": MODEL,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+        try:
+            self._phase(timing,True)
+            remaining = self.limits.total_seconds - (time.monotonic() - started)
+            async with asyncio.timeout(max(0.001, remaining)):
+                async for data in sse_events(response, self.limits, transport):
+                    timing.mark("first_upstream_event")
+                    timing.row["counts"]["upstream_events"] += 1
+                    if data == "[DONE]":
+                        timing.mark("upstream_done")
+                        if not finished:
+                            raise GatewayError("incomplete_upstream_response")
+                        await drain_sse_tail(transport, self.limits, timing,
+                                             self.limits.total_seconds - (time.monotonic() - started))
+                        if time.monotonic() - started >= self.limits.total_seconds:
+                            raise TimeoutError()
+                        self._checkpoint(timing)
+                        if pending_calls:
+                            persistence_started = time.monotonic()
+                            await run_in_threadpool(self.store.save_group, sid, call_id, pending_calls, context=issuance_context)
+                            self._checkpoint(timing)
+                            timing.row["durations_ms"]["tool_signature_persist"] = round((time.monotonic() - persistence_started) * 1000, 3)
+                            timing.row["counts"]["tool_calls"] = len(pending_calls)
+                            public_calls = [{"index": index, "id": tool["id"], "type": "function", "function": tool["function"]} for index, tool in enumerate(pending_calls)]
+                            timing.mark("tool_emitted")
+                            self._payload(timing)
+                            yield sse(chunk({"role": "assistant", "tool_calls": public_calls}))
+                        elif text_parts:
+                            text = "".join(text_parts)
+                            timing.mark("first_text")
+                            if timing.row["milestones_ms"]["first_upstream_text"] is not None:
+                                timing.row["durations_ms"]["validated_text_hold"] = round(max(0,
+                                    timing.row["milestones_ms"]["first_text"] - timing.row["milestones_ms"]["first_upstream_text"]), 3)
+                            timing.row["counts"]["text_chunks"] = 1
+                            timing.row["counts"]["text_utf8_bytes"] = text_bytes
+                            self._payload(timing)
+                            yield sse(chunk({"role": "assistant", "content": text}))
+                        self._phase(timing,False)
+                        yield sse(chunk({}, finish_reason))
+                        completed = True
+                        timing.outcome = "superseded_after_release" if self._obsolete(timing) else "completed"
+                        yield b"data: [DONE]\n\n"
+                        break
+                    event = parse_json(data)
+                    if not isinstance(event, dict) or "error" in event:
+                        raise GatewayError("upstream_stream_failed")
+                    upstream_model = event.get("model")
+                    if upstream_model is not None and (not isinstance(upstream_model, str) or not (upstream_model == MODEL or upstream_model.startswith(MODEL + "-"))):
+                        raise GatewayError("upstream_model_mismatch")
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        observed = {"input_tokens": usage.get("prompt_tokens"),
+                                    "output_tokens": usage.get("completion_tokens"),
+                                    "total_tokens": usage.get("total_tokens")}
+                        for source, target, field in (("prompt_tokens_details", "cached_input_tokens", "cached_tokens"),
+                                                      ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens")):
+                            details = usage.get(source)
+                            if isinstance(details, dict):observed[target] = details.get(field)
+                        for key, value in observed.items():
+                            if type(value) is int and 0 <= value <= 100_000_000:
+                                timing.row["usage"][key] = value
+                    choices = event.get("choices", [])
+                    if choices == []:
+                        continue  # Usage-only frames are not speech.
+                    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) or choices[0].get("index", 0) != 0 or finished:
+                        raise GatewayError("invalid_upstream_choices")
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        raise GatewayError("invalid_upstream_delta")
+                    if "tool_calls" in delta:
+                        timing.mark("first_tool_fragment")
+                        assembler.add(delta["tool_calls"])
+                    content = delta.get("content")
+                    if content is not None:
+                        if not isinstance(content, str):
+                            raise GatewayError("invalid_upstream_content")
+                        if content:
+                            timing.mark("first_upstream_text")
+                            text_bytes += len(content.encode("utf-8"))
+                            if text_bytes > self.limits.response_bytes:
+                                raise GatewayError("upstream_response_size")
+                            text_parts.append(content)
+                    reason = choice.get("finish_reason")
+                    if reason is None:
+                        continue
+                    if reason in ("tool_calls", "stop") and assembler.parts:
+                        pending_calls = assembler.finish()
+                        reason = "tool_calls"  # Normalize Google's signed-call + stop contract for Vapi.
+                    elif reason != "stop" or assembler.parts:
+                        raise GatewayError("upstream_incomplete_or_blocked")
+                    finished = True
+                    finish_reason = reason
+                if not completed:
+                    raise GatewayError("incomplete_upstream_response")
+        except (asyncio.CancelledError,GenerationSuperseded):
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                timing.outcome="superseded"
+                self._phase(timing,False)
+                async for part in self._neutral_stream(request):yield part
+                return
+            timing.outcome = "cancelled"
+            raise
+        except (GatewayError, httpx.HTTPError, TimeoutError, sqlite3.Error, ValueError, TypeError):
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                timing.outcome="superseded"
+                self._phase(timing,False)
+                async for part in self._neutral_stream(request):yield part
+                return
+            timing.outcome = "stream_unavailable"
+            # The status is already streaming. Do not emit a success finish/DONE
+            # after an error, and never expose the provider's error or request.
+            self._phase(timing,False)
+            yield sse({"error": {"code": "generation_unavailable", "message": "Voice generation could not complete. No appointment outcome is inferred."}})
+        finally:
+            self._phase(timing,False)
+            watch_stop.set()
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+            await self._cleanup(response, call_id, timing)
+
+
+class OwnedStream(StreamingResponse):
+    """Own upstream cleanup even if downstream fails before iteration starts."""
+    def __init__(self, iterator, cleanup):
+        super().__init__(iterator, media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                await self.cleanup()
+
+
+def install_gateway(app, config_loader, bind_call, **kwargs):
+    gateway = GeminiGateway(app, config_loader, bind_call, **kwargs)
+    app.state.gemini_gateway = gateway
+    app.add_api_route("/llm/chat/completions", gateway.handle, methods=["POST"])
+    return gateway

@@ -1,0 +1,19 @@
+# Optional official MCP SDK; base runtime pins remain unchanged.
+-r requirements-lock.txt
+attrs==26.1.0
+cffi==2.1.1
+cryptography==50.0.2
+httpcore2==2.14.0
+httpx2==2.14.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+mcp==2.3.0
+mcp-types==2.3.0
+pycparser==3.11
+PyJWT==2.15.1
+python-multipart==0.0.32
+pywin32==312; sys_platform == "win32"
+referencing==0.37.0
+rpds-py==2026.9.1
+sse-starlette==3.5.0
+truststore==0.10.5

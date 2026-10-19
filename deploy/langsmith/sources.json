@@ -1,0 +1,41 @@
+{
+  "reviewed_on": "2026-10-18",
+  "scope": "Official LangSmith and AWS documentation; account settings and AWS resources were not inspected or changed.",
+  "sources": [
+    {
+      "title": "LangSmith pricing",
+      "url": "https://www.langchain.com/pricing",
+      "finding": "Developer currently advertises one seat, $0 per seat per month, and 5,000 included base traces per month. Pricing can change."
+    },
+    {
+      "title": "LangSmith billing",
+      "url": "https://docs.langchain.com/langsmith/billing",
+      "finding": "Personal organizations are limited to 5,000 traces monthly without a card; adding a card removes this limit and permits excess charges. Usage limits and trace retention are account settings. Base retention is 14 days; extended retention can cost more."
+    },
+    {
+      "title": "LangSmith service administration",
+      "url": "https://docs.langchain.com/langsmith/administration-overview",
+      "finding": "No-payment-method Developer accounts have a 5,000 unique trace monthly limit on a calendar-month UTC boundary. Reaching plan or configured limits can produce HTTP 429."
+    },
+    {
+      "title": "LangSmith cloud regions",
+      "url": "https://docs.langchain.com/langsmith/cloud",
+      "finding": "SaaS region follows signup location. AWS US uses aws.smith.langchain.com and aws.api.smith.langchain.com; default GCP US uses smith.langchain.com and api.smith.langchain.com. AWS US SaaS runs in LangChain's AWS infrastructure."
+    },
+    {
+      "title": "LangSmith OpenTelemetry tracing",
+      "url": "https://docs.langchain.com/langsmith/trace-with-opentelemetry",
+      "finding": "Custom applications can send OTLP spans without adopting LangChain. Batched background export is supported. A base OTLP URL ends in /otel; a per-signal trace URL ends in /otel/v1/traces."
+    },
+    {
+      "title": "ECS Secrets Manager environment injection",
+      "url": "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html",
+      "finding": "Use container secrets name/valueFrom to inject the secret at task startup. Rotations require a fresh task. Secret environment values can be read by container processes and debugging tools. Linux Fargate 1.4.0+ is required if selecting a JSON key or secret version."
+    },
+    {
+      "title": "ECS task execution IAM role",
+      "url": "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html",
+      "finding": "ECS secret injection needs secretsmanager:GetSecretValue on the task execution role. Customer-managed KMS encryption can additionally require scoped kms:Decrypt. This is separate from the application task role."
+    }
+  ]
+}

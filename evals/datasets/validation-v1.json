@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "dataset_file": "servicevoice-golden-v1.json",
+  "dataset_sha256": "28f00784a3c42557899051eee9c6d81f7e0130b3b2f3177fc7d408536360a903",
+  "case_count": 32,
+  "splits": {
+    "regression": 10,
+    "dev": 15,
+    "holdout": 7
+  },
+  "execution_kinds": {
+    "model_text": 25,
+    "voice_manual": 6,
+    "ui_contract": 1
+  },
+  "family_count": 32,
+  "validation": "passed",
+  "validation_scope": [
+    "parseable JSON",
+    "unique stable IDs",
+    "family split assignment",
+    "supported enum values",
+    "bounded turn-check indices and integer counts",
+    "recognized template variables",
+    "rubric present",
+    "known private-incident literals absent",
+    "current runner schema and optional tool argument subset checks"
+  ],
+  "review_status": "draft_authored_pending_human_review",
+  "does_not_certify": [
+    "model performance",
+    "semantic correctness",
+    "absence of all sensitive data",
+    "human approval",
+    "audio behavior"
+  ]
+}

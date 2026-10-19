@@ -1,0 +1,23 @@
+{
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/servicevoice-${DEPLOY_ENVIRONMENT}-execution",
+  "containerDefinitions": [
+    {
+      "name": "servicevoice",
+      "environment": [
+        {"name": "SERVICEVOICE_LANGSMITH_ENABLED", "value": "false"},
+        {"name": "LANGSMITH_ENDPOINT", "value": "https://aws.api.smith.langchain.com"},
+        {"name": "LANGSMITH_PROJECT", "value": "servicevoice-production"},
+        {"name": "SERVICEVOICE_ENVIRONMENT", "value": "production"},
+        {"name": "SERVICEVOICE_LANGSMITH_SAMPLE_RATE", "value": "0.25"},
+        {"name": "SERVICEVOICE_LANGSMITH_MONTHLY_SPAN_LIMIT", "value": "1000"},
+        {"name": "SERVICEVOICE_LANGSMITH_BUDGET_PATH", "value": "/data/langsmith-budget.sqlite3"}
+      ],
+      "secrets": [
+        {
+          "name": "LANGSMITH_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:servicevoice/${DEPLOY_ENVIRONMENT}/langsmith-${SECRET_SUFFIX}"
+        }
+      ]
+    }
+  ]
+}

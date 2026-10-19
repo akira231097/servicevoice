@@ -1,0 +1,9 @@
+{
+  "name": "servicevoice-sdk-bundle",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {"build:sdk": "esbuild integrations/vapi-entry.js --bundle --format=esm --minify --outfile=app/static/vendor/vapi.js"},
+  "dependencies": {"@vapi-ai/web": "3.0.0"},
+  "devDependencies": {"esbuild": "0.28.2"}
+}

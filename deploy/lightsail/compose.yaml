@@ -1,0 +1,86 @@
+name: servicevoice-lightsail
+services:
+  servicevoice:
+    image: servicevoice-app:lightsail
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--mode", "provider"]
+    env_file:
+      - path: ${SERVICEVOICE_PRIVATE_ENV_FILE:?Use the reviewed settings file outside the checkout}
+        format: raw
+    environment:
+      SERVICEVOICE_DB: ${SERVICEVOICE_DATABASE_PATH:-/data/servicevoice.sqlite3}
+      SERVICEVOICE_CAPACITY_PROFILE: default
+      SERVICEVOICE_TELEPHONY_ENABLED: "on"
+      SERVICEVOICE_RECEIPT_NARRATION: "on"
+      SERVICEVOICE_JEV_FAQ: ${SERVICEVOICE_JEV_FAQ:-on}
+      SERVICEVOICE_LANGSMITH_ENABLED: ${SERVICEVOICE_LANGSMITH_ENABLED:-off}
+      LANGSMITH_PROJECT: servicevoice-cloud
+      SERVICEVOICE_LANGSMITH_BUDGET_PATH: /data/langsmith-budget.sqlite3
+      SERVICEVOICE_TIMING_PERSISTENCE: "on"
+      SERVICEVOICE_ENVIRONMENT: production
+      VAPI_MODEL_PROFILE: gemini-3.8-flash-custom
+      PUBLIC_BASE_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}
+      VAPI_CUSTOM_LLM_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}/llm
+    # No published application or console port. Caddy is the only public entry.
+    volumes:
+      - application-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 192
+    mem_limit: 1g
+    cpus: 1.0
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    networks: [application]
+  caddy:
+    image: servicevoice-edge:lightsail
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    environment:
+      SERVICEVOICE_PUBLIC_HOST: ${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}
+      SERVICEVOICE_ACME_EMAIL: ${SERVICEVOICE_ACME_EMAIL:?Set your certificate contact email}
+    ports:
+      - "80:8080/tcp"
+      - "443:8443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls.acme.caddy:/etc/caddy/tls.caddy:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 192m
+    cpus: 0.25
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    depends_on:
+      servicevoice: {condition: service_healthy}
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    networks: [application]
+networks:
+  application:
+    # Provider and ACME HTTPS egress is needed. No host networking or Docker socket.
+    driver: bridge
+volumes:
+  application-data:
+  caddy-data:
+  caddy-config:

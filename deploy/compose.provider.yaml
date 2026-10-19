@@ -1,0 +1,32 @@
+name: servicevoice-provider
+services:
+  servicevoice:
+    image: servicevoice-app:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # No console socket or route is enabled in provider mode.
+    command: ["--mode", "provider"]
+    env_file:
+      - ${SERVICEVOICE_PRIVATE_ENV_FILE:?Set an absolute private environment-file path outside this project}
+    environment:
+      SERVICEVOICE_DB: /data/servicevoice.sqlite3
+      VAPI_MODEL_PROFILE: gemini-3.8-flash-custom
+    ports:
+      - "127.0.0.1:8876:8000"
+    volumes:
+      - provider-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    init: true
+    restart: "no"
+    stop_grace_period: 40s
+volumes:
+  provider-data:

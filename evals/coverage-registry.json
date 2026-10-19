@@ -1,0 +1,443 @@
+{
+  "schema_version": 1,
+  "registry_id": "servicevoice-evaluation-coverage-2026-10-18-1",
+  "purpose": "Verified source-file inventory of existing coverage and execution boundaries; not a test result or completion claim.",
+  "registry_is_not_test_result": true,
+  "registry_creation_executed_listed_suites": false,
+  "entries": [
+    {
+      "id": "business_contracts",
+      "execution_class": "offline_disposable_scheduler",
+      "coverage": [
+        "proposal and confirmation effects",
+        "idempotent retry",
+        "session ownership",
+        "exact-time query",
+        "advisor withdrawal",
+        "capacity competition",
+        "move and cancellation"
+      ],
+      "limitations": [
+        "No model chooses tools; no semantic or audible consent judgment."
+      ],
+      "source_files": [
+        {
+          "path": "evals/contracts.py",
+          "sha256": "73b788ea70b77c6b6e0c517d7fba124fde113d88bf8b0e59a32238bd0ad30651"
+        },
+        {
+          "path": "tests/test_eval_contracts.py",
+          "sha256": "a637248a371c61e037d4ae84c81f5a92aa43cef8e07e82f7aa8fa05c9e6c204f"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "effect_fault_injection_and_process_recovery",
+      "execution_class": "offline_disposable_scheduler_and_subprocesses",
+      "coverage": [
+        "timeout returns pending",
+        "duplicate in-flight requests",
+        "changed-payload replay rejection",
+        "worker exception before and after commit",
+        "bounded admission and backlog",
+        "canceled waiter preserves accepted effect",
+        "actual process exit after commit",
+        "orphaned invocation remains unknown"
+      ],
+      "limitations": [
+        "Controlled local faults; no third-party scheduler or production crash drill."
+      ],
+      "source_files": [
+        {
+          "path": "tests/test_harness.py",
+          "sha256": "e6ad58010c766ddc2921fb723087eb201c691475bb2d67ebda7bc5b91674d538"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "status_read_faults",
+      "execution_class": "offline_disposable_scheduler",
+      "coverage": [
+        "unavailable status distinct from failed operation",
+        "bounded status readers",
+        "pending and unavailable polling",
+        "same operation identity",
+        "completion deadline and retry hints"
+      ],
+      "limitations": [
+        "Local fixtures and controlled waits."
+      ],
+      "source_files": [
+        {
+          "path": "tests/test_status_reads.py",
+          "sha256": "b861c12317805fb9bd8e140d2eb79e6110ae0730830259382193b7d92f41cc9c"
+        },
+        {
+          "path": "tests/test_benchmark_journey_polling.py",
+          "sha256": "05c16074843a61fc065b0b4ddb3e9d65b4f37534903386d728d9bb10f86d29c9"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "backup_restore_and_corruption",
+      "execution_class": "offline_explicit_files_and_disposable_subprocesses",
+      "coverage": [
+        "committed WAL snapshot",
+        "concurrent commits",
+        "restore relationships and receipts",
+        "corruption and schema rejection",
+        "destination publication race",
+        "interruption before publish",
+        "actual process-exit recovery"
+      ],
+      "limitations": [
+        "CLI requires explicit source/destination paths; tests use disposable databases. No managed-cloud restore evidence."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/database_backup.py",
+          "sha256": "62a9ac5d6dbf7c0bd1fdd168eba907cf0bd87f90d3706b496b57ef24b463346b"
+        },
+        {
+          "path": "tests/test_database_backup.py",
+          "sha256": "7905a33e432a44092abc875a7eef5827785e4a3134018bc7a4c6b03740cd6c85"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "gateway_stream_faults",
+      "execution_class": "offline_mock_provider_and_disposable_scheduler",
+      "coverage": [
+        "missing and mismatched signatures",
+        "malformed and truncated tool streams",
+        "HTTP failure",
+        "header and stream deadlines",
+        "missing DONE",
+        "bounded response lines",
+        "cancellation and connection cleanup",
+        "fragmented UTF-8 speech preservation"
+      ],
+      "limitations": [
+        "Mock provider transport; no real-model accuracy or TTS evaluation."
+      ],
+      "source_files": [
+        {
+          "path": "tests/test_gemini_gateway.py",
+          "sha256": "eaf88fb2360a8936c081f175f26483e43bce250721eabf865a2f4c319ba230c4"
+        },
+        {
+          "path": "tests/test_speech_stream_contract.py",
+          "sha256": "59f13c603915dc5b2829ed72a7b31bc7f091406c6018e79dd049f9d7629da1e8"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "gateway_telemetry_and_pooling",
+      "execution_class": "offline_mock_provider_and_loopback_transport",
+      "coverage": [
+        "content-free phase milestones",
+        "first text versus tool emission",
+        "connection reuse",
+        "bounded EOF draining",
+        "timing endpoint session isolation"
+      ],
+      "limitations": [
+        "Gateway first-text/header/total milestones are not first audible response. Fixed ring capacity can omit old evidence."
+      ],
+      "source_files": [
+        {
+          "path": "app/gemini_gateway.py",
+          "sha256": "3c195f005be6cfb5eea619e12eca35109f37a904c070f4722457447f765ba7bf"
+        },
+        {
+          "path": "tests/test_gateway_timing.py",
+          "sha256": "2af9eb90234912c36eb2412b07f8cd5bb22f7a79d3b6efef962e7796e1f148e2"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "tool_execution_provenance",
+      "execution_class": "offline_mock_provider_and_disposable_scheduler",
+      "coverage": [
+        "tool execution authorization",
+        "matching observed receipts",
+        "session/call ownership",
+        "forged tool-success rejection"
+      ],
+      "limitations": [
+        "Matching tool receipts do not independently establish human assent."
+      ],
+      "source_files": [
+        {
+          "path": "tests/test_tool_execution_provenance.py",
+          "sha256": "609c7b5e81503ca70e5c32cc21e148345bc482805117772e14531e6657b296a1"
+        },
+        {
+          "path": "tests/test_tool_observations.py",
+          "sha256": "809d796ef0ee9452753f9e34be691a63956ebca4cb06da030f3e8e423e51283a"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "phone_ingress_faults",
+      "execution_class": "offline_synthetic_provider_events",
+      "coverage": [
+        "separate phone credentials",
+        "atomic admission rollback",
+        "duplicate admission",
+        "deadline and abandonment races",
+        "quota and terminal-state handling",
+        "session binding"
+      ],
+      "limitations": [
+        "Synthetic provider events; no carrier or real telephone call."
+      ],
+      "source_files": [
+        {
+          "path": "tests/test_telephony_ingress.py",
+          "sha256": "6529b97edf02f12190859d240ab43260da3bfc320c7726ea86791800d0fe4c6e"
+        },
+        {
+          "path": "tests/test_telephony_api.py",
+          "sha256": "826c2c01178a25f2040b03a81ae1fd1fe5a59deb6564a468da8d0f1b67acc7a5"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "paired_tool_fusion_load",
+      "execution_class": "offline_disposable_scheduler_load",
+      "coverage": [
+        "paired fused versus separate tool reads",
+        "equivalent dealership facts and offers",
+        "local tool response distribution"
+      ],
+      "limitations": [
+        "No model, network, audio or provider requests; serialized bytes are not token counts."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/benchmark_harness.py",
+          "sha256": "0e700381fb7ea73a172dee61e8d48cf0443c9fd0a0a23a591c80bddccc2a90e9"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "full_journey_load",
+      "execution_class": "offline_disposable_scheduler_load",
+      "coverage": [
+        "booking/move/cancellation journeys",
+        "one and twenty concurrent journeys",
+        "balanced blocks and warmups",
+        "same-operation polling",
+        "replay and business invariants"
+      ],
+      "limitations": [
+        "Local Python/SQLite throughput only. Validate protocol and source compatibility before running; historical numbers are not a current rerun."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/benchmark_journey.py",
+          "sha256": "809441a62e3f1b227d22054640ca62c86b3789de31a51ca8a739c8a6b021f77b"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "browser_lifecycle_and_receipt_guards",
+      "execution_class": "offline_node_mock_media_and_sdk",
+      "coverage": [
+        "connection lifecycle",
+        "stale playback resources",
+        "combined outcome presentation",
+        "phone correction receipt guards",
+        "bounded synthetic runner lifecycle"
+      ],
+      "limitations": [
+        "Mocked media and SDK events; not microphone or acoustic acceptance."
+      ],
+      "source_files": [
+        {
+          "path": "tests/frontend-lifecycle.mjs",
+          "sha256": "a87edd71f7b60166e43eca6db8b51ccbe89c0f2704429159a899e99cb12ae286"
+        },
+        {
+          "path": "tests/frontend-presentation.mjs",
+          "sha256": "a7ebb5bd7cfef5eafeebc5c3d0106e96e99af1aae77b49ed84545ba451b660c5"
+        },
+        {
+          "path": "tests/frontend-bundle.mjs",
+          "sha256": "73e4b065c82200bca34caba3a7210b63605d263457d061fa57221a502d7fc67c"
+        },
+        {
+          "path": "tests/voice-booking-recovery.mjs",
+          "sha256": "16a87bf45bcaee6c148184d222ea583a6dacf4768811d11d8a74f59e59931aa5"
+        },
+        {
+          "path": "tests/voice-quality-lifecycle.mjs",
+          "sha256": "99aa6d6f3ce3aa4a1fb00457b1a7feba1a02265e3a5afb91eb724a302d9732b9"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "local_container_deployment",
+      "execution_class": "local_docker_sandbox_mutating",
+      "coverage": [
+        "console/provider split",
+        "authentication",
+        "synthetic booking",
+        "backup/restore",
+        "shutdown/restart persistence",
+        "data-volume ownership"
+      ],
+      "limitations": [
+        "Verifier stops/restarts the named Docker sandbox and creates synthetic records; do not run automatically as a pure eval. No AWS or provider calls."
+      ],
+      "source_files": [
+        {
+          "path": "deploy/verify_deployment.mjs",
+          "sha256": "364f0c58e18313cdc487ae62a1a86826741ae51a06f6981ec6177a37be481d5e"
+        },
+        {
+          "path": "deploy/test_server.py",
+          "sha256": "c2cb28980634707638c08f2217441c7871e274adc9fd158b517a92515f78dd2e"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "real_model_text_workflows",
+      "execution_class": "paid_gemini_text_disposable_scheduler",
+      "coverage": [
+        "actual model tool decisions",
+        "forensic regressions",
+        "consent boundaries",
+        "multilingual text and corrections",
+        "proposal-only tool consolidation"
+      ],
+      "limitations": [
+        "Consumes Gemini tokens; several legacy entrypoints start paid work without a dry-run flag. Direct model path bypasses gateway/JEV/receipt narration/Vapi/audio. Mechanical success requires separate semantic review."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/evaluate_gemini.py",
+          "sha256": "41b9bf77ca578dccc54bbcedd5310aba81f38d4d646107099b61ec462ff28490"
+        },
+        {
+          "path": "scripts/evaluate_forensic_regressions.py",
+          "sha256": "39c12860cdc21cdad1e65408b21e7348bd3d1d94c5fecfcf3a15cbfef94b4c2d"
+        },
+        {
+          "path": "scripts/evaluate_consent_boundaries.py",
+          "sha256": "4f70bd0c4f654d0fdd0ccf96ccd5c9fa413aaf6a9b777edb85f06c4f97864cd2"
+        },
+        {
+          "path": "scripts/evaluate_voice_quality.py",
+          "sha256": "d7b66a63045f4ce5c2790c4db4353be6753a5ec29372e49b5cc0feb4c385d553"
+        },
+        {
+          "path": "scripts/evaluate_first_available.py",
+          "sha256": "2ed9020d62cc278d5056b4727e42ef5b2eddecba3e4f45c3363bafcd51b9c177"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "classifier_evaluation",
+      "execution_class": "paid_typesafe_when_explicitly_executed",
+      "coverage": [
+        "synthetic classification labels",
+        "advisory quality flags",
+        "abstention and receipt-evidence uncertainty",
+        "provider failure metrics"
+      ],
+      "limitations": [
+        "Authored small corpus; scores are not calibrated truth or authority. benchmark_jev.py performs provider requests when invoked."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/benchmark_jev.py",
+          "sha256": "a9362ff7b510048c998711139b5f386fdd9faf8c9a34e9475d3bfd31deb74f2e"
+        },
+        {
+          "path": "scripts/evaluate_call_quality.py",
+          "sha256": "ff66b44b3fedc9139a1b0d30f629025bf5a36d14e2a46d7d5cbbb14cca940541"
+        },
+        {
+          "path": "tests/test_call_quality_eval.py",
+          "sha256": "4f44deed2a1872293def96c6a8d0bd5af5adda3b3751bd079a103ededc8311a3"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "synthetic_voice_provider_calls",
+      "execution_class": "paid_voice_and_local_demo_state",
+      "coverage": [
+        "synthetic PCM call transport",
+        "caption checks",
+        "bounded model/speech conversations",
+        "booking readback and correction workflow"
+      ],
+      "limitations": [
+        "Consumes provider credits and may retain fictional bookings in the native demo. Only voice_quality_smoke.mjs defaults to an offline plan. Synthetic PCM/event timing is not human listening or acoustic latency."
+      ],
+      "source_files": [
+        {
+          "path": "scripts/voice_audio_smoke.mjs",
+          "sha256": "11a5e77666f3506712eabc40e66d0d9fbbc9e993f3920064aa3039ee7b31153c"
+        },
+        {
+          "path": "scripts/voice_booking_smoke.mjs",
+          "sha256": "725646a066caad3fe5eadee77e9919405e7f5bb11715419b55b35a5de52738a6"
+        },
+        {
+          "path": "scripts/voice_quality_smoke.mjs",
+          "sha256": "c864bae7b2ede3cdf246bb79b80318f475abf6a1e801c7fe0b760738d81bf270"
+        },
+        {
+          "path": "scripts/voice_conversation_eval.mjs",
+          "sha256": "2f41a69a181709f40d239bf2182daece1592ac84c0a3d9dd6d41b7ceabd3fbf3"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    },
+    {
+      "id": "historical_human_call_review",
+      "execution_class": "read_only_historical_evidence",
+      "coverage": [
+        "two prior human conversations",
+        "persisted tool effects",
+        "observed false action/availability claims",
+        "browser and transcript timing proxies"
+      ],
+      "limitations": [
+        "Historical evidence with known defects; not a current-candidate rerun. No independent recording listening or acoustic measurement."
+      ],
+      "source_files": [
+        {
+          "path": "docs/forensics-latest-two-2026-10-18/evaluation.json",
+          "sha256": "330090f8d5dc9cc31fb90ff973e27d0a5e45dfb8250b7c2d3afcdead84ed7b09"
+        },
+        {
+          "path": "docs/forensics-latest-two-2026-10-18/timing-analysis.json",
+          "sha256": "cfd1e4a9b5bc98729ce0c8d02a56967bafab3567324e2d5efe67862a93cca6f5"
+        },
+        {
+          "path": "docs/forensics-latest-two-2026-10-18/browser-timing-observation.json",
+          "sha256": "d48e2b7380ee98d743f1e8ce892b671a5e2610408a609147e421c160365d5ab6"
+        }
+      ],
+      "execution_status": "not_executed_by_registry_creation"
+    }
+  ]
+}

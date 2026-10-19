@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DecryptOnlyThisSecretsManagerKey",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:${AWS_REGION}:${AWS_ACCOUNT_ID}:key/${KMS_KEY_ID}",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.${AWS_REGION}.amazonaws.com",
+          "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:servicevoice/${DEPLOY_ENVIRONMENT}/langsmith-${SECRET_SUFFIX}"
+        }
+      }
+    }
+  ]
+}

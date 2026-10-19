@@ -1,0 +1,56 @@
+{
+	email {$SERVICEVOICE_ACME_EMAIL}
+	default_sni {$SERVICEVOICE_PUBLIC_HOST}
+	http_port 8080
+	https_port 8443
+	admin localhost:2019
+	grace_period 40s
+	servers {
+		protocols h1 h2
+		max_header_size 16KB
+		timeouts {
+			read_header 5s
+			read_body 10s
+			idle 1m
+		}
+	}
+}
+
+{$SERVICEVOICE_PUBLIC_HOST} {
+	import /etc/caddy/tls.caddy
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		Cache-Control no-store
+	}
+	@provider {
+		method POST
+		path /webhooks/vapi/inbound /llm/chat/completions
+	}
+	handle @provider {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy servicevoice:8000 {
+			# SSE auto-flushes. Do not use flush_interval -1: it disables
+			# upstream cancellation when the downstream client disconnects.
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 35s
+				# Uvicorn closes idle keep-alives at 5s.
+				keepalive 4s
+			}
+		}
+	}
+	@liveness {
+		method GET
+		path /healthz
+	}
+	handle @liveness {
+		reverse_proxy servicevoice:8000
+	}
+	# Readiness and all console/operator/session/static/docs routes stay private.
+	handle {
+		respond "Not found" 404
+	}
+}
