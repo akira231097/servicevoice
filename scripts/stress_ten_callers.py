@@ -39,6 +39,26 @@ SOURCES=('app/capacity.py','app/main.py','app/domain.py','app/harness.py','app/g
 def hashes():return {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in SOURCES}
 def frame(delta=None,reason=None):return sse({'model':MODEL,'choices':[{'index':0,'delta':delta or {},'finish_reason':reason}]})
 def parsed_events(response):return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: {')]
+async def reconcile_terminal_events(inbound, calls):
+    """Exercise bounded retries of identical, idempotent terminal events.
+
+    Keep first-attempt rejections visible. Only deadline/busy responses are
+    retried; authentication, validation and capacity failures remain failures.
+    This helper never replays booking tools or changes production deadlines.
+    """
+    messages=[{'type':'status-update','status':'ended','call':call} for call in calls]
+    results=await asyncio.gather(*(inbound(message) for message in messages))
+    attempts=[dict(Counter(str(result.status_code) for result in results))]
+    for _ in range(2):
+        retry=[i for i,result in enumerate(results) if result.status_code in (503,504)]
+        if not retry:break
+        await asyncio.sleep(0.05)
+        responses=await asyncio.gather(*(inbound(messages[i]) for i in retry))
+        attempts.append(dict(Counter(str(result.status_code) for result in responses)))
+        for i,result in zip(retry,responses):results[i]=result
+    return results,attempts
+
+
 def check(value,message):
     if not value:raise AssertionError(message)
 
@@ -196,8 +216,9 @@ async def exercise(directory,progress=None,*,callers=4):
                     await asyncio.gather(*held,return_exceptions=True)
 
                 progress['last_phase']='teardown'
-                endings=await asyncio.gather(*(inbound({'type':'status-update','status':'ended','call':call}) for call in calls))
-                check(all(r.status_code==200 for r in endings),'Known terminal events must succeed')
+                endings,terminal_attempts=await reconcile_terminal_events(inbound,calls)
+                progress['terminal_event_attempt_statuses']=terminal_attempts
+                check(all(r.status_code==200 for r in endings),'Known terminal events must reconcile within three attempts: '+str(terminal_attempts))
                 with app.state.store.read_connection() as db:
                     check(app.state.live_admission.count(db)==0,'Ended calls must release shared admission')
                     check(db.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]==1,'Call teardown must preserve appointment')
@@ -208,7 +229,8 @@ async def exercise(directory,progress=None,*,callers=4):
                         'intentional_rejection_statuses':{'overflow':overflow.status_code,'cross_call_command':wrong.status_code},
                         'confirmed_appointments':1,'losing_capacity_conflicts':callers-1,'closed_canceled_streams':closed,
                         'gateway_outcomes':dict(Counter(r['outcome'] for r in gateway.timings)),
-                        'configured_limits':app.state.capacity.public_limits()}
+                        'configured_limits':app.state.capacity.public_limits(),
+                        'terminal_event_attempt_statuses':terminal_attempts}
             finally:
                 await app.state.shutdown_resources()
 

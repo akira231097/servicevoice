@@ -1,0 +1,3 @@
+# Reference fixtures include byte-level hashes. Preserve the reviewed bytes on
+# every checkout, including Windows hosts with core.autocrlf enabled.
+* -text

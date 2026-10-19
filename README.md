@@ -72,6 +72,8 @@ python -m evals.offline
 
 The offline runner executes the Python suite and Node tests against disposable fixtures, checks source stability, and saves local logs and JUnit output under ignored `docs/evals/runs/`. It does not start paid model or phone calls.
 
+GitHub Actions partitions every Python test file into four disjoint shards and runs all Node tests separately. Checkout preserves the exact source bytes used by fixed-hash audio fixtures. The caller stress runner records initial terminal-event responses and permits at most three attempts for identical, idempotent hang-up events after a busy/deadline response; it never retries booking tools through that helper or changes the production deadline.
+
 The Linux-specific deployment package tests run in a separate GitHub Actions job. On Linux, run `python -m pytest -q deploy/test_server.py deploy/langsmith/test_templates.py deploy/lightsail/test_package.py integrations/telephony-lab/test_verify_pcap.py`.
 
 [Evaluation instructions and v17/v18 results](docs/evaluations.md) cover reference datasets, paired experiments, judge calibration and the remaining known issue. Model executions, LangSmith uploads and synthetic voice calls are separate opt-in operations and can incur provider charges. Human microphone, interruption, multilingual listening and carrier checks remain necessary.

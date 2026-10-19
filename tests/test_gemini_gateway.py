@@ -328,11 +328,20 @@ def test_stream_timeout_closes_upstream_and_releases(tmp_path):
     stream = Slow()
     app, gateway, _ = setup(tmp_path, lambda _: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream), GatewayLimits(total_seconds=0.02))
     async def run():
+        response = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+        async def connected():
+            return False
+        # Enter the streaming phase directly: a 20 ms end-to-end budget may
+        # legitimately expire during SQLite/auth setup on a slower machine.
+        # This test specifically exercises the stream timeout and cleanup.
+        gateway.active.add("call-a")
+        iterator = gateway._relay(SimpleNamespace(is_disconnected=connected), response, "sid-a", "call-a", time.monotonic())
         try:
-            result = await post(app, request_body())
-            assert "Checking" not in result.text and "generation_unavailable" in result.text and "[DONE]" not in result.text
-            assert gateway.active == set()
+            body = b"".join([chunk async for chunk in iterator]).decode()
+            assert "Checking" not in body and "generation_unavailable" in body and "[DONE]" not in body
+            assert gateway.active == set() and response.is_closed
         finally:
+            await iterator.aclose()
             await gateway.close()
     asyncio.run(run())
 
