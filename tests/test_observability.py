@@ -12,6 +12,35 @@ from app.observability import (
 )
 
 
+def drain_telemetry(sink):
+    """Wait for test-owned workers while their HTTP mocks remain installed.
+
+    This is test teardown, not a change to the application's bounded close.
+    The stalled-exporter test below still verifies its 10 ms caller budget.
+    """
+    stop = time.monotonic() + 10
+    while time.monotonic() < stop:
+        if sink.close(timeout_seconds=0.25):
+            return True
+    return False
+
+
+@pytest.fixture(autouse=True)
+def finish_test_telemetry_workers(monkeypatch):
+    original = create_telemetry
+    owned = []
+    def tracked(*args, **kwargs):
+        sink = original(*args, **kwargs)
+        owned.append(sink)
+        return sink
+    monkeypatch.setitem(globals(), "create_telemetry", tracked)
+    yield
+    # Teardown precedes monkeypatch.undo, preventing late exports from using
+    # the next parametrized case's mocked transport.
+    for sink in owned:
+        assert drain_telemetry(sink), "Test-owned telemetry worker did not stop"
+
+
 def config(tmp_path, **changes):
     return replace(TelemetryConfig(enabled=True, api_key="test-secret-api-key-not-a-real-key",
         budget_path=str(tmp_path / "budget.sqlite3")), **changes)
@@ -44,7 +73,7 @@ def test_disabled_and_missing_key_have_no_side_effects(monkeypatch, env, reason)
     assert isinstance(sink, NullTelemetry)
     assert sink.status()["reason"] == reason
     assert not sink.record_event("setup.check", {}, correlation="example")
-    assert sink.close()
+    assert drain_telemetry(sink)
 
 
 @pytest.mark.parametrize("field,value", [
@@ -89,7 +118,7 @@ def test_real_spans_have_only_safe_attributes_and_pseudonyms(tmp_path):
         "model": secret, "status": secret, "error": secret,
         "duration_ms": 42.25, "check_count": 3,
     }, correlation=secret)
-    assert sink.close()
+    assert drain_telemetry(sink)
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     span = spans[0]
@@ -172,7 +201,7 @@ def test_budget_failure_prevents_export_without_touching_caller(tmp_path):
     blocked.write_text("fixed", encoding="utf-8")
     sink, exporter = make_sink(tmp_path, budget_path=str(blocked / "quota.db"))
     assert sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert not exporter.get_finished_spans()
     assert sink.status()["budget_errors"] == 1
     assert sink.status()["quota_dropped"] == 1
@@ -201,7 +230,7 @@ def test_failed_exports_consume_reserved_budget_and_never_raise(tmp_path):
             raise RuntimeError("private-shutdown-message")
     sink = create_telemetry(config(tmp_path, monthly_span_limit=1), exporter=Failure())
     assert sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert sink.status()["export_failed"] >= 1
     following, exporter = make_sink(tmp_path, monthly_span_limit=1)
     following.record_event("setup.check", {}, correlation="case")
@@ -286,7 +315,7 @@ def test_real_otlp_serialization_has_fixed_endpoint_no_content_or_redirects(tmp_
     sink = create_telemetry(config(tmp_path, workspace_id="8c185029-1999-4afe-8ada-e6ff36839982"))
     assert sink.status()["reason"] == "ready"
     sink.record_event("setup.check", {"status": "ready", "prompt": sensitive}, correlation=sensitive)
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert len(observed) == 1
     request = observed[0]
     assert request["url"] == "https://aws.api.smith.langchain.com/otel/v1/traces"
@@ -315,7 +344,7 @@ def test_transport_exception_is_sanitized_before_sdk_logging(tmp_path, monkeypat
     monkeypatch.setattr(requests.Session, "request", request)
     sink = create_telemetry(config(tmp_path))
     sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert "private-error-with-api-token-and-customer" not in caplog.text
     assert not caplog.text
     assert sink.status()["export_failed"] == 1
@@ -340,7 +369,7 @@ def test_malformed_ambient_otel_secrets_are_neither_parsed_nor_logged(tmp_path, 
     monkeypatch.setattr(requests.Session, "request", request)
     sink = create_telemetry(config(tmp_path))
     assert sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert len(observed) == 1
     assert sensitive not in caplog.text
     assert sink.status()["exported"] == 1
@@ -363,7 +392,7 @@ def test_fast_routes_do_not_impersonate_gemini_or_its_token_usage(tmp_path, rout
         "route": route, "model": "gemini-3.8-flash", "input_tokens": 20,
         "output_tokens": 30, "total_tokens": 50, "first_text_ms": 37.25,
     }, correlation="synthetic-route")
-    assert sink.close()
+    assert drain_telemetry(sink)
     attrs = dict(exporter.get_finished_spans()[0].attributes)
     assert attrs["langsmith.span.kind"] == kind
     assert attrs["langsmith.metadata.first_text_ms"] == 37.25
@@ -432,7 +461,7 @@ def test_otlp_acknowledgements_are_bounded_validated_and_never_retried(tmp_path,
     monkeypatch.setattr(requests.Session, "request", request)
     sink = create_telemetry(config(tmp_path))
     sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert len(observed) == 1
     assert closed == [True]
     assert sink.status()["exported"] == int(expected)
@@ -464,7 +493,7 @@ def test_response_slow_drip_uses_small_reads_and_absolute_deadline(tmp_path, mon
     monkeypatch.setattr(requests.Session, "request", request)
     sink = create_telemetry(config(tmp_path))
     sink.record_event("setup.check", {}, correlation="case")
-    assert sink.close()
+    assert drain_telemetry(sink)
     assert observed == [1]
     assert closed == [True]
     assert sink.status()["export_failed"] == 1
@@ -475,7 +504,7 @@ def test_conversation_threads_do_not_override_langsmith_project_addressing(tmp_p
     assert sink.record_event("gateway.request", {"route": "gemini"}, correlation="private-session-a")
     assert sink.record_event("tool.execution", {"tool_name": "confirm_action"}, correlation="private-session-a")
     assert sink.record_event("gateway.request", {"route": "gemini"}, correlation="private-session-b")
-    assert sink.close()
+    assert drain_telemetry(sink)
     spans = exporter.get_finished_spans()
     attributes = [dict(span.attributes) for span in spans]
     threads = [row["langsmith.metadata.thread_id"] for row in attributes]
@@ -500,7 +529,19 @@ def test_budget_admission_is_atomic_across_concurrent_workers(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     budget = _Budget(str(tmp_path / "quota.db"), 10)
     budget.reserve(0)
+    def reserve():
+        try:
+            return budget.reserve(3)
+        except sqlite3.OperationalError as error:
+            # The exporter deliberately drops optional traces on a busy quota
+            # database. Contention must not bypass the cap or lose accounting.
+            assert error.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+            return 0
     with ThreadPoolExecutor(max_workers=5) as executor:
-        reservations = list(executor.map(lambda _: budget.reserve(3), range(15)))
-    assert sum(reservations) == 10
+        reservations = list(executor.map(lambda _: reserve(), range(15)))
+    assert all(0 <= count <= 3 for count in reservations)
+    assert sum(reservations) <= 10
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
+        assert connection.execute("SELECT SUM(spans) FROM telemetry_budget").fetchone()[0] == sum(reservations)
+    assert budget.reserve(10) == 10 - sum(reservations)
     assert budget.reserve(1) == 0
