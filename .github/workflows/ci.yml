@@ -8,8 +8,15 @@ jobs:
   regressions:
     runs-on: windows-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        suite: ['0', '1', '2', '3', node]
+    name: regressions (${{ matrix.suite }})
     env:
       SERVICEVOICE_DB: .local/ci-servicevoice.sqlite3
+      CI_SUITE: ${{ matrix.suite }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,9 +32,9 @@ jobs:
           .venv/Scripts/python.exe -m pip install -r requirements-mcp-lock.txt
           .venv/Scripts/python.exe scripts/install_sqlite_runtime.py
           npm ci --ignore-scripts
-      - name: Run offline Python and Node suites
+      - name: Run every offline test across disjoint shards
         shell: pwsh
-        run: .venv/Scripts/python.exe -m evals.offline
+        run: .venv/Scripts/python.exe -u scripts/ci_regressions.py
   linux-packages:
     runs-on: ubuntu-latest
     timeout-minutes: 10
