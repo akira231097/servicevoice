@@ -13,6 +13,7 @@ services:
         format: raw
     environment:
       SERVICEVOICE_EVAL_SOURCE_DB: /evidence/servicevoice.sqlite3
+      SERVICEVOICE_EVAL_DIAGNOSTICS_PATH: /evidence/servicevoice-diagnostics.sqlite3
       SERVICEVOICE_EVAL_OUTBOX: /evaluations/outbox.sqlite3
       SERVICEVOICE_EVAL_PROJECT: servicevoice-live-calls
       SERVICEVOICE_ENVIRONMENT: production

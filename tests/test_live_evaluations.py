@@ -16,7 +16,7 @@ import pytest
 from app.domain import Store
 from app.gemini_gateway import SignatureStore, GatewayLimits
 from app.issuance_context import user_context
-from app.live_eval_evidence import (DIMENSIONS, EvidenceError, Redactor, build_evidence,
+from app.live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, Redactor, build_evidence,
     canonical, integrity, latency, read_snapshot)
 from app.live_evaluations import (Config, LangSmith, Outbox, Worker, feedback_rows,
     parse_judgment, public_report)
@@ -108,7 +108,8 @@ def test_duplicate_receipt_for_historical_action_does_not_change_current_state(s
     snapshot=read_snapshot(store.path,call['id'])
     booking=snapshot['proposals'][0]
     reschedule=deepcopy(booking)
-    reschedule['kind']='reschedule';reschedule['payload']={'slot_id':'later'}
+    reschedule['kind']='reschedule';reschedule['payload']={'slot_id':'later','appointment_id':reschedule['result']['appointment']['id']}
+    reschedule['result']['action']='reschedule'
     reschedule['result']['appointment']['slot_id']='later'
     snapshot['proposals'].append(reschedule);snapshot['appointments'][0]['slot_id']='later'
     assert integrity(snapshot)['verdict']=='pass'
@@ -207,8 +208,33 @@ class ProviderMock:
     def __init__(self,call,workspace):
         self.call=call;self.workspace=workspace;self.project=str(uuid4())
         self.runs={};self.feedback={};self.judge_requests=0;self.calls=0;self.fail_feedback_once=False;self.bad_judge=False
+        self.run_posts=[];self.fail_child_once=False;self.corrupt_child_field=None
+        self.hide_child_readback_once=False
+        self.hide_feedback_readback_once=False
+        self.batch_requests=[];self.trace_queries=[];self.feedback_queries=[];self.rate_limit_batch_once=False
+        self.request_paths=[]
+    def read_run(self,rid):
+        body=deepcopy(self.runs.get(rid))
+        if not isinstance(body,dict):return body
+        if body.get('parent_run_id') and self.hide_child_readback_once:
+            self.hide_child_readback_once=False;return None
+        if body.get('parent_run_id') and self.corrupt_child_field:
+            field=self.corrupt_child_field
+            if field=='non_object':body=[]
+            elif field=='equivalent_timezone':
+                body['start_time']=datetime.fromisoformat(body['start_time']).isoformat().replace('+00:00','Z')
+                body['end_time']=datetime.fromisoformat(body['end_time']).isoformat().replace('+00:00','Z')
+            elif field=='vendor_utc_naive':
+                body['start_time']=datetime.fromisoformat(body['start_time']).replace(tzinfo=None).isoformat()
+                body['end_time']=datetime.fromisoformat(body['end_time']).replace(tzinfo=None).isoformat()
+            elif field=='vendor_shifted_microsecond':
+                from datetime import timedelta
+                body['start_time']=(datetime.fromisoformat(body['start_time'])+timedelta(microseconds=1)).replace(tzinfo=None).isoformat()
+            else:body[field]={'corrupted':True} if field=='outputs' else 'corrupted'
+        return body
     def __call__(self,request):
         path=request.url.path
+        self.request_paths.append((request.method,path))
         def result(body,status=200):return httpx.Response(status,json=body)
         if request.url.host=='api.vapi.ai':self.calls+=1;return result(self.call)
         if request.url.host=='generativelanguage.googleapis.com':
@@ -218,18 +244,57 @@ class ProviderMock:
             if self.bad_judge:value['hallucination_free']['evidence_refs']=['bad']
             return result({'model':'gemini-3.8-flash','choices':[{'finish_reason':'stop','message':{'content':canonical(value)}}]})
         if path=='/sessions':return result([{'id':self.project,'tenant_id':self.workspace,'name':'servicevoice-live-calls'}])
+        if path=='/api/v1/runs/query':
+            query=json.loads(request.content);self.trace_queries.append(query)
+            assert request.method=='POST' and query['session']==[self.project] and query['limit']==100
+            assert set(query)=={'session','trace','limit','select'}
+            assert {'id','session_id','trace_id','start_time','end_time','outputs'}<=set(query['select'])
+            rows=[]
+            for rid,value in self.runs.items():
+                if value.get('trace_id')==query['trace']:
+                    body=self.read_run(rid)
+                    if body is not None:rows.append(body)
+            return result({'runs':rows,'cursors':{'next':None,'prev':None}})
+        if path=='/api/v1/runs/batch':
+            batch=json.loads(request.content);self.batch_requests.append(batch)
+            assert request.method=='POST' and set(batch)=={'post','patch'}
+            assert batch['patch']==[] and 1<=len(batch['post'])<=100
+            if self.rate_limit_batch_once:
+                self.rate_limit_batch_once=False
+                return httpx.Response(429,json={},headers={'Retry-After':'120'})
+            for body in batch['post']:
+                self.run_posts.append(body['id']);self.runs[body['id']]=body
+            if self.fail_child_once:self.fail_child_once=False;return result({},503)
+            return result({},202)
         if path=='/runs':
-            body=json.loads(request.content);self.runs[body['id']]=body;return result({},202)
+            body=json.loads(request.content);self.run_posts.append(body['id']);self.runs[body['id']]=body
+            # An ambiguous acknowledgement after durable acceptance must retry
+            # the same child identity, never create another model judgment.
+            if body.get('parent_run_id') and self.fail_child_once:
+                self.fail_child_once=False;return result({},503)
+            return result({},202)
         if path.startswith('/runs/'):
             rid=path.rsplit('/',1)[1]
             if request.method=='PATCH' and rid in self.runs:self.runs[rid].update(json.loads(request.content))
-            return result(self.runs.get(rid,{}),200 if rid in self.runs else 404)
+            body=self.read_run(rid)
+            return result(body or {},200 if body is not None else 404)
         if path=='/feedback':
+            if request.method=='GET':
+                self.feedback_queries.append(dict(request.url.params))
+                assert request.url.params['limit']=='100'
+                rows=[deepcopy(v)for v in self.feedback.values()if v['run_id']==request.url.params['run']]
+                if rows and self.hide_feedback_readback_once:
+                    self.hide_feedback_readback_once=False;rows=rows[1:]
+                offset=int(request.url.params['offset'])
+                return result(rows[offset:offset+100])
             if self.fail_feedback_once:self.fail_feedback_once=False;return result({},503)
             body=json.loads(request.content);assert body['extend_trace_retention'] is False
             self.feedback[body['id']]=body;return result(body)
         if path.startswith('/feedback/'):
-            fid=path.rsplit('/',1)[1];return result(self.feedback.get(fid,{}),200 if fid in self.feedback else 404)
+            fid=path.rsplit('/',1)[1]
+            if fid in self.feedback and self.hide_feedback_readback_once:
+                self.hide_feedback_readback_once=False;return result({},404)
+            return result(self.feedback.get(fid,{}),200 if fid in self.feedback else 404)
         raise AssertionError(str(request.url))
 
 
@@ -255,6 +320,114 @@ def test_upload_outage_retries_cached_review_without_another_model_call(scenario
     now[0]+=901;worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1}
     assert mock.judge_requests==1 and len(mock.runs)==1
+
+
+def test_accepted_child_temporarily_missing_retries_frozen_review_after_fifteen_seconds(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    worker.outbox.discover(worker.config.source)
+    with closing(worker.outbox.db()) as db,db:
+        db.execute('UPDATE jobs SET attempts=5')
+    mock.hide_child_readback_once=True
+    assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        pending=dict(db.execute('SELECT * FROM jobs').fetchone())
+        budget=db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]
+    assert pending['attempts']==6 and pending['failures']==1
+    assert pending['next_attempt']==now[0]+15
+    assert pending['last_error']=='component_span_readback_ingestion_pending'
+    assert pending['report'] and mock.judge_requests==1 and budget==1
+    assert not mock.feedback
+    # All six component children have been posted before the first delayed
+    # readback can interrupt export. No one-child-per-retry serialization.
+    assert len([r for r in mock.runs.values() if r.get('parent_run_id')])==6
+    frozen=deepcopy(mock.runs)
+    now[0]+=14;assert not worker.tick()
+    now[0]+=1;assert worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert all(mock.runs[k]==value for k,value in frozen.items())
+    assert len(mock.run_posts)==len(set(mock.run_posts))
+    with closing(worker.outbox.db()) as db:
+        assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==1
+        assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]==1
+
+
+def test_all_feedback_is_created_before_a_temporarily_missing_first_readback(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.hide_feedback_readback_once=True
+    assert worker.tick() and worker.outbox.status()['jobs']=={'pending':1}
+    report=next(iter(mock.runs.values()))['outputs']
+    expected=list(feedback_rows(str(uuid4()),report))
+    assert len(mock.feedback)==len(expected)>6
+    frozen=deepcopy(mock.feedback)
+    assert mock.judge_requests==1
+    now[0]+=15
+    assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
+    assert mock.judge_requests==1 and mock.feedback==frozen
+
+
+def test_hundreds_of_component_children_use_bounded_official_batches_and_two_trace_queries(scenario,tmp_path):
+    from app.diagnostics import Diagnostics
+    store,call=scenario;source=Path(store.path)
+    sink=Diagnostics(source.with_name(source.stem+'-diagnostics.sqlite3'))
+    start=datetime.fromisoformat(call['startedAt']).timestamp()
+    for index in range(176):
+        assert sink.record('tts','tts.completed','success',call_id=call['id'],start_unix=start+10+index*.01,duration_ms=5)
+    assert sink.close()
+    worker,mock,_=worker_fixture(tmp_path,scenario)
+    assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
+    assert [len(b['post'])for b in mock.batch_requests]==[100,76]
+    assert all(b['patch']==[]for b in mock.batch_requests)
+    assert len(mock.trace_queries)==2 and len(mock.feedback_queries)==2
+    root=next(r for r in mock.runs.values()if r['name']=='voice.call.review')
+    assert all(q['session']==[mock.project] and q['trace']==root['id']for q in mock.trace_queries)
+    child_ids={r['id']for r in mock.runs.values()if r.get('parent_run_id')}
+    assert len(child_ids)==176
+    assert not any(path=='/runs/'+child for _,path in mock.request_paths for child in child_ids)
+    assert not any(path.startswith('/feedback/')for _,path in mock.request_paths)
+    assert mock.judge_requests==1
+
+
+def test_batch_rate_limit_honors_numeric_retry_after_without_another_judge_or_budget_attempt(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.rate_limit_batch_once=True;assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        pending=dict(db.execute('SELECT * FROM jobs').fetchone())
+    assert pending['last_error']=='export_http_429' and pending['next_attempt']==now[0]+120
+    assert pending['report'] and not mock.feedback and mock.judge_requests==1
+    now[0]+=119;assert not worker.tick()
+    now[0]+=1;assert worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert len(mock.run_posts)==len(set(mock.run_posts))
+    with closing(worker.outbox.db()) as db:
+        assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==1
+        assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]==1
+
+
+def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_component_evidence(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.fail_child_once=True;worker.tick()
+    root=next(r for r in mock.runs.values()if r['name']=='voice.call.review')
+    extra=deepcopy(next(r for r in mock.runs.values()if r.get('parent_run_id')))
+    extra['id']=str(uuid4());extra['name']='human.forensic.annotation'
+    mock.runs[extra['id']]=extra
+    now[0]+=901;worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert root['outputs']['trace_export']['exported_event_spans']==3
+    assert root['outputs']['trace_export']['exported_group_spans']==3
+
+
+def test_real_export_failures_back_off_by_failed_ticks_not_lifetime_poll_attempts(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario)
+    worker.outbox.discover(worker.config.source)
+    with closing(worker.outbox.db()) as db,db:db.execute('UPDATE jobs SET attempts=25')
+    for delay in (30,60):
+        mock.fail_feedback_once=True;assert worker.tick()
+        with closing(worker.outbox.db()) as db:
+            pending=dict(db.execute('SELECT * FROM jobs').fetchone())
+        assert pending['next_attempt']==now[0]+delay
+        now[0]+=delay
+    assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
+    assert mock.judge_requests==1
 
 
 def test_active_call_is_never_judged(scenario,tmp_path):
@@ -334,6 +507,65 @@ def test_unverified_reference_is_flagged_without_assuming_it_was_asserted(scenar
     assert package['mechanical_checks']['reference_consistency']['verdict']=='uncertain'
 
 
+def test_complete_matching_reference_can_pass_text_check_with_audio_coverage_still_unknown(scenario,tmp_path):
+    store,call=scenario
+    package=build_evidence(call,read_snapshot(store.path,call['id']))
+    report=public_report(package,judgment(package),call,[],configuration(tmp_path,store.path))
+    assert report['checks']['reference_consistency']['verdict']=='pass'
+    assert report['checks']['booking_accuracy']['verdict']=='pass'
+    assert report['needs_review'] is False
+    assert report['evidence_coverage']['spoken_audio_verified'] is None
+    feedback={r['key']:r for r in feedback_rows(str(uuid4()),report)}
+    assert feedback['spoken_audio_verified']['score'] is None
+    assert feedback['spoken_audio_verified']['value']=='unverified'
+
+
+@pytest.mark.parametrize('spoken',['Your reference is C. SV. 3F2DFB5.','Your appointment is confirmed.'])
+def test_returned_reference_without_complete_assistant_literal_requires_text_review_not_audio_failure(scenario,tmp_path,spoken):
+    store,call=scenario
+    call['artifact']['messages'][-1]['message']=spoken
+    package=build_evidence(call,read_snapshot(store.path,call['id']))
+    report=public_report(package,judgment(package),call,[],configuration(tmp_path,store.path))
+    assert package['mechanical_checks']['reference_consistency']['verdict']=='uncertain'
+    assert package['mechanical_checks']['reference_consistency']['reason_code']=='returned_reference_missing_complete_literal_requires_review'
+    assert report['checks']['booking_accuracy']['verdict']=='uncertain'
+    assert report['checks']['booking_integrity']['verdict']=='pass'
+    assert report['needs_review'] is True
+    assert report['evidence_coverage']['spoken_audio_verified'] is None
+
+
+def test_no_booking_reference_obligation_is_not_counted_as_reference_success(scenario):
+    store,call=scenario
+    call['artifact']['messages']=[{'role':'user','message':'What are your hours?'},
+        {'role':'bot','message':'Monday through Friday, eight to five Central.'}]
+    package=build_evidence(call,read_snapshot(store.path,call['id']))
+    assert package['mechanical_checks']['reference_consistency']['verdict']=='not_applicable'
+
+
+def test_reference_uncertainty_does_not_replace_an_existing_semantic_failure(scenario,tmp_path):
+    store,call=scenario;call['artifact']['messages'][-1]['message']='Confirmed.'
+    package=build_evidence(call,read_snapshot(store.path,call['id']))
+    report=public_report(package,judgment(package,'fail'),call,[],configuration(tmp_path,store.path))
+    assert report['checks']['booking_accuracy']['verdict']=='fail'
+
+
+@pytest.mark.parametrize('reason,expected',[
+    ('assistant-ended-call',True),('assistant-said-end-call-phrase',True),
+    ('customer-ended-call',False),('silence-timed-out',None),('new-unrecognized-reason',None),(None,None),
+    ([],None),({},None),
+])
+def test_provider_termination_is_separate_coverage_and_never_a_goodbye_quality_grade(scenario,tmp_path,reason,expected):
+    store,call=scenario;call['endedReason']=reason
+    package=build_evidence(call,read_snapshot(store.path,call['id']))
+    report=public_report(package,judgment(package),call,[],configuration(tmp_path,store.path))
+    assert report['evidence_coverage']['provider_ended_by_assistant'] is expected
+    assert report['needs_review'] is False
+    assert 'provider_ended_by_assistant' not in report['checks']
+    feedback={r['key']:r for r in feedback_rows(str(uuid4()),report)}
+    assert feedback['provider_ended_by_assistant']['score']==(int(expected) if expected is not None else None)
+    assert 'goodbye' in feedback['provider_ended_by_assistant']['comment']
+
+
 def test_service_labels_are_not_replaced_as_customer_names():
     value={'facts':{'name':'Cedar','services':[{'name':'Oil & filter service'}]},'customer':{'name':'Alex Morgan','phone':'5125550142'}}
     safe=Redactor(value).value(value)
@@ -410,14 +642,257 @@ def test_zero_summary_cannot_hide_positive_measured_turns():
     assert latency(call)['turn_avg_ms']==4000
 
 
-def test_latency_revision_reuses_semantic_grades_without_another_judge_call(scenario,tmp_path):
+@pytest.mark.parametrize('previous_version',['live-call-review-v1','live-call-review-v2','live-call-review-v3'])
+def test_new_review_contract_rejudges_older_cached_review_without_relabeling_it(scenario,tmp_path,previous_version):
     worker,mock,now=worker_fixture(tmp_path,scenario);worker.tick()
     with closing(worker.outbox.db()) as db,db:
-        cached=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);cached['review_version']='live-call-review-v1'
+        cached=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);cached['review_version']=previous_version
+        if previous_version!='live-call-review-v3':
+            cached['checks'].pop('task_completion');cached['checks'].pop('conversation_quality')
+        cached.pop('evidence_coverage',None)
         db.execute('UPDATE jobs SET report=?',(canonical(cached),))
     mock.runs.clear();mock.feedback.clear()
     now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
-    assert mock.judge_requests==1 and restarted.outbox.status()['jobs']=={'complete':1}
+    assert mock.judge_requests==2 and restarted.outbox.status()['jobs']=={'complete':1}
     report=next(iter(mock.runs.values()))['outputs']
-    assert report['review_version']=='live-call-review-v2' and report['semantic_review_version']=='live-call-review-v1'
+    assert report['review_version']==VERSION and report['supersedes_review_version']==previous_version
+    assert {'task_completion','conversation_quality'}<=set(report['checks'])
+    assert report['evidence_coverage']['spoken_audio_verified'] is None
+    with closing(restarted.outbox.db()) as db:
+        assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==2
+        assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]==2
+
+
+@pytest.mark.parametrize('previous_version',['live-call-review-v2','live-call-review-v3'])
+def test_old_review_with_exhausted_attempts_cannot_manufacture_new_dimension_passes(scenario,tmp_path,previous_version):
+    worker,mock,now=worker_fixture(tmp_path,scenario);worker.tick()
+    with closing(worker.outbox.db()) as db,db:
+        cached=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);cached['review_version']=previous_version
+        db.execute('UPDATE jobs SET report=?,judge_attempts=3',(canonical(cached),))
+    mock.runs.clear();mock.feedback.clear();now[0]+=901
+    restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
+    report=next(iter(mock.runs.values()))['outputs']
+    assert mock.judge_requests==1
+    assert all(report['checks'][d]['verdict']=='uncertain' for d in DIMENSIONS)
+    assert report['review_process']['semantic_status']=='judge_attempt_limit_exhausted'
+
+
+def test_budget_exhaustion_reason_and_true_coverage_denominators_are_visible(scenario,tmp_path):
+    worker,mock,_=worker_fixture(tmp_path,scenario);worker.config=replace(worker.config,monthly_limit=1)
+    worker.outbox.discover(worker.config.source);worker.outbox.reserve_judge(mock.call['id'],1)
+    worker.tick()
+    report=next(iter(mock.runs.values()))['outputs'];status=worker.outbox.status(1)
+    assert report['review_process']['semantic_status']=='monthly_judge_budget_exhausted'
+    assert status['coverage']['known_ended_calls']==1
+    assert status['coverage']['completed_reviews']==1
+    assert status['coverage']['semantically_assessed_calls']==0
+    assert status['coverage']['completed_with_unknown_semantics']==1
+    assert status['coverage']['completed_review_fraction']==1
+    assert status['coverage']['semantic_assessment_fraction']==0
+    assert 'monthly_judge_budget_exhausted' in status['alerts']
+
+
+def test_successful_review_records_lag_and_does_not_claim_provider_audio_visibility(scenario,tmp_path):
+    worker,mock,_=worker_fixture(tmp_path,scenario);worker.tick()
+    status=worker.outbox.status(200);report=next(iter(mock.runs.values()))['outputs']
+    assert status['coverage']['semantically_assessed_calls']==1
+    assert status['coverage']['fully_scored_calls']==1
+    assert status['average_review_lag_seconds']>=0
+    assert status['max_review_lag_seconds']>=status['average_review_lag_seconds']
+    assert report['diagnostics']['coverage']['complete'] is False
+    assert report['diagnostics']['configuration']['provider_effective_configuration']=='unknown'
+
+
+def test_worker_exports_only_call_scoped_diagnostic_breadcrumbs_and_keeps_unknown_audio(scenario,tmp_path):
+    from app.diagnostics import Diagnostics, operation_identifier, turn_identifier
+    store,call=scenario
+    worker,mock,_=worker_fixture(tmp_path,scenario)
+    source=Path(store.path);path=source.with_name(source.stem+'-diagnostics.sqlite3')
+    turn=turn_identifier(call['id'],2);operation=operation_identifier('session','confirm')
+    sink=Diagnostics(path,{'SERVICEVOICE_ENVIRONMENT':'production'})
+    assert sink.record('tool_harness','execution_finished','success',call_id=call['id'],turn_id=turn,
+        operation_id=operation,duration_ms=12,attributes={'receipt_present':True,'tool_name':'confirm_action',
+            'transcript':'PRIVATE CUSTOMER 5125550142','exception':'PRIVATE API KEY'})
+    assert sink.record('gateway','request_finished','failure',call_id=str(uuid4()),duration_ms=50)
+    assert sink.close()
+    assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0])
+    snapshot=report['diagnostics']
+    assert len(snapshot['events'])==1
+    assert snapshot['events'][0]['turn_id']==turn and snapshot['events'][0]['operation_id']==operation
+    assert snapshot['events'][0]['config_id']==snapshot['configuration']['id']
+    assert snapshot['configuration']['provenance']=='local_requested_settings_and_owned_source'
+    assert snapshot['configuration']['provider_effective_configuration']=='unknown'
+    assert snapshot['components']['components']['tool_harness']['evidence_status']=='observed'
+    assert snapshot['components']['components']['caller_device']['evidence_status']=='unavailable'
+    assert snapshot['coverage']['complete'] is False and snapshot['components']['complete'] is False
+    for private in (call['id'],'PRIVATE CUSTOMER','5125550142','PRIVATE API KEY'):
+        assert private not in canonical(snapshot)
+
+
+def record_export_diagnostics(scenario):
+    from app.diagnostics import Diagnostics, operation_identifier, turn_identifier
+    store,call=scenario;source=Path(store.path)
+    path=source.with_name(source.stem+'-diagnostics.sqlite3')
+    turn=turn_identifier(call['id'],2);operation=operation_identifier('session','confirm')
+    request=str(uuid4());started=datetime.fromisoformat(call['startedAt']).timestamp()
+    sink=Diagnostics(path,{'SERVICEVOICE_ENVIRONMENT':'production'})
+    assert sink.record('gateway','request_finished','success',call_id=call['id'],turn_id=turn,request_id=request,
+        start_unix=started+10,duration_ms=20,attributes={'http_status':200,'transcript':'PRIVATE SOURCE'})
+    assert sink.record('tool_harness','execution_finished','pending',call_id=call['id'],turn_id=turn,
+        operation_id=operation,start_unix=started+11,duration_ms=50,attributes={'receipt_present':False})
+    # An observation after the call ends is a point event, not a fabricated
+    # duration of the scheduler write. Explicit same-operation evidence joins it.
+    ended=datetime.fromisoformat(call['endedAt']).timestamp()
+    assert sink.record('scheduler','receipt_observed','success',call_id=call['id'],turn_id=turn,
+        operation_id=operation,start_unix=ended+1,duration_ms=0,
+        attributes={'receipt_present':True,'evidence_source':'tool_receipt'})
+    # A breadcrumb without measured duration stays in the root report, with
+    # skipped timing coverage rather than an invented child interval.
+    assert sink.record('voice_runtime','call_ended','success',call_id=call['id'],start_unix=ended)
+    assert sink.close()
+    return path
+
+
+def test_real_diagnostic_ledger_exports_verified_children_and_late_receipt_without_private_text(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,_=worker_fixture(tmp_path,scenario)
+    assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
+    root=next(r for r in mock.runs.values() if r['name']=='voice.call.review')
+    children=[r for r in mock.runs.values() if r.get('parent_run_id')]
+    events=[r for r in children if r['extra']['metadata']['record_kind']=='component_event']
+    assert len(events)==3 and len(children)==6
+    assert root['outputs']['trace_export']['exported_event_spans']==3
+    assert root['outputs']['trace_export']['skipped_event_counts']=={'missing_or_invalid_duration':1}
+    operation=next(r for r in children if r['name']=='voice.operation.observed_events')
+    receipt=next(r for r in events if r['name']=='voice.component.scheduler.receipt_observed')
+    assert receipt['parent_run_id']==operation['id']
+    assert datetime.fromisoformat(receipt['start_time'])>datetime.fromisoformat(root['end_time'])
+    assert receipt['outputs']['measurements']['receipt_present'] is True
+    assert all(r['trace_id']==root['id'] for r in children)
+    assert all(r['dotted_order'].startswith(root['dotted_order']+'.') for r in children)
+    assert 'PRIVATE SOURCE' not in canonical(children)
+    assert scenario[1]['id'] not in canonical(children)
+    assert mock.judge_requests==1
+
+
+def test_ambiguous_child_upload_retries_same_frozen_ids_without_another_judge_or_new_ledger_events(scenario,tmp_path):
+    from app.diagnostics import Diagnostics
+    path=record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.fail_child_once=True;worker.tick()
+    assert worker.outbox.status()['jobs']=={'pending':1} and mock.judge_requests==1 and not mock.feedback
+    frozen=deepcopy(mock.runs)
+    sink=Diagnostics(path)
+    assert sink.record('tts','tts.failed','failure',call_id=scenario[1]['id'],duration_ms=1,
+        attributes={'error_code':'tts_upstream_rate_limited'})
+    assert sink.close()
+    now[0]+=901;worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert len(mock.run_posts)==len(set(mock.run_posts))==len(mock.runs)
+    assert all(mock.runs[k]==value for k,value in frozen.items())
+    assert not any(r['name'].endswith('tts.failed') for r in mock.runs.values())
+    assert len(mock.feedback)>0
+
+
+@pytest.mark.parametrize('field',['outputs','start_time','end_time','run_type','error','non_object','vendor_shifted_microsecond'])
+def test_corrupted_component_readback_blocks_completion_and_feedback_until_reconciled(scenario,tmp_path,field):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.corrupt_child_field=field
+    assert worker.tick()
+    assert worker.outbox.status()['jobs']=={'pending':1}
+    assert 'component_span_readback_mismatch_or_ingestion_pending' in worker.outbox.status()['pending_reasons']
+    assert mock.judge_requests==1 and not mock.feedback
+    mock.corrupt_child_field=None;now[0]+=901;worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+
+
+@pytest.mark.parametrize('serialization',['equivalent_timezone','vendor_utc_naive'])
+def test_equivalent_component_timestamps_reconcile_across_iso_serializations(scenario,tmp_path,serialization):
+    record_export_diagnostics(scenario);worker,mock,_=worker_fixture(tmp_path,scenario)
+    mock.corrupt_child_field=serialization;worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1}
+
+
+@pytest.mark.parametrize('actual',[
+    '2026-10-20T20:25:52.453571Z',
+    '2026-10-20T20:25:52.453571+00:00',
+    '2026-10-20T20:25:52.453571',
+    '2026-10-20T15:25:52.453571-05:00',
+])
+def test_official_readback_timestamp_serializations_preserve_the_exact_instant(actual):
+    assert LangSmith.same_time(actual,'2026-10-20T20:25:52.453571+00:00')
+
+
+@pytest.mark.parametrize('actual,expected',[
+    ('2026-10-20T20:25:52.453572','2026-10-20T20:25:52.453571+00:00'),
+    ('2026-10-20T20:25:52.453571','2026-10-20T20:25:52.453571'),
+    ('2026-10-20T20:25:52.453571Z','2026-10-20T20:25:52.453571'),
+    ('2026-10-20T20:25:52.453571-05:00','2026-10-20T20:25:52.453571+00:00'),
+    ('2026-10-20','2026-10-20T00:00:00+00:00'),
+    ('2026-10-20T20:25:52.4535710','2026-10-20T20:25:52.453571+00:00'),
+    ('2026-02-30T20:25:52.453571','2026-10-20T20:25:52.453571+00:00'),
+    ('2026-10-20T20:25:52.453571+00:99','2026-10-20T18:46:52.453571+00:00'),
+    (None,'2026-10-20T20:25:52.453571+00:00'),
+])
+def test_timestamp_readback_never_invents_expected_timezone_or_rounds_a_real_shift(actual,expected):
+    assert not LangSmith.same_time(actual,expected)
+
+
+def test_authoritative_uncertainty_is_not_counted_as_a_fully_scored_semantic_review(scenario,tmp_path):
+    store,call=scenario
+    with store.connect() as db:db.execute('DELETE FROM gemini_tool_signatures')
+    worker,mock,_=worker_fixture(tmp_path,scenario);worker.tick()
+    root=next(r for r in mock.runs.values() if r['name']=='voice.call.review')
+    assert root['outputs']['checks']['confirmation_compliance']['verdict']=='uncertain'
+    assert root['outputs']['review_process']['semantic_status']=='assessed_with_uncertainty'
+    coverage=worker.outbox.status()['coverage']
+    assert coverage['semantically_assessed_calls']==1 and coverage['fully_scored_calls']==0
+    assert coverage['completed_with_unknown_semantics']==1
+
+
+def test_persistent_dependency_failure_deadletters_and_requeue_preserves_judge_limits(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario)
+    worker.config=replace(worker.config,max_failures=2)
+    original=worker.client
+    worker.client=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(503,json={})))
+    for _ in range(2):worker.tick();now[0]+=901
+    status=worker.outbox.status(200)
+    assert status['jobs']=={'deadletter':1} and status['coverage']['deadletter_calls']==1
+    assert 'review_deadletters_require_operator_action' in status['alerts']
+    assert not worker.tick()
+    assert worker.outbox.requeue_deadletter(mock.call['id'])
+    worker.client.close();worker.client=original
+    worker.tick()
+    assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+
+
+def test_active_call_waiting_does_not_consume_persistent_failure_budget(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario);mock.call['status']='in-progress'
+    worker.config=replace(worker.config,max_failures=1)
+    for _ in range(5):worker.tick();now[0]+=901
+    status=worker.outbox.status(200)
+    assert status['jobs']=={'pending':1} and status['coverage']['known_active_calls']==1
+    assert status['coverage']['known_ended_calls']==0
+    assert status['oldest_pending_review_age_seconds'] is None
+    with closing(worker.outbox.db()) as db:assert db.execute('SELECT failures FROM jobs').fetchone()[0]==0
+
+
+def test_oldest_pending_ended_call_and_unavailable_identity_are_separate(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario);worker.outbox.discover(worker.config.source)
+    worker.outbox.mark_eligibility(mock.call['id'],True,now[0]-700)
+    missing=str(uuid4());worker.outbox.discover_provider_calls([(missing,now[0]-900)])
+    worker.outbox.unavailable(missing)
+    status=worker.outbox.status(200)
+    assert status['oldest_pending_review_age_seconds']==700
+    assert status['coverage']['discovered_calls']==2
+    assert status['coverage']['known_ended_calls']==1
+    assert status['coverage']['eligibility_unknown_calls']==1
+    assert status['coverage']['provider_records_unavailable']==1
+    assert 'review_backlog_older_than_ten_minutes' in status['alerts']
+
+
+def test_legacy_four_dimension_judgment_cannot_pass_new_rubric(scenario):
+    package=build_evidence(scenario[1],read_snapshot(scenario[0].path,scenario[1]['id']))
+    value=judgment(package);value.pop('task_completion');value.pop('conversation_quality')
+    with pytest.raises(EvidenceError,match='judge_invalid_dimensions'):parse_judgment(value,package)

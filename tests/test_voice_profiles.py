@@ -220,3 +220,59 @@ def test_offline_cannot_apply():
     with pytest.raises(SystemExit) as exc:
         provisioner.main(["--offline", "--apply"])
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("profile", ["gemini-3.8-flash-lite-tts","gemini-3.8-flash-tts"])
+def test_gemini_speech_uses_custom_voice_credential_without_elevenlabs_or_raw_key(profile):
+    env={"VAPI_CUSTOM_TTS_URL":"https://voice.example/tts/vapi",
+         "VAPI_CUSTOM_TTS_CREDENTIAL_ID":ELEVEN_CREDENTIAL,
+         "VAPI_ELEVENLABS_CREDENTIAL_ID":CREDENTIAL,
+         "VAPI_SERVER_CREDENTIAL_ID":WEBHOOK_CREDENTIAL,
+         "GEMINI_API_KEY":"SYNTHETIC-RAW-KEY", "GEMINI_TTS_MODEL":profile}
+    result=payload(env,voice_profile=profile)
+    assert result["voice"]=={"provider":"custom-voice","server":{
+        "url":"https://voice.example/tts/vapi","credentialId":ELEVEN_CREDENTIAL,"timeoutSeconds":30,
+        "backoffPlan":{"type":"fixed","maxRetries":0,"baseDelaySeconds":1}},"cachingEnabled":False,
+        "chunkPlan":{"formatPlan":{"enabled":False}}}
+    assert result["credentialIds"]==[ELEVEN_CREDENTIAL,WEBHOOK_CREDENTIAL]
+    encoded=json.dumps(result)
+    assert "SYNTHETIC-RAW-KEY" not in encoded and "11labs" not in encoded and "fallbackPlan" not in encoded
+
+
+@pytest.mark.parametrize("profile", ["gemini-3.8-flash-lite-tts","gemini-3.8-flash-tts"])
+def test_gemini_disables_reference_normalization_without_changing_reasoning_tools_or_transcriber(profile):
+    env={"VAPI_CUSTOM_LLM_URL":"https://adapter.example/llm",
+        "VAPI_CUSTOM_LLM_CREDENTIAL_ID":CREDENTIAL,
+        "VAPI_CUSTOM_TTS_URL":"https://voice.example/tts/vapi",
+        "VAPI_CUSTOM_TTS_CREDENTIAL_ID":ELEVEN_CREDENTIAL,
+        "VAPI_ELEVENLABS_CREDENTIAL_ID":ELEVEN_CREDENTIAL,
+        "VAPI_SERVER_CREDENTIAL_ID":WEBHOOK_CREDENTIAL,"GEMINI_TTS_MODEL":profile}
+    options={"model_profile":"gemini-3.8-flash-custom","allow_experimental":True}
+    original=payload(env,voice_profile="eleven-v4-turbo",**options)
+    candidate=payload(env,voice_profile=profile,**options)
+    # Vapi's formatter otherwise turns CSV-03... into "C S Vminus three..."
+    # before the custom endpoint sees it. Disable formatting, retain chunking's
+    # default behavior and the unchanged approved text / booking safeguards.
+    assert candidate["voice"]["chunkPlan"]=={"formatPlan":{"enabled":False}}
+    assert "enabled" not in candidate["voice"]["chunkPlan"]
+    assert "chunkPlan" not in original["voice"]
+    assert original["voice"]=={"provider":"11labs","model":"eleven_v4_turbo","voiceId":"sarah"}
+    assert {k:v for k,v in candidate.items() if k not in {"voice","credentialIds"}}=={
+        k:v for k,v in original.items() if k not in {"voice","credentialIds"}}
+    assert candidate["credentialIds"]==[CREDENTIAL,ELEVEN_CREDENTIAL,WEBHOOK_CREDENTIAL]
+
+
+@pytest.mark.parametrize("url", ["http://voice.example/tts","https://127.0.0.1/tts","https://localhost/tts",
+    "https://user:password@voice.example/tts","https://voice.example/tts?key=secret","https://voice.example/tts#secret"])
+def test_gemini_speech_url_rejects_private_addresses_and_credentials(url):
+    with pytest.raises(ValueError):payload({"VAPI_CUSTOM_TTS_URL":url},voice_profile="gemini-3.8-flash-lite-tts")
+
+
+def test_gemini_speech_apply_requires_explicit_saved_endpoint_and_matching_runtime_model():
+    with pytest.raises(ValueError,match="VAPI_CUSTOM_TTS_URL"):
+        select_profiles({},voice_profile="gemini-3.8-flash-lite-tts",apply=True)
+    env={"VAPI_CUSTOM_TTS_URL":"https://voice.example/tts/vapi","VAPI_CUSTOM_TTS_CREDENTIAL_ID":CREDENTIAL}
+    with pytest.raises(ValueError,match="GEMINI_TTS_MODEL"):
+        select_profiles(env,voice_profile="gemini-3.8-flash-tts",apply=True)
+    _,voice,credentials,_=select_profiles(env,voice_profile="gemini-3.8-flash-lite-tts",apply=True)
+    assert voice["server"]["credentialId"]==CREDENTIAL and credentials==[CREDENTIAL]

@@ -261,7 +261,10 @@ def test_observability_status_is_local_only_and_absent_on_public_listener(app_se
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
                 response = await client.get("/api/observability-status")
                 assert response.status_code == 200
-                assert response.json() == sink.status()
+                status=response.json()
+                diagnostic_status=status.pop("diagnostics")
+                assert status == sink.status()
+                assert diagnostic_status["enabled"] and diagnostic_status["config_id"]
                 assert response.headers["cache-control"] == "no-store"
                 assert "synthetic-not-a-real-key" not in response.text
                 assert (await client.get("/api/observability-status", headers={"host": "external.example"})).status_code == 403

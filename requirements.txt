@@ -7,3 +7,5 @@ tzdata>=2025.1
 pytest>=8,<10
 opentelemetry-sdk==1.45.1
 opentelemetry-exporter-otlp-proto-http==1.45.1
+numpy==2.2.6
+soxr==1.1.0

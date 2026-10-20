@@ -12,10 +12,14 @@ from uuid import UUID
 PROJECT = Path(__file__).resolve().parents[2]
 PUBLIC_KEYS = frozenset({"SERVICEVOICE_PUBLIC_HOST", "SERVICEVOICE_ACME_EMAIL",
                          "SERVICEVOICE_PRIVATE_ENV_FILE", "SERVICEVOICE_DATABASE_PATH", "SERVICEVOICE_JEV_FAQ",
-                         "SERVICEVOICE_LANGSMITH_ENABLED"})
+                         "SERVICEVOICE_LANGSMITH_ENABLED", "VAPI_VOICE_PROFILE", "GEMINI_TTS_MODEL", "GEMINI_TTS_VOICE"})
+PUBLIC_REQUIRED = frozenset({"SERVICEVOICE_PUBLIC_HOST", "SERVICEVOICE_ACME_EMAIL", "SERVICEVOICE_PRIVATE_ENV_FILE"})
+GEMINI_VOICE_PROFILES = frozenset({"gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"})
+VOICE_PROFILES = GEMINI_VOICE_PROFILES | {"elliot-v2", "eleven-flash-2.5", "eleven-v4-turbo"}
+GEMINI_VOICES = frozenset("Zephyr Puck Charon Kore Fenrir Leda Orus Aoede Callirrhoe Autonoe Enceladus Iapetus Umbriel Algieba Despina Erinome Algenib Rasalgethi Laomedeia Achernar Alnilam Schedar Gacrux Pulcherrima Achird Zubenelgenubi Vindemiatrix Sadachbia Sadaltager Sulafat".split())
 PRIVATE_REQUIRED = frozenset({"GEMINI_API_KEY", "GEMINI_GATEWAY_SECRET", "VAPI_PHONE_WEBHOOK_SECRET",
                           "VAPI_PHONE_ORG_ID", "VAPI_PHONE_NUMBER_ID", "VAPI_PHONE_ASSISTANT_ID"})
-PRIVATE_KEYS = PRIVATE_REQUIRED | {"TYPESAFE_API_KEY", "LANGSMITH_API_KEY", "LANGSMITH_WORKSPACE_ID", "LANGSMITH_ENDPOINT"}
+PRIVATE_KEYS = PRIVATE_REQUIRED | {"GEMINI_TTS_BEARER_SECRET", "TYPESAFE_API_KEY", "LANGSMITH_API_KEY", "LANGSMITH_WORKSPACE_ID", "LANGSMITH_ENDPOINT"}
 
 
 class PreflightError(ValueError):
@@ -79,7 +83,7 @@ def validate(settings_path, *, project=PROJECT, check_permissions=True):
     if not settings_path.is_absolute() or settings_path.resolve().is_relative_to(project.resolve()):
         raise PreflightError("settings_must_be_outside_checkout")
     settings = read_env(settings_path, PUBLIC_KEYS, check_permissions=check_permissions)
-    if not PUBLIC_KEYS.difference({"SERVICEVOICE_DATABASE_PATH", "SERVICEVOICE_JEV_FAQ", "SERVICEVOICE_LANGSMITH_ENABLED"}).issubset(settings):
+    if not PUBLIC_REQUIRED.issubset(settings):
         raise PreflightError("required_public_configuration_missing")
     kind = public_host(settings["SERVICEVOICE_PUBLIC_HOST"])
     if not re.fullmatch(r"[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", settings["SERVICEVOICE_ACME_EMAIL"]):
@@ -92,6 +96,24 @@ def validate(settings_path, *, project=PROJECT, check_permissions=True):
             or private_path.resolve() == settings_path.resolve()):
         raise PreflightError("private_environment_must_be_outside_checkout")
     private = read_env(private_path, PRIVATE_KEYS, private=True, check_permissions=check_permissions)
+    # Previous settings files keep their native voice; the new release template
+    # explicitly selects Gemini and cannot pass without its independent credential.
+    profile = settings.setdefault("VAPI_VOICE_PROFILE", "elliot-v2")
+    model = settings.setdefault("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+    voice = settings.setdefault("GEMINI_TTS_VOICE", "Kore")
+    if profile not in VOICE_PROFILES or model not in GEMINI_VOICE_PROFILES or voice not in GEMINI_VOICES:
+        raise PreflightError("supported_speech_configuration_required")
+    if profile in GEMINI_VOICE_PROFILES:
+        if model != profile:
+            raise PreflightError("speech_model_must_match_voice_profile")
+        if not 32 <= len(private.get("GEMINI_TTS_BEARER_SECRET", "")) <= 512:
+            raise PreflightError("gemini_speech_requires_independent_32_to_512_character_secret")
+    if "GEMINI_TTS_BEARER_SECRET" in private:
+        tts_secret = private["GEMINI_TTS_BEARER_SECRET"]
+        if not 32 <= len(tts_secret) <= 512:
+            raise PreflightError("gemini_speech_requires_independent_32_to_512_character_secret")
+        if tts_secret in {private["GEMINI_GATEWAY_SECRET"], private["VAPI_PHONE_WEBHOOK_SECRET"], private["GEMINI_API_KEY"]}:
+            raise PreflightError("independent_credentials_required")
     faq = settings.setdefault("SERVICEVOICE_JEV_FAQ", "on")
     if faq not in {"on", "off"} or faq == "on" and len(private.get("TYPESAFE_API_KEY", "")) < 20:
         raise PreflightError("faq_on_requires_typesafe_key")
@@ -119,6 +141,8 @@ def validate(settings_path, *, project=PROJECT, check_permissions=True):
     return settings, {"configuration_shape_valid": True, "public_address_kind": kind,
                       "capacity_profile": "default", "provider_credentials_verified": False,
                       "public_tls_verified": False, "private_console_exposed": False,
+                      "speech_provider_verified": False, "voice_profile": profile,
+                      "component_diagnostics_enabled": True,
                       "private_file_permissions_checked": check_permissions and os.name == "posix"}
 
 

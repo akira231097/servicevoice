@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 
-sys.path.insert(0, '/app/deploy')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from server import LocalBoundary, SocketDispatcher, load_secrets, lock_data, ready
 
 
@@ -97,6 +97,17 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(values['GEMINI_API_KEY'], 'synthetic-test-key')
             self.assertEqual(file.read_text(), 'synthetic-test-key\n')
 
+    def test_custom_speech_secret_uses_same_private_file_boundary(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); file = root / 'tts'; file.write_text('synthetic-speech-' + 's' * 32 + '\n')
+            values = {'GEMINI_TTS_BEARER_SECRET_FILE': str(file)}
+            load_secrets(values, root)
+            self.assertEqual(values['GEMINI_TTS_BEARER_SECRET'], 'synthetic-speech-' + 's' * 32)
+            with self.assertRaisesRegex(RuntimeError, 'one mechanism'):
+                load_secrets(values, root)
+            with self.assertRaisesRegex(RuntimeError, 'mounted under'):
+                load_secrets({'GEMINI_TTS_BEARER_SECRET_FILE': str(root.parent / 'outside')}, root)
+
     def test_ambiguous_outside_and_oversized_secrets_fail(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name); file = root / 'key'; file.write_text('x' * 4097)
@@ -121,6 +132,22 @@ class ConfigurationTests(unittest.TestCase):
             file = Path(name) / 'missing.sqlite3'
             console = types.SimpleNamespace(state=types.SimpleNamespace(store=types.SimpleNamespace(path=file)))
             self.assertFalse(ready('local', console, {})); self.assertFalse(file.exists())
+
+    def test_gemini_speech_readiness_requires_matching_model_voice_and_separate_secret(self):
+        with tempfile.TemporaryDirectory() as name:
+            file = Path(name) / 'state.sqlite3'
+            with sqlite3.connect(file) as db: db.execute('CREATE TABLE sessions(id TEXT)')
+            console = types.SimpleNamespace(state=types.SimpleNamespace(store=types.SimpleNamespace(path=file),
+                telephony_ingress=types.SimpleNamespace(config=object())))
+            values = {'GEMINI_API_KEY': 'synthetic', 'GEMINI_GATEWAY_SECRET': 'g' * 32,
+                      'VAPI_PHONE_WEBHOOK_SECRET': 'p' * 32, 'VAPI_MODEL_PROFILE': 'gemini-3.8-flash-custom',
+                      'VAPI_VOICE_PROFILE': 'gemini-3.8-flash-lite-tts', 'GEMINI_TTS_BEARER_SECRET': 's' * 32}
+            self.assertTrue(ready('provider', console, values))
+            for change in ({'GEMINI_TTS_BEARER_SECRET': ''}, {'GEMINI_TTS_BEARER_SECRET': 'g' * 32},
+                           {'GEMINI_TTS_BEARER_SECRET': 'p' * 32}, {'GEMINI_TTS_MODEL': 'gemini-3.8-flash-tts'},
+                           {'GEMINI_TTS_VOICE': 'invented'}):
+                with self.subTest(change=tuple(change)):
+                    self.assertFalse(ready('provider', console, {**values, **change}))
 
 
 if __name__ == '__main__': unittest.main()

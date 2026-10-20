@@ -14,7 +14,9 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 SECRET_KEYS = ('VAPI_WEBHOOK_SECRET', 'GEMINI_GATEWAY_SECRET', 'GEMINI_API_KEY',
-               'VAPI_PHONE_WEBHOOK_SECRET', 'TYPESAFE_API_KEY', 'LANGSMITH_API_KEY')
+               'GEMINI_TTS_BEARER_SECRET', 'VAPI_PHONE_WEBHOOK_SECRET', 'TYPESAFE_API_KEY', 'LANGSMITH_API_KEY')
+# Keep launch/readiness checks independent of optional HTTP/provider imports.
+GEMINI_TTS_VOICES = frozenset("Zephyr Puck Charon Kore Fenrir Leda Orus Aoede Callirrhoe Autonoe Enceladus Iapetus Umbriel Algieba Despina Erinome Algenib Rasalgethi Laomedeia Achernar Alnilam Schedar Gacrux Pulcherrima Achird Zubenelgenubi Vindemiatrix Sadachbia Sadaltager Sulafat".split())
 
 
 def load_secrets(values=os.environ, root=Path('/run/secrets')):
@@ -123,6 +125,14 @@ def ready(mode, console, values=os.environ):
             db.execute('SELECT id FROM sessions LIMIT 0').fetchall()
         if mode == 'local':
             return True
+        voice_profile = values.get('VAPI_VOICE_PROFILE', '')
+        if voice_profile in {'gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'}:
+            if (not 32 <= len(values.get('GEMINI_TTS_BEARER_SECRET', '')) <= 512
+                    or values.get('GEMINI_TTS_MODEL', 'gemini-3.8-flash-lite-tts') != voice_profile
+                    or values.get('GEMINI_TTS_VOICE', 'Kore') not in GEMINI_TTS_VOICES
+                    or values.get('GEMINI_TTS_BEARER_SECRET') in {
+                        values.get('GEMINI_API_KEY'), values.get('GEMINI_GATEWAY_SECRET'), values.get('VAPI_PHONE_WEBHOOK_SECRET')}):
+                return False
         return bool(console.state.telephony_ingress.config is not None
                     and values.get('VAPI_MODEL_PROFILE') == 'gemini-3.8-flash-custom'
                     and values.get('GEMINI_API_KEY') and len(values.get('GEMINI_GATEWAY_SECRET', '')) >= 32)

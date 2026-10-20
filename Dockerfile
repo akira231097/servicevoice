@@ -22,6 +22,7 @@ RUN pip install --disable-pip-version-check --only-binary=:all: -r requirements-
 COPY app/ ./app/
 COPY scripts/database_backup.py ./scripts/
 COPY deploy/server.py deploy/runtime_health.py deploy/label_sandbox.py ./deploy/
+COPY deploy/tts_server.py ./deploy/
 RUN python deploy/label_sandbox.py
 USER 10001:10001
 EXPOSE 8000

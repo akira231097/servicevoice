@@ -122,6 +122,39 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "32_to_512"):
             self.validate()
 
+    def test_gemini_speech_is_explicit_and_requires_independent_matching_configuration(self):
+        self.assertEqual(self.validate()[0]["VAPI_VOICE_PROFILE"], "elliot-v2")
+        self.public_values["VAPI_VOICE_PROFILE"] = "gemini-3.8-flash-lite-tts"
+        self.write()
+        with self.assertRaisesRegex(preflight.PreflightError, "gemini_speech_requires"):
+            self.validate()
+        self.private_values["GEMINI_TTS_BEARER_SECRET"] = "synthetic-speech-" + "s" * 32
+        self.write()
+        settings, summary = self.validate()
+        self.assertEqual(settings["GEMINI_TTS_MODEL"], settings["VAPI_VOICE_PROFILE"])
+        self.assertEqual(settings["GEMINI_TTS_VOICE"], "Kore")
+        self.assertFalse(summary["speech_provider_verified"])
+        self.assertTrue(summary["component_diagnostics_enabled"])
+        self.assertNotIn(self.private_values["GEMINI_TTS_BEARER_SECRET"], json.dumps([settings, summary]))
+        for key in ("GEMINI_API_KEY", "GEMINI_GATEWAY_SECRET", "VAPI_PHONE_WEBHOOK_SECRET"):
+            self.private_values["GEMINI_TTS_BEARER_SECRET"] = self.private_values[key]
+            self.write()
+            with self.assertRaisesRegex(preflight.PreflightError, "independent_credentials"):
+                self.validate()
+
+    def test_invalid_speech_model_voice_or_profile_is_rejected(self):
+        for key, value in (("VAPI_VOICE_PROFILE", "invented"), ("GEMINI_TTS_MODEL", "invented"),
+                           ("GEMINI_TTS_VOICE", "unknown")):
+            self.public_values[key] = value
+            self.write()
+            with self.assertRaisesRegex(preflight.PreflightError, "supported_speech_configuration"):
+                self.validate()
+            del self.public_values[key]
+        self.public_values.update(VAPI_VOICE_PROFILE="gemini-3.8-flash-tts", GEMINI_TTS_MODEL="gemini-3.8-flash-lite-tts")
+        self.write()
+        with self.assertRaisesRegex(preflight.PreflightError, "speech_model_must_match"):
+            self.validate()
+
     def test_raw_dollar_is_preserved_and_shell_quotes_rejected(self):
         self.private_values["GEMINI_GATEWAY_SECRET"] = "$not-expanded-" + "x" * 32
         self.write()
@@ -196,12 +229,24 @@ class PackageTests(unittest.TestCase):
     def test_source_contract_has_no_public_console_or_cancellation_disabling_flush(self):
         caddy = (HERE / "Caddyfile").read_text()
         active = "\n".join(line for line in caddy.splitlines() if not line.strip().startswith("#"))
-        self.assertIn("path /webhooks/vapi/inbound /llm/chat/completions", active)
+        self.assertIn("path /webhooks/vapi/inbound /llm/chat/completions /tts/vapi", active)
         self.assertNotIn("flush_interval", active)
         self.assertNotIn("lb_retries", active)
         self.assertIn("profile shortlived", (HERE / "tls.acme.caddy").read_text())
         self.assertIn("default_sni {$SERVICEVOICE_PUBLIC_HOST}", active)
         self.assertIn("setcap -r /usr/bin/caddy", (HERE / "Dockerfile.caddy").read_text())
+
+    def test_speech_and_diagnostics_share_durable_private_volume_without_build_secrets(self):
+        compose = (HERE / "compose.yaml").read_text()
+        self.assertIn('SERVICEVOICE_DIAGNOSTICS_ENABLED: "on"', compose)
+        self.assertIn('application-data:/data', compose)
+        self.assertIn('VAPI_CUSTOM_TTS_URL: https://${SERVICEVOICE_PUBLIC_HOST:', compose)
+        self.assertIn('}/tts/vapi', compose)
+        self.assertNotIn('GEMINI_TTS_BEARER_SECRET:', compose)
+        evaluator = (HERE / "compose.evaluations.yaml").read_text()
+        self.assertIn('SERVICEVOICE_EVAL_DIAGNOSTICS_PATH: /evidence/servicevoice-diagnostics.sqlite3', evaluator)
+        self.assertIn('evaluation-evidence:/evidence:ro', evaluator)
+        self.assertIn('VAPI_VOICE_PROFILE=gemini-3.8-flash-lite-tts', (HERE / "settings.env.example").read_text())
 
 
 if __name__ == "__main__":

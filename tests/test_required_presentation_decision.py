@@ -31,7 +31,14 @@ def test_provider_requires_object_or_null_but_backend_keeps_legacy_optional(name
     assert field["properties"]["response_scope"]["enum"] == ["receipt_only"]
     # Language is an unrestricted validated tag, never an English-only enum.
     assert "enum" not in field["properties"]["response_language"]
-    assert set(public.get("required", [])) - {"presentation"} == set(raw.get("required", []))
+    explicit_decisions={"presentation"}
+    if name in {"begin_service_request","search_availability","prepare_first_available_booking","prepare_booking","prepare_reschedule"}:
+        explicit_decisions.add("services")
+        assert "services" not in raw.get("required", [])
+        assert public["required"].count("services")==1
+        assert public["properties"]["services"]["type"]==["array","null"]
+        assert "default" not in public["properties"]["services"]
+    assert set(public.get("required", [])) - explicit_decisions == set(raw.get("required", []))
     assert set(public["properties"]) == set(raw["properties"])
 
 

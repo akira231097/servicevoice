@@ -82,6 +82,43 @@ _NARRATOR = re.compile(r"^receipt-en-\d{4}-\d{2}-\d{2}-\d{1,3}$")
 _RESPONSE_LIMIT_BYTES = 64 * 1024
 _EXPORT_DEADLINE_SECONDS = 2.0
 
+_GENERATION_UUID_KEYS = ("generation_id", "predecessor_generation_id", "superseded_by_generation_id")
+_GENERATION_ENUMS = {
+    "generation_sequence_scope": frozenset({"process_local_http_arrival_only"}),
+    "predecessor_relation": frozenset({"queued_successor", "active_or_draining_owner"}),
+    "supersession_cause": frozenset({"newer_local_http_arrival", "gateway_shutdown", "unknown", "predecessor_cleanup_wait_expired"}),
+    "payload_release_scope": frozenset({"gateway_yield_not_provider_receipt_or_playback"}),
+    "generation_terminal_state": _ENUMS["outcome"] | frozenset({
+        "superseded_before_release", "downstream_disconnected", "cancelled_unknown_cause"}),
+}
+_GENERATION_TIMES = ("superseded_at_ms", "payload_released_at_ms", "downstream_disconnect_at_ms")
+_SSE_RESPONSE_ID = re.compile(r"^chatcmpl-[a-f0-9]{32}$")
+
+
+def _generation_fields(values):
+    """Strict content-free local lineage, never inferred provider/TTS linkage."""
+    safe={}
+    for key in _GENERATION_UUID_KEYS:
+        value=values.get(key)
+        if type(value) is str:
+            try:
+                if str(UUID(value))==value:safe[key]=value
+            except ValueError:pass
+    for key,allowed in _GENERATION_ENUMS.items():
+        value=values.get(key)
+        if type(value) is str and value in allowed:safe[key]=value
+    for key,minimum in (("generation_sequence",1),("checkpoint_rejections",0)):
+        value=values.get(key)
+        if type(value) is int and minimum<=value<=100_000_000:safe[key]=value
+    for key in _GENERATION_TIMES:
+        value=values.get(key)
+        if type(value) in (int,float) and math.isfinite(value) and 0<=value<=86_400_000:
+            safe[key]=round(float(value),3)
+    for key in ("sse_response_id","neutral_sse_response_id"):
+        value=values.get(key)
+        if type(value) is str and _SSE_RESPONSE_ID.fullmatch(value):safe[key]=value
+    return safe
+
 
 @dataclass(frozen=True)
 class TelemetryConfig:
@@ -201,6 +238,7 @@ def safe_attributes(attributes: Mapping) -> dict:
                 safe["run_id"] = run_id
         except ValueError:
             pass
+    safe.update(_generation_fields(attributes))
     return safe
 
 
@@ -551,6 +589,7 @@ def safe_timing_row(row):
         values = row.get(field)
         values = values if type(values) is dict else {}
         safe[field] = {key: value if type(value := values.get(key)) is int and 0 <= value <= 100_000_000 else None for key in sorted(keys)}
+    safe.update(_generation_fields(row))
     return safe
 
 

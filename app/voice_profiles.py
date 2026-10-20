@@ -6,7 +6,9 @@ account availability and from passing our live conversational acceptance tests.
 from __future__ import annotations
 
 from copy import deepcopy
+import ipaddress
 import re
+from urllib.parse import urlsplit
 from uuid import UUID
 
 MODEL_PROFILES = {
@@ -42,6 +44,24 @@ MODEL_PROFILES = {
 }
 
 VOICE_PROFILES = {
+    "gemini-3.8-flash-lite-tts": {
+        "settings": {"provider": "custom-voice", "chunkPlan": {"formatPlan": {"enabled": False}}},
+        "support": "documented_custom_adapter",
+        "sources": ["https://ai.google.dev/gemini-api/docs/speech-generation",
+                    "https://docs.vapi.ai/customization/custom-voices/custom-tts",
+                    "https://docs.vapi.ai/assistants/voice-formatting-plan"],
+        "notes": ["Latency-first Gemini speech candidate. Our authenticated PCM adapter uses the server-side Gemini API key; no ElevenLabs credential or fallback is selected.",
+                  "Requires GEMINI_TTS_MODEL=gemini-3.8-flash-lite-tts on the actual server. Account availability and audible accuracy require live validation."],
+    },
+    "gemini-3.8-flash-tts": {
+        "settings": {"provider": "custom-voice", "chunkPlan": {"formatPlan": {"enabled": False}}},
+        "support": "documented_custom_adapter",
+        "sources": ["https://ai.google.dev/gemini-api/docs/speech-generation",
+                    "https://docs.vapi.ai/customization/custom-voices/custom-tts",
+                    "https://docs.vapi.ai/assistants/voice-formatting-plan"],
+        "notes": ["Quality-first Gemini speech candidate through the authenticated PCM adapter. No ElevenLabs credential or fallback is selected.",
+                  "Requires GEMINI_TTS_MODEL=gemini-3.8-flash-tts on the actual server. Account availability and audible accuracy require live validation."],
+    },
     "elliot-v2": {
         "settings": {"provider": "vapi", "voiceId": "Elliot", "version": 2},
         "support": "documented_native",
@@ -111,6 +131,19 @@ def _credential_id(value, label):
         raise ValueError(f"{label} must be a saved Vapi credential UUID.") from exc
 
 
+def _tts_url(value):
+    parsed = urlsplit(value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.hostname.lower() == "localhost"
+            or parsed.hostname.lower().endswith((".localhost", ".local"))):
+        raise ValueError("VAPI_CUSTOM_TTS_URL must be a public HTTPS endpoint without credentials or query parameters.")
+    try:address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:pass
+    else:
+        if not address.is_global:raise ValueError("VAPI_CUSTOM_TTS_URL must not point to a private address.")
+    return value
+
+
 def select_profiles(env, *, model_profile=None, voice_profile=None, apply=False, allow_experimental=False):
     # CLI > named environment profile > supported legacy model alias > default.
     selected_model = model_profile or env.get("VAPI_MODEL_PROFILE", "").strip()
@@ -144,6 +177,18 @@ def select_profiles(env, *, model_profile=None, voice_profile=None, apply=False,
         credential = _credential_id(env.get("VAPI_ELEVENLABS_CREDENTIAL_ID", "").strip(), "VAPI_ELEVENLABS_CREDENTIAL_ID")
         if credential:
             credentials.append(credential)
+    if voice["provider"] == "custom-voice":
+        tts_url = env.get("VAPI_CUSTOM_TTS_URL", "").strip()
+        credential = _credential_id(env.get("VAPI_CUSTOM_TTS_CREDENTIAL_ID", "").strip(), "VAPI_CUSTOM_TTS_CREDENTIAL_ID")
+        if apply and (not tts_url or not credential):
+            raise ValueError("Set VAPI_CUSTOM_TTS_URL and saved VAPI_CUSTOM_TTS_CREDENTIAL_ID before applying Gemini speech.")
+        if apply and env.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts") != selected_voice:
+            raise ValueError("GEMINI_TTS_MODEL must match the selected Gemini voice profile on the speech server.")
+        voice["server"] = {"url": _tts_url(tts_url) if tts_url else "https://REPLACE-WITH-GEMINI-TTS.example/tts/vapi",
+                           "credentialId": credential or "REPLACE-WITH-SAVED-CUSTOM-TTS-CREDENTIAL-ID", "timeoutSeconds": 30,
+                           "backoffPlan": {"type": "fixed", "maxRetries": 0, "baseDelaySeconds": 1}}
+        voice["cachingEnabled"] = False
+        credentials.append(credential or "REPLACE-WITH-SAVED-CUSTOM-TTS-CREDENTIAL-ID")
     manifest = {
         "model_profile": selected_model, "voice_profile": selected_voice,
         "model_support": model_entry["support"], "voice_support": voice_entry["support"],

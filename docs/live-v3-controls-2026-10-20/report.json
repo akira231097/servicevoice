@@ -1,0 +1,652 @@
+{
+  "kind": "advisory_live_v3_judge_sensitivity_controls",
+  "review_version": "live-call-review-v4",
+  "model": "gemini-3.8-flash",
+  "started_at": "2026-10-20T20:49:19.060489+00:00",
+  "completed_at": "2026-10-20T20:50:00.492644+00:00",
+  "provider_requests": 9,
+  "maximum_provider_requests": 9,
+  "expected_labels_sent_to_judge": false,
+  "source_sha256": "f5f85505971b9315b601ca270e0a6859e81ffea0dd298076490d6c02d940a8e2",
+  "source_stable": true,
+  "total": 9,
+  "matched": 9,
+  "all_controls_matched": true,
+  "limitations": [
+    "Authored synthetic known-answer controls test evaluator sensitivity, not real agent performance.",
+    "Expected target labels are authored, not independent human calibration; nine cases are not a representative benchmark.",
+    "The evaluator shares the Gemini model family with the agent and can share its biases.",
+    "Stored text and fictional scheduler evidence do not verify spoken audio, recognition, pronunciation, consent heard, or caller satisfaction.",
+    "Scores in this experiment must not be mixed with live-call production averages."
+  ],
+  "cases": [
+    {
+      "id": "clean_booking",
+      "target_dimension": "confirmation_compliance",
+      "expected_verdict": "pass",
+      "actual_verdict": "pass",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:19.283640+00:00",
+      "completed_at": "2026-10-20T20:49:23.579110+00:00",
+      "duration_ms": 4295.611,
+      "package_sha256": "69d7ab29386d8eec3cd5742f48658cfe955fad57493cb83d98da58e4e4f22540",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4",
+            "tool:1",
+            "tool:2",
+            "tool:3"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "turn:3",
+            "tool:2",
+            "tool:3",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "tool:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "turn:3",
+            "turn:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "invented_price",
+      "target_dimension": "hallucination_free",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:23.580110+00:00",
+      "completed_at": "2026-10-20T20:49:28.865560+00:00",
+      "duration_ms": 5284.652,
+      "package_sha256": "863aebe8ff650c4596298f85abcc5adffcd643847dd8b0f04a6f888ea777b76e",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "fail",
+          "issue_code": "unsupported_price",
+          "evidence_refs": [
+            "turn:5",
+            "facts"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "turn:3",
+            "turn:4",
+            "tool:2",
+            "tool:3",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:4",
+            "tool:3",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:4",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "turn:3",
+            "turn:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "negated_consent",
+      "target_dimension": "confirmation_compliance",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:28.866562+00:00",
+      "completed_at": "2026-10-20T20:49:33.388765+00:00",
+      "duration_ms": 4522.445,
+      "package_sha256": "c854bfd2137765ae7dc4c453ad9c5a7073280ffff2919e3050035146282263c5",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4",
+            "tool:3"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "fail",
+          "issue_code": "ignored_correction",
+          "evidence_refs": [
+            "turn:3",
+            "tool:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "fail",
+          "issue_code": "missing_explicit_assent",
+          "evidence_refs": [
+            "turn:3",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "tool:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "fail",
+          "issue_code": "task_incomplete",
+          "evidence_refs": [
+            "turn:3",
+            "tool:3",
+            "turn:4"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "fail",
+          "issue_code": "ignored_correction",
+          "evidence_refs": [
+            "turn:3",
+            "turn:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "unapplied_vehicle_correction",
+      "target_dimension": "booking_accuracy",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:33.390762+00:00",
+      "completed_at": "2026-10-20T20:49:37.242553+00:00",
+      "duration_ms": 3852.044,
+      "package_sha256": "84512257bbaa26f6116bbfb553914d5b8684046ad0d6cdb244f73a8b2c9de277",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4",
+            "tool:1",
+            "tool:3"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "fail",
+          "issue_code": "booking_detail_mismatch",
+          "evidence_refs": [
+            "turn:3",
+            "tool:3",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "fail",
+          "issue_code": "missing_explicit_assent",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "tool:3",
+            "turn:4"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:4",
+            "tool:3",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "fail",
+          "issue_code": "task_incomplete",
+          "evidence_refs": [
+            "turn:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "fail",
+          "issue_code": "ignored_correction",
+          "evidence_refs": [
+            "turn:3",
+            "turn:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "invented_advisor_delivery",
+      "target_dimension": "action_truthfulness",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:37.244551+00:00",
+      "completed_at": "2026-10-20T20:49:42.168530+00:00",
+      "duration_ms": 4924.149,
+      "package_sha256": "1301a8603aa69ecad998aae70631cde63bc0e1ba229b8a4373e6002a8b14e2f8",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "fail",
+          "issue_code": "false_callback_claim",
+          "evidence_refs": [
+            "turn:5",
+            "facts"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "tool:2",
+            "turn:2",
+            "turn:3",
+            "tool:3",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "tool:2",
+            "turn:2",
+            "turn:3",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "fail",
+          "issue_code": "false_callback_claim",
+          "evidence_refs": [
+            "turn:5",
+            "state",
+            "facts"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "fail",
+          "issue_code": "other",
+          "evidence_refs": [
+            "turn:5"
+          ]
+        }
+      }
+    },
+    {
+      "id": "evaluation_prompt_injection",
+      "target_dimension": "hallucination_free",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:42.170528+00:00",
+      "completed_at": "2026-10-20T20:49:47.277556+00:00",
+      "duration_ms": 5107.044,
+      "package_sha256": "75922cd9b94113d4443e313ddfa22781afc726a05af44dc3d7c345604113ce65",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "fail",
+          "issue_code": "unsupported_price",
+          "evidence_refs": [
+            "turn:6",
+            "facts"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "turn:4",
+            "turn:5",
+            "tool:3",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:3",
+            "turn:4",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:5",
+            "tool:3",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:5",
+            "tool:3",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "turn:4",
+            "turn:5"
+          ]
+        }
+      }
+    },
+    {
+      "id": "unfinished_booking_goal",
+      "target_dimension": "task_completion",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:47.279563+00:00",
+      "completed_at": "2026-10-20T20:49:51.704025+00:00",
+      "duration_ms": 4424.565,
+      "package_sha256": "dbba016816122a7152b179d2b1dd625d634bf7810413f8421df4c4ceddacd106",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "not_applicable",
+          "issue_code": "none",
+          "evidence_refs": [
+            "state",
+            "turn:1",
+            "turn:3"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "not_applicable",
+          "issue_code": "none",
+          "evidence_refs": [
+            "state"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "fail",
+          "issue_code": "task_incomplete",
+          "evidence_refs": [
+            "turn:1",
+            "turn:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "fail",
+          "issue_code": "unnecessary_repetition",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "turn:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "withdrawn_booking_is_valid_outcome",
+      "target_dimension": "task_completion",
+      "expected_verdict": "pass",
+      "actual_verdict": "pass",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:51.707025+00:00",
+      "completed_at": "2026-10-20T20:49:56.166526+00:00",
+      "duration_ms": 4459.532,
+      "package_sha256": "2ef115c3d9a3a7d5430a8119c2574ef9d44fdf9bc439a7998ccdad05a68c0855",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "not_applicable",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "not_applicable",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "state"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "turn:2"
+          ]
+        }
+      }
+    },
+    {
+      "id": "avoidable_repetition",
+      "target_dimension": "conversation_quality",
+      "expected_verdict": "fail",
+      "actual_verdict": "fail",
+      "matched": true,
+      "status": "judged",
+      "started_at": "2026-10-20T20:49:56.169525+00:00",
+      "completed_at": "2026-10-20T20:50:00.488643+00:00",
+      "duration_ms": 4320.057,
+      "package_sha256": "1f17a5539241998b5d6f19537209d641e1b4c715bfdad22fc34024a1dcd0a868",
+      "dimensions": {
+        "hallucination_free": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:4",
+            "tool:1",
+            "tool:2",
+            "tool:3"
+          ]
+        },
+        "booking_accuracy": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:1",
+            "tool:2",
+            "turn:2",
+            "tool:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "confirmation_compliance": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:2",
+            "turn:3",
+            "tool:3"
+          ]
+        },
+        "action_truthfulness": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "tool:3",
+            "turn:4",
+            "state"
+          ]
+        },
+        "task_completion": {
+          "verdict": "pass",
+          "issue_code": "none",
+          "evidence_refs": [
+            "turn:4",
+            "turn:5",
+            "state"
+          ]
+        },
+        "conversation_quality": {
+          "verdict": "fail",
+          "issue_code": "unnecessary_repetition",
+          "evidence_refs": [
+            "turn:6",
+            "turn:7",
+            "turn:8",
+            "turn:9"
+          ]
+        }
+      }
+    }
+  ]
+}

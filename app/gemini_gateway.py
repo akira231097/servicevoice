@@ -12,10 +12,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 import secrets
 import sqlite3
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import HTTPException, Request
@@ -30,6 +31,8 @@ from .receipt_narration import BoundedSelector, NARRATOR_VERSION
 from .jev_faq import FAQ_VERSION, JevFaqRouter
 from .jev_classifier import JEV_MODEL
 from .issuance_context import user_context
+from .diagnostics import turn_identifier
+from .call_lifecycle import END_CALL, CLOSING_POLICY, UNKNOWN_ATTEMPT_CONTEXT, enabled as closing_enabled, schema as closing_schema
 
 MODEL = "gemini-3.8-flash"
 # A low reasoning setting still spends output budget on hidden reasoning.
@@ -47,11 +50,28 @@ class RequestTiming:
     def __init__(self, call_id, started, sink, observer=None, correlation=None):
         self.started, self.sink, self.finished = started, sink, False
         self.observer,self.correlation=observer,correlation
+        self.diagnostic_context={}
         self.admission_released = False
         self.generation = None
         self.outcome = "interrupted"
+        request_id=uuid4().hex
         self.row = {
-            "request_id": uuid4().hex,
+            "request_id": request_id,
+            "generation_id": str(UUID(request_id)),
+            "generation_sequence": None,
+            "generation_sequence_scope": "process_local_http_arrival_only",
+            "predecessor_generation_id": None,
+            "predecessor_relation": None,
+            "superseded_by_generation_id": None,
+            "supersession_cause": None,
+            "superseded_at_ms": None,
+            "payload_released_at_ms": None,
+            "payload_release_scope": "gateway_yield_not_provider_receipt_or_playback",
+            "downstream_disconnect_at_ms": None,
+            "checkpoint_rejections": 0,
+            "generation_terminal_state": None,
+            "sse_response_id": None,
+            "neutral_sse_response_id": None,
             "call_key": hashlib.sha256(call_id.encode()).hexdigest()[:16],
             "started_at_unix": time.time() - max(0, time.monotonic() - started),
             "system_prompt_sha256": None,
@@ -85,6 +105,17 @@ class RequestTiming:
         if not self.finished and self.row["milestones_ms"][milestone] is None:
             self.row["milestones_ms"][milestone] = round(max(0, time.monotonic() - self.started) * 1000, 3)
 
+    def note_time(self,field):
+        if not self.finished and self.row[field] is None:
+            self.row[field]=round(max(0,time.monotonic()-self.started)*1000,3)
+
+    def note_superseded(self,replacement_id=None,cause="unknown"):
+        if self.finished:return
+        self.note_time("superseded_at_ms")
+        if self.row["supersession_cause"] is None:self.row["supersession_cause"]=cause
+        if self.row["superseded_by_generation_id"] is None:
+            self.row["superseded_by_generation_id"]=replacement_id
+
     async def transport_event(self, event_name, _info):
         # HTTPCore info can include requests, headers, hostnames and exceptions.
         # Count only these two fixed event names; never inspect or save info.
@@ -100,6 +131,16 @@ class RequestTiming:
             return
         self.mark("total")
         self.row["outcome"] = self.outcome
+        if self.outcome=="supersession_wait_expired":
+            terminal="supersession_wait_expired"
+        elif self.generation is not None and self.generation.disconnected:
+            terminal="downstream_disconnected"
+        elif self.generation is not None and self.generation.superseded.is_set():
+            terminal="superseded_after_release" if self.generation.payload_emitted else "superseded_before_release"
+        elif self.outcome in {"cancelled","interrupted"}:
+            terminal="cancelled_unknown_cause"
+        else:terminal=self.outcome
+        self.row["generation_terminal_state"]=terminal
         self.finished = True
         self.sink.append(deepcopy(self.row))
         if self.observer is not None:
@@ -158,18 +199,21 @@ def parse_json(value):
         raise GatewayError("invalid_json") from exc
 
 
-def tool_identity(tool, limits):
+def tool_identity(tool, limits, *, allow_end_call=False):
     if not isinstance(tool, dict):
         raise GatewayError("invalid_tool_history")
     tool_id, function = tool.get("id"), tool.get("function")
     if not isinstance(tool_id, str) or not 1 <= len(tool_id) <= 200 or not isinstance(function, dict):
         raise GatewayError("invalid_tool_history")
     name, arguments = function.get("name"), function.get("arguments")
-    if not isinstance(name, str) or name not in DEFINITIONS or not isinstance(arguments, str) or len(arguments) > limits.argument_chars:
+    if (not isinstance(name, str) or (name not in DEFINITIONS and not (allow_end_call and name == END_CALL))
+            or not isinstance(arguments, str) or len(arguments) > limits.argument_chars):
         raise GatewayError("invalid_tool_history")
     parsed = parse_json(arguments)
     if not isinstance(parsed, dict):
         raise GatewayError("invalid_tool_arguments")
+    if name == END_CALL and parsed:
+        raise GatewayError("invalid_platform_arguments")
     digest = hashlib.sha256(canonical({"name": name, "arguments": parsed}).encode()).hexdigest()
     return tool_id, name, arguments, digest
 
@@ -211,6 +255,17 @@ class SignatureStore:
             session = db.execute("SELECT ended,created,provider_call_id FROM sessions WHERE id=? AND tenant='cedar-demo'", (sid,)).fetchone()
         if not session or session["ended"] or session["provider_call_id"] != call_id or time.time() - session["created"] > 4 * 3600:
             raise GatewayError("inactive_session", 409)
+
+    def diagnostic_tool_context(self,sid,call_id,tool_id):
+        """A best-effort join to existing issuance evidence, never authorization."""
+        try:
+            with closing(sqlite3.connect(self.path,timeout=.02)) as db:
+                row=db.execute("SELECT extras FROM gemini_tool_signatures WHERE session_id=? AND provider_call_id=? AND tool_call_id=?",(sid,call_id,tool_id)).fetchone()
+            value=json.loads(row[0]) if row else {}
+            context=value.get("__servicevoice_issuance_context",{})
+            ordinal=context.get("user_count")
+            return {"user_count":ordinal} if type(ordinal) is int and ordinal>0 else {}
+        except (sqlite3.Error,ValueError,TypeError,AttributeError):return {}
 
     def require_gemini_policy(self, sid, call_id):
         with closing(self.connect()) as db:
@@ -257,13 +312,14 @@ class SignatureStore:
         gateway. A signed call may arrive individually or in a reordered batch,
         so execution checks each identity without imposing history group order.
         """
+        diagnostic_contexts = {}
         with closing(self.connect()) as db:
             db.execute("BEGIN")
             policy = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
             if not policy:
                 raise GatewayError("tool_policy_missing", 403)
             if policy["policy"] == "provider-native":
-                return
+                return diagnostic_contexts
             if policy["policy"] != "gemini-issued":
                 raise GatewayError("tool_policy_configuration", 503)
             for tool_id, name, normalized, original in calls:
@@ -272,18 +328,48 @@ class SignatureStore:
                 if self._existing_exact_operation(db, sid, tool_id, name, normalized):
                     continue
                 _, _, _, digest = tool_identity({"id": tool_id, "function": {"name": name, "arguments": canonical(original)}}, self.limits)
-                row = db.execute("SELECT fingerprint,expires FROM gemini_tool_signatures WHERE provider_call_id=? AND session_id=? AND tool_call_id=?", (call_id, sid, tool_id)).fetchone()
+                row = db.execute("SELECT fingerprint,expires,extras FROM gemini_tool_signatures WHERE provider_call_id=? AND session_id=? AND tool_call_id=?", (call_id, sid, tool_id)).fetchone()
                 if not row or row["expires"] < time.time():
                     raise GatewayError("tool_not_issued", 409)
                 if row["fingerprint"] != digest:
                     raise GatewayError("tool_issue_mismatch", 409)
+                # Project optional observation from this existing authorization
+                # read. It cannot authorize a tool, reject a valid operation,
+                # or add another database/network hop to the response path.
+                try:
+                    extras = json.loads(row["extras"])
+                    context = extras.get("__servicevoice_issuance_context", {})
+                    ordinal = context.get("user_count")
+                    if type(ordinal) is int and 1 <= ordinal <= 100_000:
+                        diagnostic_contexts[tool_id] = {"user_count": ordinal}
+                except (ValueError, TypeError, AttributeError, RecursionError):
+                    pass
+        return diagnostic_contexts
 
-    def save_group(self, sid, call_id, calls, context=None):
+    def end_call_ready(self, sid):
+        """Read durable operations; missing failure receipts remain unresolved.
+
+        A failed journal entry alone is not an authoritative scheduler outcome.
+        A proposal alone is not an accepted operation and does not block exit.
+        This read is a release gate, not an atomic lease over later webhooks.
+        """
+        with closing(self.connect()) as db:
+            unresolved=db.execute("""SELECT 1 FROM tool_invocations i
+                LEFT JOIN tool_results r ON r.session_id=i.session_id AND r.call_id=i.call_id
+                WHERE i.session_id=? AND i.status IN ('queued','running','unknown','failed')
+                AND r.call_id IS NULL LIMIT 1""",(sid,)).fetchone()
+        return unresolved is None
+
+    def save_group(self, sid, call_id, calls, context=None, *, allow_end_call=False):
         from .issuance_context import encode_extras
         group_id, expires = uuid4().hex, time.time() + self.limits.signature_ttl
         records = []
         for index, tool in enumerate(calls):
-            tool_id, _, _, digest = tool_identity(tool, self.limits)
+            tool_id, name, _, digest = tool_identity(tool, self.limits, allow_end_call=allow_end_call)
+            if name == END_CALL and len(calls) != 1:
+                raise GatewayError("invalid_platform_batch")
+            if name == END_CALL and context is None:
+                raise GatewayError("platform_context_missing",409)
             extras = tool.get("extra_content", {})
             if not isinstance(extras, dict) or len(canonical(extras)) > self.limits.extra_chars:
                 raise GatewayError("invalid_tool_signature")
@@ -309,14 +395,16 @@ class SignatureStore:
                 db.rollback()
                 raise
 
-    def restore_group(self, sid, call_id, calls, *, with_context=False):
+    def restore_group(self, sid, call_id, calls, *, with_context=False, allow_end_call=False):
         from .issuance_context import decode_extras
         if not isinstance(calls, list) or not 1 <= len(calls) <= self.limits.tool_calls:
             raise GatewayError("invalid_tool_history")
         restored, group, ordinals, contexts = [], None, [], []
         with closing(self.connect()) as db:
             for tool in calls:
-                tool_id, name, arguments, digest = tool_identity(tool, self.limits)
+                tool_id, name, arguments, digest = tool_identity(tool, self.limits, allow_end_call=allow_end_call)
+                if name == END_CALL and len(calls) != 1:
+                    raise GatewayError("invalid_platform_batch")
                 row = db.execute("SELECT * FROM gemini_tool_signatures WHERE provider_call_id=? AND tool_call_id=? AND session_id=?", (call_id, tool_id, sid)).fetchone()
                 if not row or row["expires"] < time.time():
                     raise GatewayError("tool_signature_missing", 409)
@@ -342,29 +430,35 @@ class SignatureStore:
             raise GatewayError("tool_group_mismatch", 409)
         if any(context != contexts[0] for context in contexts):
             raise GatewayError("tool_group_context_mismatch", 409)
+        if restored and restored[0]["function"]["name"]==END_CALL and contexts[0] is None:
+            raise GatewayError("platform_context_missing",409)
         return (restored, contexts[0]) if with_context else restored
 
 
-def tool_definitions(requested):
-    if not isinstance(requested, list) or len(requested) > len(DEFINITIONS):
+def tool_definitions(requested, *, allow_end_call=False):
+    if not isinstance(requested, list) or len(requested) > len(DEFINITIONS) + int(allow_end_call):
         raise GatewayError("invalid_tools")
     names = []
     for entry in requested:
         if not isinstance(entry, dict) or entry.get("type") != "function" or not isinstance(entry.get("function"), dict):
             raise GatewayError("invalid_tools")
         name = entry["function"].get("name")
-        if not isinstance(name, str) or name not in DEFINITIONS or name in names:
+        if (not isinstance(name, str) or (name not in DEFINITIONS and not (allow_end_call and name == END_CALL))
+                or name in names):
             raise GatewayError("invalid_tools")
         names.append(name)
     # Caller-provided schemas/descriptions cannot grant a new tool or behavior.
-    return [deepcopy(schema) for schema in TOOL_SCHEMAS if schema["function"]["name"] in names]
+    tools=[deepcopy(schema) for schema in TOOL_SCHEMAS if schema["function"]["name"] in names]
+    if END_CALL in names:tools.append(closing_schema())
+    return tools
 
 
-def render_system_prompt(local_date=None):
+def render_system_prompt(local_date=None, *, allow_end_call=False):
     """Render one trusted system policy and fresh public facts from one date."""
     local_date = today() if local_date is None else local_date
     facts = dealership_facts(local_date)
     prompt = SYSTEM_PROMPT.replace("{{current_date}}", facts["today"]).replace("{{timezone}}", facts["timezone"])
+    if allow_end_call:prompt += "\n" + CLOSING_POLICY
     return prompt + "\n<trusted_dealership_facts>\n" + canonical(facts) + "\n</trusted_dealership_facts>"
 
 
@@ -412,14 +506,14 @@ def normalize_causal_tool_history(messages, groups):
     return ordered
 
 
-def prepare_request(body, sid, call_id, store, limits, observations):
+def prepare_request(body, sid, call_id, store, limits, observations, *, allow_end_call=False):
     if body.get("model") != MODEL or body.get("stream") is not True:
         raise GatewayError("unsupported_model_or_stream")
     messages = body.get("messages")
     if not isinstance(messages, list) or not 1 <= len(messages) <= limits.messages:
         raise GatewayError("invalid_history")
     cleaned = [{"role": "system", "content": render_system_prompt()}]
-    waiting, used_ids, groups = set(), set(), []
+    waiting, used_ids, groups, platform_results = set(), set(), [], set()
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
             raise GatewayError("invalid_history")
@@ -434,18 +528,29 @@ def prepare_request(body, sid, call_id, store, limits, observations):
         if role == "assistant" and message.get("tool_calls") is not None:
             if waiting:
                 raise GatewayError("incomplete_tool_history", 409)
-            calls, context = store.restore_group(sid, call_id, message["tool_calls"], with_context=True)
-            groups.append((len(cleaned),len(calls),context))
+            calls, context = store.restore_group(sid, call_id, message["tool_calls"], with_context=True,
+                                                allow_end_call=allow_end_call)
+            platform=bool(calls and calls[0]["function"]["name"]==END_CALL)
+            if not platform:groups.append((len(cleaned),len(calls),context))
             for tool in calls:
                 if tool["id"] in used_ids:
                     raise GatewayError("repeated_tool_history", 409)
                 used_ids.add(tool["id"])
-                waiting.add(tool["id"])
-            value["tool_calls"] = calls
+                (platform_results if platform else waiting).add(tool["id"])
+            if platform:
+                # Authenticate our own exact signature/session before retaining
+                # an explicitly UNKNOWN platform attempt. Never accept a caller-
+                # supplied platform result as scheduler evidence. No synthetic
+                # success/failure tool result is inserted into model history.
+                value["content"]=UNKNOWN_ATTEMPT_CONTEXT
+            else:value["tool_calls"] = calls
         elif message.get("tool_calls") is not None:
             raise GatewayError("invalid_tool_history")
         if role == "tool":
             tool_id = message.get("tool_call_id")
+            if allow_end_call and isinstance(tool_id,str) and tool_id in platform_results:
+                platform_results.remove(tool_id)
+                continue  # Its outcome is unknown even if this raw text claims success.
             if not isinstance(tool_id, str) or tool_id not in waiting:
                 raise GatewayError("orphan_tool_result", 409)
             waiting.remove(tool_id)
@@ -462,7 +567,12 @@ def prepare_request(body, sid, call_id, store, limits, observations):
     if waiting:
         raise GatewayError("incomplete_tool_history", 409)
     cleaned=normalize_causal_tool_history(cleaned,groups)
-    tools = tool_definitions(body.get("tools", []))
+    tools = tool_definitions(body.get("tools", []), allow_end_call=allow_end_call)
+    has_closing=any(tool["function"]["name"]==END_CALL for tool in tools)
+    if has_closing:
+        cleaned[0]["content"]=render_system_prompt(allow_end_call=True)
+        if not store.end_call_ready(sid):
+            tools=[tool for tool in tools if tool["function"]["name"]!=END_CALL]
     result = {"model": MODEL, "reasoning_effort": "low", "stream": True,
               "stream_options": {"include_usage": True}, "messages": cleaned, "max_tokens": MAX_OUTPUT_TOKENS}
     if tools:
@@ -483,8 +593,8 @@ def merge_extras(target, incoming):
 
 
 class ToolAssembler:
-    def __init__(self, limits):
-        self.limits, self.parts = limits, {}
+    def __init__(self, limits, *, allow_end_call=False):
+        self.limits, self.parts, self.allow_end_call = limits, {}, allow_end_call
         self.complete_indices = set()
 
     def _index(self, fragment):
@@ -495,7 +605,7 @@ class ToolAssembler:
             return index, False
         # Google's compatibility stream can emit an entire identified function
         # without an index. Never guess the target of an unidentified fragment.
-        tool_id, _, _, _ = tool_identity(fragment, self.limits)
+        tool_id, _, _, _ = tool_identity(fragment, self.limits, allow_end_call=self.allow_end_call)
         matches = [index for index, item in self.parts.items() if item["id"] == tool_id]
         if matches:
             index = matches[0]
@@ -548,7 +658,9 @@ class ToolAssembler:
         calls = [self.parts[index] for index in sorted(self.parts)]
         ids = set()
         for tool in calls:
-            tool_id, _, _, _ = tool_identity(tool, self.limits)
+            tool_id, name, _, _ = tool_identity(tool, self.limits, allow_end_call=self.allow_end_call)
+            if name == END_CALL and len(calls) != 1:
+                raise GatewayError("invalid_platform_batch")
             if tool_id in ids:
                 raise GatewayError("duplicate_upstream_tool_id")
             ids.add(tool_id)
@@ -655,15 +767,59 @@ class GeminiGateway:
                                connection_capacity=self.limits.concurrency if self.limits.concurrency>4 else 2)
         self.telemetry = None
         self.timing_sink = None
+        self.diagnostics = None
+        self._wal_anchor = None
+        self._wal_anchor_startup_task = None
+        self.wal_anchor_status = "disabled"
 
-    def _observe_timing(self,row,sid):
+    def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
             try:self.timing_sink.record(row)
             except Exception:pass  # Diagnostics must never delay or fail a booking.
+        if self.diagnostics is not None and context is not None:
+            try:
+                call_id=context["call_id"];turn_id=context.get("turn_id")
+                def event(component,event_name,duration,attributes,phase_started=None,phase_outcome=None):
+                    self.diagnostics.record(component,event_name,
+                        phase_outcome or ("success" if row["outcome"] in {"completed","tool_emitted","narrated"} else "superseded" if row["outcome"]=="superseded" else "cancelled" if row["outcome"]=="cancelled" else "failure"),
+                        call_id=call_id,turn_id=turn_id,request_id=row["request_id"],
+                        start_unix=phase_started or row["started_at_unix"],duration_ms=duration,attributes=attributes)
+                event("gateway","request_finished",row["milestones_ms"].get("total"),{
+                    "route":row["route"],"model":MODEL,"user_ordinal":context.get("user_count"),
+                    "first_text_ms":row["milestones_ms"].get("first_text"),"preflight_ms":row["milestones_ms"].get("preflight"),
+                    "input_tokens":row["usage"].get("input_tokens"),"output_tokens":row["usage"].get("output_tokens"),
+                    "total_tokens":row["usage"].get("total_tokens"),"evidence_source":"server_observed",
+                    **{key:row.get(key) for key in ("generation_id","generation_sequence","generation_sequence_scope",
+                        "predecessor_generation_id","predecessor_relation","superseded_by_generation_id",
+                        "generation_terminal_state","supersession_cause","superseded_at_ms",
+                        "payload_released_at_ms","payload_release_scope","downstream_disconnect_at_ms",
+                        "checkpoint_rejections","sse_response_id","neutral_sse_response_id")}})
+                if context.get("llm_started_at") is not None:
+                    llm_end=row["milestones_ms"].get("upstream_done")
+                    if llm_end is None:llm_end=row["milestones_ms"]["total"]
+                    event("llm","generation_finished",max(0,(row["started_at_unix"]+llm_end/1000-context["llm_started_at"])*1000),{
+                        "model":MODEL,"input_tokens":row["usage"].get("input_tokens"),"output_tokens":row["usage"].get("output_tokens"),"evidence_source":"server_observed"},context["llm_started_at"])
+                if row["counts"].get("jev_requests"):
+                    reason=row.get("jev_reason","")
+                    failed=reason=="classification_deadline" or reason.startswith("classifier_")
+                    code="timeout" if reason in {"classification_deadline","classifier_timeout"} else "upstream_unavailable" if failed else "none"
+                    event("faq_router","classification_finished",row["durations_ms"].get("jev_route"),{
+                        "route":row["route"],"error_code":code,"evidence_source":"server_observed"},
+                        context.get("faq_started_at"),"failure" if failed else "success")
+                if row["route"]=="deterministic_receipt":
+                    event("receipt_renderer","render_finished",context.get("receipt_elapsed_ms"),{
+                        "route":row["route"],"source_result_sha256":row.get("source_result_sha256"),
+                        "output_text_sha256":row.get("output_text_sha256"),"evidence_source":"server_observed"},context.get("receipt_started_at"))
+            except Exception:pass
         if self.telemetry is None:return
         attributes={"route":row["route"],"outcome":row["outcome"],"model":MODEL,
                     "prompt_sha256":row["system_prompt_sha256"],"prompt_version":SYSTEM_PROMPT_VERSION,
                     "narrator_version":row["narrator_version"]}
+        for key in ("generation_id","generation_sequence","generation_sequence_scope","predecessor_generation_id",
+                "predecessor_relation","superseded_by_generation_id","supersession_cause","superseded_at_ms",
+                "payload_released_at_ms","payload_release_scope","downstream_disconnect_at_ms",
+                "checkpoint_rejections","generation_terminal_state","sse_response_id","neutral_sse_response_id"):
+            attributes[key]=row.get(key)
         for key,value in row["milestones_ms"].items():attributes[key+"_ms"]=value
         for key,value in row["durations_ms"].items():attributes[key+"_ms"]=value
         for key,value in row["counts"].items():attributes[key]=value
@@ -678,8 +834,69 @@ class GeminiGateway:
         call_key = hashlib.sha256(call_id.encode()).hexdigest()[:16] if call_id is not None else None
         return deepcopy([row for row in self.timings if call_key is None or row["call_key"] == call_key])
 
+    def _open_wal_anchor(self):
+        """Keep WAL sidecars available to a separate read-only reviewer mount.
+
+        This connection is itself read-only. The business process already owns
+        the writable directory, so SQLite can initialize shared-memory sidecars.
+        No BEGIN or cursor survives the probe: this is not a retained snapshot,
+        does not pin a WAL checkpoint, and never changes journal mode.
+        """
+        connection=sqlite3.connect(Path(self.store.path).resolve().as_uri()+"?mode=ro",uri=True,
+            isolation_level=None,check_same_thread=False,timeout=.2)
+        try:
+            with closing(connection.execute("PRAGMA query_only=ON")) as cursor:cursor.fetchall()
+            with closing(connection.execute("PRAGMA journal_mode")) as cursor:
+                mode=cursor.fetchone()[0]
+            if mode!="wal":
+                connection.close()
+                return None
+            with closing(connection.execute("SELECT name FROM sqlite_schema LIMIT 1")) as cursor:cursor.fetchall()
+            if connection.in_transaction:
+                raise sqlite3.OperationalError("unexpected_read_transaction")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    async def _initialize_wal_anchor(self):
+        try:
+            connection=await run_in_threadpool(self._open_wal_anchor)
+            if self.closing:
+                if connection is not None:await run_in_threadpool(connection.close)
+                self.wal_anchor_status="closed"
+                return False
+            self._wal_anchor=connection
+            self.wal_anchor_status="ready" if connection is not None else "not_wal"
+            return connection is not None
+        except Exception:
+            self.wal_anchor_status="unavailable"
+            # An explicitly enabled observation path must not silently appear
+            # ready. Do not include SQLite errors, file paths or credentials.
+            raise RuntimeError("gateway_wal_anchor_unavailable") from None
+
     async def start(self):
+        if self.closing:return False
+        config=await run_in_threadpool(self.config_loader)
+        if self.closing:return False
+        if config.get("SERVICEVOICE_TIMING_PERSISTENCE","off")=="on":
+            if self._wal_anchor_startup_task is None:
+                self._wal_anchor_startup_task=asyncio.create_task(self._initialize_wal_anchor())
+                # A cancelled lifespan waiter does not abandon a created SQLite
+                # connection. close() also handles a late initializer safely.
+                self._wal_anchor_startup_task.add_done_callback(
+                    lambda task:None if task.cancelled() else task.exception())
+            await asyncio.shield(self._wal_anchor_startup_task)
         return await self.faq.start()
+
+    async def _close_wal_anchor(self):
+        task=self._wal_anchor_startup_task
+        if task is not None and not task.done():
+            with suppress(TimeoutError,RuntimeError):
+                await asyncio.wait_for(asyncio.shield(task),timeout=1)
+        connection,self._wal_anchor=self._wal_anchor,None
+        if connection is not None:await run_in_threadpool(connection.close)
+        if task is not None:self.wal_anchor_status="closed"
 
     async def close(self):
         self.closing = True
@@ -691,7 +908,8 @@ class GeminiGateway:
         try:
             await self.client.aclose()
         finally:
-            await self.faq.close()
+            try:await self.faq.close()
+            finally:await self._close_wal_anchor()
 
     def _release(self, call_id, timing=None):
         # Event-loop-local, synchronous removal cannot be interrupted midway.
@@ -712,9 +930,11 @@ class GeminiGateway:
         if call_id not in self.owners and call_id not in self.successors:
             self.active.discard(call_id)
 
-    def _supersede(self, generation):
+    def _supersede(self, generation, *, replacement=None):
         if generation.superseded.is_set():
             return
+        generation.timing.note_superseded(replacement.timing.row["generation_id"] if replacement is not None else None,
+            "newer_local_http_arrival" if replacement is not None else "gateway_shutdown" if self.closing else "unknown")
         generation.superseded.set()
         task = generation.task
         if task is not None and not task.done():
@@ -736,6 +956,7 @@ class GeminiGateway:
     def _checkpoint(self, timing):
         generation = timing.generation
         if generation is not None and (generation.superseded.is_set() or self.owners.get(generation.call_id) is not generation):
+            if not timing.finished:timing.row["checkpoint_rejections"]+=1
             raise GenerationSuperseded()
 
     def _phase(self, timing, active):
@@ -749,6 +970,7 @@ class GeminiGateway:
 
     def _payload(self, timing):
         self._checkpoint(timing)
+        timing.note_time("payload_released_at_ms")
         if timing.generation is not None:
             timing.generation.payload_emitted = True
         # Never cancel an ASGI send outside our generator's exception handler.
@@ -756,16 +978,18 @@ class GeminiGateway:
         # an already emitted command or prove whether the caller heard text.
         self._phase(timing, False)
 
-    async def _neutral_stream(self, request):
+    async def _neutral_stream(self, request, timing=None):
         if await request.is_disconnected():
             return
-        yield sse({"id":"chatcmpl-"+uuid4().hex,"object":"chat.completion.chunk",
+        response_id="chatcmpl-"+uuid4().hex
+        if timing is not None and not timing.finished:timing.row["neutral_sse_response_id"]=response_id
+        yield sse({"id":response_id,"object":"chat.completion.chunk",
                    "created":int(time.time()),"model":MODEL,
                    "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
         yield b"data: [DONE]\n\n"
 
     def _neutral_response(self, request, call_id, timing):
-        return OwnedStream(self._neutral_stream(request), lambda:self._cleanup_narration(call_id,timing))
+        return OwnedStream(self._neutral_stream(request,timing), lambda:self._cleanup_narration(call_id,timing))
 
     async def _admit(self, request, call_id, timing, sequence):
         generation = Generation(call_id, sequence, timing)
@@ -777,6 +1001,7 @@ class GeminiGateway:
             self.latest_sequences = {key:value for key,value in self.latest_sequences.items() if value[1]>moment}
             prior = self.latest_sequences.get(call_id)
             if prior is not None and sequence<prior[0]:
+                timing.note_superseded(prior[2] if len(prior)>2 else None,"newer_local_http_arrival")
                 generation.superseded.set()
                 timing.outcome="superseded"
                 return False
@@ -788,15 +1013,20 @@ class GeminiGateway:
                 raise HTTPException(429,"Gateway capacity unavailable.")
             owner = self.owners.get(call_id)
             previous = self.successors.get(call_id)
+            predecessor=previous or owner
+            if predecessor is not None:
+                timing.row["predecessor_generation_id"]=predecessor.timing.row["generation_id"]
+                timing.row["predecessor_relation"]="queued_successor" if previous is not None else "active_or_draining_owner"
             if owner is None and previous is None and len(self.active)>=self.limits.concurrency:
                 timing.outcome="capacity_rejected";timing.finish()
                 raise HTTPException(429,"Gateway capacity unavailable.")
             if call_id not in self.latest_sequences and len(self.latest_sequences)>=self.limits.signatures_total:
                 timing.outcome="capacity_rejected";timing.finish()
                 raise HTTPException(429,"Gateway admission metadata capacity unavailable.")
-            self.latest_sequences[call_id]=(sequence,timing.started+self.limits.total_seconds+self.limits.cleanup_seconds)
+            self.latest_sequences[call_id]=(sequence,timing.started+self.limits.total_seconds+self.limits.cleanup_seconds,
+                                            timing.row["generation_id"])
             if previous is not None:
-                self._supersede(previous)
+                self._supersede(previous,replacement=generation)
             if owner is None:
                 self.successors.pop(call_id,None)
                 self.owners[call_id]=generation
@@ -804,7 +1034,7 @@ class GeminiGateway:
                 self._phase(timing,True)
                 return True
             self.successors[call_id]=generation
-            self._supersede(owner)
+            self._supersede(owner,replacement=generation)
 
         # Keep the actual running/draining owner's barrier, never a superseded
         # waiter's barrier. A -> B -> C must still wait for A to really finish.
@@ -821,6 +1051,7 @@ class GeminiGateway:
                     timing.outcome="superseded"
                     return False
                 if not owner.released.is_set():
+                    timing.note_superseded(cause="predecessor_cleanup_wait_expired")
                     generation.superseded.set()
                     timing.outcome="supersession_wait_expired"
                     return False
@@ -876,6 +1107,7 @@ class GeminiGateway:
             if await request.is_disconnected():
                 if generation is not None:
                     generation.disconnected=True
+                    generation.timing.note_time("downstream_disconnect_at_ms")
                 owner.cancel()
                 return
             await asyncio.sleep(0.1)
@@ -897,13 +1129,19 @@ class GeminiGateway:
         call = body.get("call")
         sid = await run_in_threadpool(self.bind_call, call, body.get("assistant"))
         call_id = call["id"]
-        timing = RequestTiming(call_id, received_at, self.timings,self._observe_timing,sid)
+        request.state.diagnostic_call_id=call_id
+        diagnostic_context={"call_id":call_id}
+        timing = RequestTiming(call_id, received_at, self.timings,
+            lambda row,session:self._observe_timing(row,session,diagnostic_context),sid)
+        timing.row["generation_sequence"]=sequence
+        timing.diagnostic_context=diagnostic_context
         try:
             # A configured native/default call must never receive custom Gemini
             # output while retaining the weaker provider-native execution gate.
             await run_in_threadpool(self.store.require_gemini_policy, sid, call_id)
             await run_in_threadpool(self.store.check_live, sid, call_id)
-            upstream = await run_in_threadpool(prepare_request, body, sid, call_id, self.store, self.limits, self.observations)
+            upstream = await run_in_threadpool(prepare_request, body, sid, call_id, self.store, self.limits, self.observations,
+                                               **({"allow_end_call":True} if closing_enabled(config) else {}))
         except (GatewayError, ObservationError) as exc:
             timing.outcome = "rejected"
             timing.finish()
@@ -913,6 +1151,9 @@ class GeminiGateway:
             timing.finish()
             raise HTTPException(503, "Gateway state unavailable.") from None
         timing.mark("preflight")
+        context=user_context(upstream["messages"])
+        if context:
+            diagnostic_context.update(user_count=context["user_count"],turn_id=turn_identifier(call_id,context["user_count"]))
         timing.row["system_prompt_sha256"] = hashlib.sha256(upstream["messages"][0]["content"].encode("utf-8")).hexdigest()
         timing.row["counts"]["history_messages"] = len(upstream["messages"])
         timing.row["counts"]["history_tool_results"] = sum(message["role"] == "tool" for message in upstream["messages"])
@@ -957,7 +1198,10 @@ class GeminiGateway:
     async def _generate(self,request,config,key,upstream,sid,call_id,started,timing):
         if config.get("SERVICEVOICE_RECEIPT_NARRATION") == "on":
             try:
+                timing.diagnostic_context["receipt_started_at"]=time.time()
+                receipt_started=time.monotonic()
                 decision = await self.narration.choose(sid, call_id, upstream["messages"])
+                timing.diagnostic_context["receipt_elapsed_ms"]=(time.monotonic()-receipt_started)*1000
                 self._checkpoint(timing)
                 timing.row["narration_reason"] = decision.reason
                 if decision.text is not None:
@@ -971,6 +1215,7 @@ class GeminiGateway:
                 raise
         if config.get("SERVICEVOICE_JEV_FAQ") == "on":
             faq_started = time.monotonic()
+            timing.diagnostic_context["faq_started_at"]=time.time()
             watch_stop = asyncio.Event()
             watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
             try:
@@ -1002,6 +1247,7 @@ class GeminiGateway:
         try:
             async with asyncio.timeout(max(0.001, self.limits.total_seconds-(time.monotonic()-started))):
                 provider_request = self.client.build_request("POST", GOOGLE_URL, json=upstream, headers={"Authorization": "Bearer " + key})
+                timing.diagnostic_context["llm_started_at"]=time.time()
                 provider_request.extensions["trace"] = timing.transport_event
                 response = await self.client.send(provider_request, stream=True)
                 timing.generation.response=response
@@ -1027,7 +1273,8 @@ class GeminiGateway:
             with suppress(asyncio.CancelledError):
                 await watcher
         return OwnedStream(self._relay(request, response, sid, call_id, started, timing,
-                                       issuance_context=user_context(upstream["messages"])),
+                                       issuance_context=user_context(upstream["messages"]),
+                                       allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[]))),
                            lambda: self._cleanup(response, call_id, timing))
 
     async def _cleanup_narration(self, call_id, timing):
@@ -1039,6 +1286,7 @@ class GeminiGateway:
 
     async def _narrate(self, request, text, timing, source="servicevoice-receipt"):
         response_id = "chatcmpl-" + uuid4().hex
+        timing.row["sse_response_id"]=response_id
         def chunk(delta, reason=None):
             return {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
                     "model": source, "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
@@ -1062,17 +1310,17 @@ class GeminiGateway:
             if self._obsolete(timing) and not timing.generation.disconnected:
                 timing.outcome="superseded"
                 self._phase(timing,False)
-                async for part in self._neutral_stream(request):yield part
+                async for part in self._neutral_stream(request,timing):yield part
                 return
             timing.outcome = "cancelled"
             raise
         finally:
             self._phase(timing,False)
 
-    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None):
+    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None, allow_end_call=False):
         timing = timing or RequestTiming(call_id, started, self.timings)
         transport = {"iterator": response.aiter_bytes(), "buffer_bytes": 0, "received_bytes": 0}
-        assembler = ToolAssembler(self.limits)
+        assembler = ToolAssembler(self.limits,allow_end_call=allow_end_call)
         finished, completed, pending_calls, finish_reason = False, False, None, None
         # A model may put an unsupported success claim before its tool call.
         # Keep that generation's prose private until its type is known. A tool
@@ -1080,6 +1328,7 @@ class GeminiGateway:
         # the outcome speech. Text-only generations retain their exact words.
         text_parts, text_bytes = [], 0
         response_id = "chatcmpl-" + uuid4().hex
+        timing.row["sse_response_id"]=response_id
         watch_stop = asyncio.Event()
         watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
         def chunk(delta, reason=None):
@@ -1102,8 +1351,13 @@ class GeminiGateway:
                             raise TimeoutError()
                         self._checkpoint(timing)
                         if pending_calls:
+                            if pending_calls[0]["function"]["name"]==END_CALL:
+                                if not await run_in_threadpool(self.store.end_call_ready,sid):
+                                    raise GatewayError("platform_operation_unresolved",409)
+                                self._checkpoint(timing)
                             persistence_started = time.monotonic()
-                            await run_in_threadpool(self.store.save_group, sid, call_id, pending_calls, context=issuance_context)
+                            await run_in_threadpool(self.store.save_group, sid, call_id, pending_calls, context=issuance_context,
+                                                    allow_end_call=allow_end_call)
                             self._checkpoint(timing)
                             timing.row["durations_ms"]["tool_signature_persist"] = round((time.monotonic() - persistence_started) * 1000, 3)
                             timing.row["counts"]["tool_calls"] = len(pending_calls)
@@ -1183,7 +1437,7 @@ class GeminiGateway:
             if self._obsolete(timing) and not timing.generation.disconnected:
                 timing.outcome="superseded"
                 self._phase(timing,False)
-                async for part in self._neutral_stream(request):yield part
+                async for part in self._neutral_stream(request,timing):yield part
                 return
             timing.outcome = "cancelled"
             raise
@@ -1191,7 +1445,7 @@ class GeminiGateway:
             if self._obsolete(timing) and not timing.generation.disconnected:
                 timing.outcome="superseded"
                 self._phase(timing,False)
-                async for part in self._neutral_stream(request):yield part
+                async for part in self._neutral_stream(request,timing):yield part
                 return
             timing.outcome = "stream_unavailable"
             # The status is already streaming. Do not emit a success finish/DONE

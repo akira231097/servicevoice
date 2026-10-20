@@ -2,10 +2,10 @@
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_serializer, model_validator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from .domain import Store
+from .domain import DomainError, Store, normalize_services
 from .tool_schema import provider_schema
 
-SYSTEM_PROMPT_VERSION = "2026-10-18-gemini-agentic-18"
+SYSTEM_PROMPT_VERSION = "2026-10-20-gemini-agentic-19-combined-intake"
 # Per-generation execution bound; independent of the number of catalog tools.
 MAX_TOOL_BATCH = 12
 SYSTEM_PROMPT = '''<role>
@@ -21,6 +21,13 @@ After a saved local handoff, a queue-save failure, an explicit decline, or a sta
 <presentation_metadata>
 Every tool with a presentation field requires an explicit rendering decision. Set presentation to an object with response_scope="receipt_only", the current response_language and caller_timezone when the next reply needs only the verified offers, complete readback or saved result. Infer the current language from the conversation; an explicit language declaration is not required. Use dealership for resolved dealership-local time, or the caller's resolved IANA timezone for an equivalent time as well. This is not a list of supported conversation languages. Set presentation to null when another unanswered question, explanation, unresolved correction or genuine uncertainty needs a full response. Do not omit the field or invent preferences to fill it. A fully resolved contact or vehicle correction whose corrected proposal can be read back is eligible for the object. Re-evaluate on each tool call, including after the latest assent; never copy stale preferences. Presentation describes how to render verified facts; it never selects a slot, proves assent, grants permission or changes the proposal. All preparation, readback, subsequent explicit assent and receipt requirements remain unchanged.
 </presentation_metadata>
+
+<combined_service_visit>
+When the caller requests several supported services, preserve ALL of them in ONE appointment with ONE reference. A diagnostic appointment plus brake inspection is supported as one combined intake visit; do not silently drop either request, create separate appointments, or send a supported combination to an advisor merely because it has several services.
+For availability and booking preparation, keep service as the first selected catalog ID and set services to the complete ordered list including that first ID. For one service, set services=null or a one-item list. Never infer an additional service or duplicate an ID. Every returned slot is ONE 60-minute intake block regardless of the number of selected services; this is not a promise of repair labor duration or completion time.
+Read back every selected service in the single proposal before asking for explicit later confirmation. Confirm only the exact complete scope the caller heard and accepted. A requested service addition, removal or correction before confirmation requires searching the updated complete set and preparing a fresh complete proposal; never confirm the obsolete proposal. Preserve the full service list when correcting only customer or vehicle details.
+If the caller changes the services of this conversation's already confirmed appointment, use prepare_reschedule with the complete new services list and the saved appointment's slot_id to propose that change at the same time. A time change still requires an offered available slot. It remains the same appointment and reference and requires a new readback and later explicit confirmation. A plain reschedule preserves all saved services; cancellation affects the whole visit. Claim all requested services were saved only when the successful receipt's full service scope matches them.
+</combined_service_visit>
 
 <facts>
 The current dealership-local date is {{current_date}} and timezone is {{timezone}}. Use that date/year for relative dates. If missing or unresolved, use get_dealership_info. Clarify an ambiguous date, time or timezone BEFORE collecting more customer details or preparing a proposal. Ask which timezone the caller means instead of assuming a conversion of your last offer. Once resolved, use the offset for that specific date and repeat both the dealership time and the caller's requested timezone equivalent at readback. Read back the full weekday, date, time and timezone; never substitute a timezone identifier for a physical location.
@@ -111,8 +118,9 @@ class Presentable(StrictModel):
     def preserve_legacy_arguments(self, handler):
         value = handler(self)
         # Omission must preserve pre-v7 idempotency fingerprints in every caller.
-        if value.get("presentation") is None:
-            value.pop("presentation", None)
+        for field in ("presentation","services"):
+            if value.get(field) is None:
+                value.pop(field, None)
         return value
 
 class AvailabilityTimeFilter(StrictModel):
@@ -136,8 +144,22 @@ class AvailabilityTimeFilter(StrictModel):
                 raise ValueError("The time range must contain at least one time; overnight ranges require separate dates.")
         return self
 
-class Search(Presentable):
-    service: Literal["oil_change","tires","brakes","diagnostic"]
+ServiceID = Literal["oil_change","tires","brakes","diagnostic"]
+
+
+class ServiceSelection(Presentable):
+    service: ServiceID = Field(description="Primary service, equal to the first item of services when a complete list is supplied.")
+    services: list[ServiceID] | None = Field(None,min_length=1,max_length=4,
+        description="Complete ordered unique service scope of ONE intake appointment, including primary service first. Null means only the primary service. Preserve every caller-requested supported service.")
+
+    @model_validator(mode="after")
+    def complete_service_scope(self):
+        try:normalize_services(self.service,self.services)
+        except DomainError as exc:raise ValueError(exc.message) from None
+        return self
+
+
+class Search(ServiceSelection):
     date: str | None = Field(None,pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",description="YYYY-MM-DD in America/Chicago; omit to search next available")
     time_filter: AvailabilityTimeFilter | None = Field(None, description="Resolved dealership-local exact time or range. Filter all available slots before selecting offers. Convert a known caller timezone first; clarify uncertain conversions.")
 
@@ -146,21 +168,19 @@ class Search(Presentable):
         value = handler(self)
         # Old normalized Search arguments include date:null. Preserve that exact
         # shape so historical same-ID retries still match their fingerprints.
-        for key in ("presentation", "time_filter"):
+        for key in ("presentation", "time_filter", "services"):
             if value.get(key) is None:
                 value.pop(key, None)
         return value
 
-class Booking(Presentable):
-    service: Literal["oil_change","tires","brakes","diagnostic"]
+class Booking(ServiceSelection):
     slot_id: str = Field(min_length=1,max_length=100)
     customer_name: str = Field(min_length=2,max_length=80)
     phone: str = Field(min_length=10,max_length=25)
     vehicle: str = Field(min_length=4,max_length=120)
 
-class FirstAvailableBooking(Presentable):
+class FirstAvailableBooking(ServiceSelection):
     strategy: Literal["first_available"] = Field(description="Only explicit unrestricted earliest availability; no date, day, time window or unresolved constraint.")
-    service: Literal["oil_change","tires","brakes","diagnostic"]
     customer_name: str = Field(min_length=2,max_length=80)
     phone: str = Field(min_length=10,max_length=25)
     vehicle: str = Field(min_length=4,max_length=120)
@@ -171,6 +191,16 @@ class Confirm(Presentable):
 
 class Reschedule(Presentable):
     slot_id: str = Field(min_length=1,max_length=100)
+    services: list[ServiceID] | None = Field(None,min_length=1,max_length=4,
+        description="Complete replacement service list for this same appointment; null preserves all saved services. A changed list may use the existing appointment slot_id without changing its time. Requires a fresh full readback and later confirmation.")
+
+    @field_validator("services")
+    @classmethod
+    def complete_service_scope(cls,value):
+        if value is not None:
+            try:normalize_services(value[0],value)
+            except DomainError as exc:raise ValueError(exc.message) from None
+        return value
 
 class Dismiss(StrictModel):
     proposal_id: str = Field(min_length=1,max_length=100,description="The pending proposal the caller declined; never an appointment ID")
@@ -189,13 +219,13 @@ DEFINITIONS={
     "begin_service_request":(Search,"Initial availability when the complete, unrestricted first-available shortcut does not apply. Gets date, policy and slots; does not reserve or book. Invalidates old proposals."),
     "search_availability":(Search,"Search live mock capacity, applying the caller's resolved exact time or range before selecting up to three offers. Inspect complete/truncated/query metadata; an omitted slot is not unavailable. Every search invalidates any previous unconfirmed proposal."),
     "prepare_first_available_booking":(FirstAvailableBooking,"For a fresh session only: explicitly requested unrestricted earliest availability plus complete service/name/callback/vehicle. Server selects the first live slot and prepares the readback. No reservation or booking; requires later caller confirmation. Never for date/time constraints, corrections or existing task state."),
-    "prepare_booking":(Booking,"Prepare a booking readback. Does NOT book; user must then explicitly confirm the exact proposal."),
+    "prepare_booking":(Booking,"Prepare ONE intake appointment covering the complete services list in one readback. Does NOT book; user must then explicitly confirm the exact proposal."),
     "confirm_action":(Confirm,"Commit the current proposal only after reading it aloud and receiving explicit agreement in the next user turn. Safe to retry same proposal."),
     "dismiss_proposal":(Dismiss,"Withdraw the current pending proposal when the caller declines. Never cancels or changes an existing appointment."),
     "get_appointment":(Empty,"Look up the saved appointment for THIS conversation, including after a write timeout."),
     "get_session_context":(Empty,"Recover compact authoritative task state after a detour or uncertainty; contains facts, not a conversation summary or consent proof."),
     "get_operation":(Operation,"Check an original operation after operation_pending. Use the exact returned operation_id; never retry an uncertain write under a different ID."),
-    "prepare_reschedule":(Reschedule,"Prepare a change to this conversation's appointment using a returned available slot. Requires subsequent confirmation."),
+    "prepare_reschedule":(Reschedule,"Prepare a time and/or complete service-scope change to this conversation's ONE appointment. Time changes need an offered available slot; service-only changes may keep the saved slot_id. Null services preserves every saved service. Requires fresh readback and subsequent confirmation."),
     "prepare_cancellation":(Presentable,"Prepare cancellation of this conversation's appointment. Requires subsequent confirmation."),
     "request_handoff":(Handoff,"Save an advisor request in the LOCAL DEMO QUEUE. No actual transfer or callback is delivered."),
     "withdraw_handoff":(WithdrawHandoff,"Withdraw this conversation's saved LOCAL advisor request when the caller asks to remove it. Requires a successful receipt before claiming withdrawal. Retains audit history; never changes an appointment or sends external contact."),
@@ -212,6 +242,9 @@ def model_tool_parameters(model):
         parameters.setdefault("required", []).append("presentation")
         # A required nullable decision has no implicit choice for the model.
         parameters["properties"]["presentation"].pop("default", None)
+    if "services" in model.model_fields:
+        parameters.setdefault("required", []).append("services")
+        parameters["properties"]["services"].pop("default", None)
     return parameters
 
 

@@ -20,17 +20,19 @@ flowchart LR
     Gateway -. content-free timings .-> Smith[LangSmith]
 ```
 
-The v18 configuration uses Gemini `gemini-3.8-flash` with low reasoning, Soniox automatic speech recognition and ElevenLabs speech synthesis through Vapi. Provider access and model availability depend on your account. The application supports optional guarded narration from verified receipts and a narrow TypeSafe Jev FAQ classification route. Neither optimization can confirm a booking or invent availability.
+The v18 baseline uses Gemini `gemini-3.8-flash` with low reasoning, Soniox speech recognition and ElevenLabs speech synthesis through Vapi. This evaluation branch adds an isolated Gemini `gemini-3.8-flash-lite-tts` speech candidate, real sample-rate conversion, native closing and detailed call diagnostics. Phone acceptance remains separate from automated text/tool tests. Provider access and model availability depend on your account. Optional guarded narration from verified receipts and a narrow TypeSafe Jev FAQ route cannot confirm a booking or invent availability.
 
 ## What is implemented
 
 - Availability, proposals, booking, appointment lookup, rescheduling and cancellation in a local scheduler.
+- One intake appointment covering several supported services, with one reference and capacity block, complete readbacks and fresh confirmation after a service change. The intake block is not a repair-completion promise.
 - Fresh, session-scoped proposals; readback and a later confirmation step before committing an appointment.
 - Idempotent mutations, atomic capacity checks, issued-tool validation and verified result history.
 - Bounded tool execution, pending/unknown operation states and recovery without blindly replaying uncertain work.
 - Separate private operator console and authenticated public provider endpoints.
 - Phone admission limits, an advisor request inbox and optional local MCP advisor integration.
 - Content-free runtime tracing, synthetic reference datasets, native LangSmith experiments and hallucination checks.
+- Automatic post-call reviews with separate mechanical booking checks, advisory semantic grades, evidence coverage, response-generation lineage and measured latency. See [component observability](docs/component-observability.md).
 - Docker and single-instance Lightsail deployment packages, backup/restore tools and fault/load tests.
 
 An advisor request is a saved local task. It does not send a callback or transfer a live call. There is no real dealership CRM/DMS integration. Generated speech can still be wrong; these safeguards and evaluations reduce risk without guaranteeing zero hallucinations. The scheduler remains the authority for committed appointments.
@@ -94,8 +96,9 @@ This public repository contains a clean source snapshot. Credentials, customer/c
 ## Automatic live-call reviews
 
 The optional post-call worker reviews completed calls automatically and sends
-private scores and voice timing to the `servicevoice-live-calls` LangSmith
-project. It runs separately from voice generation and mounts the scheduler
+private scores and voice timing to its configured LangSmith project. The
+original baseline uses `servicevoice-live-calls`; the isolated Gemini speech
+candidate uses `servicevoice-speech-candidate`. It runs separately from voice generation and mounts the scheduler
 volume read-only. The voice process receives no evaluation Vapi API key.
 
 It checks factual grounding, action truthfulness, caller intent versus saved
@@ -140,11 +143,16 @@ rather than assuming API sort order. Unavailable provider records are excluded,
 not counted as successes. Reviews normally follow hang-up by about one or two
 minutes; provider outages and queued calls can take longer.
 
-In LangSmith, inspect `voice.call.review` with the current
-`live-call-review-v2` tag. `voice.review.coverage` records immutable worker-status
-snapshots. v1 records are retained as earlier revisions; the v2 latency correction
-reuses frozen semantic grades without another model request. The separate
-reference datasets/experiments remain offline regression evaluations.
+In LangSmith, inspect `voice.call.review` in the project matching the assistant
+you tested. The original baseline's `live-call-review-v2` records are historical;
+the evaluation branch's candidate reviewer uses `live-call-review-v5`. Check
+each row's review version, source digest and judge prompt revision before
+comparing results. `voice.review.coverage` records immutable worker-status
+snapshots. Earlier versions remain visible; the historical v2 latency correction
+reused frozen semantic grades without another model request. The separate
+reference datasets/experiments remain regression evaluations, not real-call
+performance denominators. See the [candidate reviewer guide](deploy/lightsail/speech-evaluations.md)
+for its separate image, evidence volumes and outbox.
 
 The default allowance is 200 post-call model attempts per UTC month per worker,
 including failed attempts, and at most three attempts per call. Budget exhaustion

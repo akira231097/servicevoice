@@ -1,0 +1,36 @@
+# Reviewed optional snippet: insert INSIDE the existing HTTPS site's braces,
+# before its final catch-all. Do not replace existing main-number routes.
+@speech_candidate_business {
+    method POST
+    path /speech-candidate/webhooks/vapi/inbound /speech-candidate/llm/chat/completions
+}
+handle @speech_candidate_business {
+    uri strip_prefix /speech-candidate
+    request_body {
+        max_size 1MB
+    }
+    reverse_proxy servicevoice-candidate:8000 {
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 35s
+            keepalive 4s
+        }
+    }
+}
+@speech_candidate_audio {
+    method POST
+    path /speech-candidate/tts/vapi
+}
+handle @speech_candidate_audio {
+    uri strip_prefix /speech-candidate
+    request_body {
+        max_size 1MB
+    }
+    reverse_proxy servicevoice-speech-candidate:8000 {
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 35s
+            keepalive 4s
+        }
+    }
+}

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ServiceVoice: how to review your calls</title>
+<style>
+:root{color-scheme:light;--ink:#142333;--muted:#526273;--line:#d8e2e9;--teal:#006e71;--paper:#fff;--wash:#eef5f6}
+*{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:var(--ink);font:17px/1.65 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1080px;margin:auto;padding:48px 28px 70px}header{border-top:6px solid var(--teal);padding:32px;background:var(--paper);border-radius:6px}.eyebrow{margin:0;color:var(--teal);font-size:13px;font-weight:750;letter-spacing:.1em;text-transform:uppercase}h1{font-size:clamp(32px,4vw,48px);line-height:1.15;max-width:750px;margin:14px 0 20px}h2{font-size:26px;line-height:1.3;margin:34px 0 14px}h3{font-size:19px;line-height:1.35;margin:0 0 8px}p{margin:0 0 15px}.lede{font-size:20px;max-width:830px}.muted,small{color:var(--muted)}a{color:var(--teal);text-underline-offset:3px}a.button{display:inline-block;background:var(--teal);color:white;padding:10px 17px;border-radius:5px;text-decoration:none;margin:4px 8px 8px 0;font-weight:650}section{background:var(--paper);padding:10px 28px 24px;border:1px solid var(--line);border-radius:6px;margin-top:22px}.callout{padding:16px 18px;background:var(--wash);border-left:4px solid var(--teal);margin:18px 0}.warn{background:#fff6e5;border-color:#b98012}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}.card{padding:18px;background:var(--wash);border-radius:5px}.step{font-size:12px;color:var(--teal);font-weight:750;letter-spacing:.08em;text-transform:uppercase}.flow{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin:20px 0}.flow div{flex:1;min-width:160px;padding:16px;background:var(--wash);border-radius:5px}.flow strong{display:block}code{font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;background:#eaf0f4;padding:2px 5px;border-radius:3px;overflow-wrap:anywhere}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:15px;margin:16px 0}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:13px 12px}th{background:var(--wash)}td:first-child{min-width:190px;font-weight:650}li{margin:9px 0}ol,ul{padding-left:24px}.tag{font-size:13px;display:inline-block;border:1px solid var(--line);border-radius:4px;padding:3px 7px}.check{color:#087052}.fail{color:#b02433}.unknown{color:#876109}footer{margin-top:30px;font-size:14px;color:var(--muted)}@media(max-width:720px){main{padding:20px 14px 40px}header,section{padding:22px 18px}.grid{grid-template-columns:1fr}h2{font-size:23px}.lede{font-size:18px}}
+</style>
+</head>
+<body><main>
+<header>
+<p class="eyebrow">ServiceVoice · operator guide · review version 3</p>
+<h1>After a call, here is how to tell whether the agent did a good job.</h1>
+<p class="lede">LangSmith is your call report card and investigation desk. It tells you what our checks found, what saved successfully, where time was spent, and what we could not verify.</p>
+<a class="button" href="https://smith.langchain.com/">Open LangSmith</a>
+<p class="muted">Sign in to your own workspace and select the project configured for your deployment, commonly <strong>servicevoice-live-calls</strong>. This public guide omits private workspace and resource addresses; the link above opens the general LangSmith entry page. This is a historical v3 guide: check the review version on a row before applying its instructions.</p>
+<div class="callout warn"><strong>Release boundary:</strong> speech changes require a separate listening acceptance test. Trace and review features described here do not prove that any particular phone assistant has changed or passed that test. Confirm the review version and configuration on the specific call.</div>
+</header>
+
+<section id="quick-start"><h2>Your routine after every call</h2>
+<ol>
+<li><strong>Finish the call and note the approximate time.</strong> The reviewer works afterward, outside the conversation. A short delay before its report appears is normal; there is no guaranteed completion time.</li>
+<li><strong>Open the project above and choose the time range covering your call.</strong> Look for a row named <code>voice.call.review</code>. One such row is one call review. Its Inputs include the call ID and a private Vapi call link.</li>
+<li><strong>Use the v3 filters below.</strong> Open the row and examine its Feedback and Outputs. Start with <code>needs_review</code>, then read every failed or uncertain check.</li>
+<li><strong>Check the proof.</strong> Follow the evidence references and Vapi call link. A saved receipt proves what the database stored; the transcript shows what the provider wrote down. Neither alone proves what someone heard.</li>
+<li><strong>Check the reviewer's own health.</strong> If your call has no review, inspect the latest <code>voice.review.coverage</code> row. Missing reviews must not silently disappear from your assessment.</li>
+</ol>
+<div class="callout"><strong>The first question is: “Did we have enough evidence?”</strong> A green check on one item does not mean the whole call was perfect. A blank score needs explanation.</div>
+</section>
+
+<section id="what"><h2>What are we evaluating?</h2>
+<p>There are six main questions about the conversation. Separate checks also inspect receipts, confirmation order, evidence completeness and response speed.</p>
+<div class="scroll"><table><thead><tr><th>LangSmith Feedback name</th><th>In everyday language</th><th>Example of something to investigate</th></tr></thead><tbody>
+<tr><td><code>hallucination_free</code></td><td>Did it stick to the dealership's facts and the results it actually received?</td><td>Saying the shop is open on Sunday when the configured hours say it is closed.</td></tr>
+<tr><td><code>booking_accuracy</code></td><td>Did the saved appointment match the agreed details?</td><td>You corrected the vehicle year, but the saved appointment still has the old year.</td></tr>
+<tr><td><code>confirmation_compliance</code></td><td>Did it read back the proposal and wait for a later confirmation before saving a change?</td><td>“Show me a time” being treated as permission to book it.</td></tr>
+<tr><td><code>action_truthfulness</code></td><td>Did it tell the truth about what it had done?</td><td>“I removed the advisor request” without a successful removal receipt.</td></tr>
+<tr><td><code>task_completion</code></td><td>Did it finish the caller's actual goal, or clearly agree on the next step?</td><td>Ending a booking conversation after collecting details, without a booking or a clear explanation.</td></tr>
+<tr><td><code>conversation_quality</code></td><td>Was the written conversation relevant, clear and responsive to corrections?</td><td>Repeated questions, pointless loops or ignoring “Actually, make it Thursday.” This score does not judge pronunciation or sound quality.</td></tr>
+</tbody></table></div>
+<p><strong>“No hallucination found” means no unsupported claim was detected in the evidence reviewed.</strong> It is not a guarantee that hallucinations are impossible.</p>
+</section>
+
+<section id="how"><h2>How do those grades get produced?</h2>
+<div class="flow" aria-label="Review process"><div><strong>1. Gather the evidence</strong>Stored conversation, tool history, dealership facts, saved receipts and timings.</div><div><strong>2. Check hard facts</strong>Code checks the booking and operation records, confirmation sequence and missing evidence.</div><div><strong>3. Read the conversation</strong>A Gemini reviewer assesses the six questions using that evidence.</div><div><strong>4. Save the report</strong>LangSmith receives scores, safe references and recorded component events.</div></div>
+<p>The automatic reviewer can make mistakes. Its opinion cannot turn a failed booking integrity check into a pass. Missing authoritative booking evidence also prevents a confident booking pass.</p>
+<p>The review does not create, cancel or change appointments. Booking safeguards run during the call; the review helps you discover problems afterward.</p>
+<div class="grid"><div class="card"><h3>Quality scores</h3><p><span class="check"><strong>1 = pass</strong></span><br><span class="fail"><strong>0 = fail</strong></span><br><span class="unknown"><strong>Blank = uncertain or not applicable</strong></span></p><p>Read the verdict and its reason to distinguish those two blank cases.</p></div><div class="card"><h3>Attention flag</h3><p><code>needs_review</code> works differently: <strong>1 means investigate</strong>. A failed or uncertain check raises it.</p><p>0 means the included checks did not request review, not that every audio or vendor detail was observed.</p></div><div class="card"><h3>Speed numbers</h3><p>Latency is in milliseconds: <strong>1,000 ms is one second</strong>. Lower is faster.</p><p>A missing timing is unknown. It must not be interpreted as an instant response.</p></div></div>
+<p>Two additional indicators help you avoid trusting a partial report: <code>semantic_assessment_available</code> says the conversation reviewer ran; <code>six_dimensions_scored</code> says no main dimension was uncertain. These describe review coverage, not caller satisfaction. A not-applicable verdict still has no numeric quality score.</p>
+</section>
+
+<section id="filters"><h2>Set up two views in LangSmith</h2>
+<p>Use the project's filter controls. Some workspaces show <strong>Add filter</strong>; others show a search bar. Choose <strong>Runs</strong> when filtering by run name. Save the views if convenient.</p>
+<div class="scroll"><table><thead><tr><th>View</th><th>Exact filters</th><th>What you use it for</th></tr></thead><tbody>
+<tr><td>Current call reviews</td><td>Name equals <code>voice.call.review</code><br>Tag contains <code>live-call-review-v3</code><br>Choose today's date range.</td><td>Open the recent call, then inspect its Feedback and Outputs. To prioritize problems, add Feedback <code>needs_review</code> equals <code>1</code>.</td></tr>
+<tr><td>Review system health</td><td>Name equals <code>voice.review.coverage</code><br>Tag contains <code>live-call-review-v3</code><br>Sort with the newest first.</td><td>Check whether all known ended calls are being reviewed and whether the reviewer is stuck.</td></tr>
+</tbody></table></div>
+<p>The existing dashboard is called <strong>ServiceVoice live-call supervision</strong>. Use it for trends, then open individual call rows for explanations. Check each chart's time range and review-version filter; a chart built for an older review version may not include the newer checks.</p>
+<div class="callout warn"><strong>LangSmith's “Error” column is not the complete report card.</strong> An upload can succeed while the conversation fails a quality check. Look at Feedback and <code>needs_review</code>, not just whether the trace has a red technical error.</div>
+</section>
+
+<section id="evidence"><h2>Open one call and follow the evidence</h2>
+<ol>
+<li>In <strong>Feedback</strong>, select the failed or uncertain check and read its fixed reason and evidence references.</li>
+<li>In <strong>Outputs → evidence_index</strong>, find that reference. For example, <code>turn:12</code> identifies a stored message and its offset from the start; <code>tool:3</code> identifies a tool event. These are review references, not guaranteed labels on the provider's screen.</li>
+<li>Use <strong>Inputs → vapi_call_url</strong> to inspect the source call in Vapi. If a recording exists and you have access, listen around that offset. If recording was off or unavailable, leave the question of exactly what was spoken unresolved.</li>
+<li>For a booking, inspect <strong>Outputs → booking</strong> and the authoritative receipt evidence. Customer names, numbers, transcript text and raw tool arguments are deliberately excluded from this LangSmith export; detailed records remain in the protected source systems.</li>
+</ol>
+<p>You can add your own review using the trace's <strong>… → Notes</strong> menu. Record the timestamp, what you observed and whether it disagrees with the automatic grade. Keep personal data out of notes; do not overwrite an automatic judgment as though it never happened.</p>
+<p class="muted">The automated review sends bounded conversation evidence to Gemini for judging. The LangSmith export contains safe checks and references rather than the raw conversation.</p>
+</section>
+
+<section id="timing"><h2>If it feels slow, which number should you look at?</h2>
+<div class="scroll"><table><thead><tr><th>Feedback or component measurement</th><th>What it tells you</th><th>What it does not prove</th></tr></thead><tbody>
+<tr><td><code>latency_turn_avg_ms</code></td><td>Vapi's reported average response-turn delay.</td><td>A precisely measured gap at the caller's own speaker.</td></tr>
+<tr><td><code>latency_turn_p95_ms</code></td><td>The slow end of the measured turns. Roughly, 95% of sampled turns were at or below this number.</td><td>A stable long-term estimate when the sample has only a few turns. Check <code>latency_measured_turns</code>.</td></tr>
+<tr><td>Model / voice / endpointing / transcriber averages</td><td>Vapi's breakdown: thinking, speech generation, waiting for the caller to finish, and hearing.</td><td>Every internal step inside each vendor. These stages can overlap; do not blindly add them.</td></tr>
+<tr><td><code>first_text_ms</code> and <code>latency_server_first_text_p95_ms</code></td><td>How quickly this server produced text.</td><td>When synthesized speech reached the caller.</td></tr>
+<tr><td>TTS <code>first_audio_ms</code></td><td>When the Gemini speech adapter first had usable audio bytes ready.</td><td>Playback, correct pronunciation or what the caller actually heard.</td></tr>
+</tbody></table></div>
+<p>The report records its configured targets in <code>latency_targets_ms</code>. A target is a chosen acceptance threshold, not a claim about the achieved speed.</p>
+</section>
+
+<section id="trace"><h2>The detailed trace is the call's trail of name tags</h2>
+<div class="grid"><div class="card"><h3>Audio path</h3><p>Your microphone → voice service and speech recognition → synthesized speech → your speaker.</p><p>We observe available provider events and our speech adapter. Your device and hidden vendor internals can remain unknown.</p></div><div class="card"><h3>Decision path</h3><p>Recognized words → gateway → narrow FAQ route or Gemini → approved response.</p><p>Look here for thinking delays, fallback decisions, invalid requests or unsupported claims.</p></div><div class="card"><h3>Business path</h3><p>Proposed action → guarded tool → scheduler → saved receipt.</p><p>Look here for rejected changes, time conflicts, confirmation checks and uncertain operations.</p></div></div>
+<p>Inside a call review, expand the recorded child rows. <code>voice.turn.observed_events</code> groups an exchange, <code>voice.request.observed_events</code> groups one request, and <code>voice.operation.observed_events</code> groups evidence for an action. Rows starting <code>voice.component.</code> show actual recorded boundaries.</p>
+<p><strong>Configuration</strong> means which local source and settings were captured. <strong>Call</strong> is the whole conversation. <strong>Turn</strong> identifies a conversation step. <strong>Operation</strong> links an action to its receipt. Request IDs connect related server work.</p>
+<p>In child-row metadata, inspect <code>configuration_id</code>, <code>turn_id</code> and <code>operation_id</code> when present. Under Outputs, inspect the outcome and safe measurements. Groups show a time envelope of related events; they are not separate measured execution stages and their times must not be added together.</p>
+<p>In <strong>Outputs → diagnostics → components</strong>, each component answers five questions: <em>what enters, what leaves, who owns it, what failure looks like, and how it is observed</em>. Under <code>diagnostics.coverage</code> and <code>trace_export</code>, check for losses, skipped events or absent evidence. “Observed” means some evidence was captured, not complete visibility. Local configuration hashes do not independently prove the exact settings published at a provider.</p>
+</section>
+
+<section id="health"><h2>Make sure the reviewer itself is working</h2>
+<p>In the newest <code>voice.review.coverage</code> row, open Outputs. Read these before quoting a success rate:</p>
+<ul>
+<li><strong>Known ended calls / completed reviews:</strong> how many known finished calls should have a review, and how many do.</li>
+<li><strong>Semantically assessed / fully scored:</strong> how many received a conversation assessment, and how many were assessed without uncertainty. A completed upload may still contain unknown grades.</li>
+<li><strong>Oldest pending review age / review lag:</strong> whether unfinished reviews are piling up and how late completed reports arrived.</li>
+<li><strong>Unavailable records / discovery errors:</strong> whether the provider record could not be fetched or the call list may be incomplete. Unknown or unavailable calls are never successful calls by default.</li>
+<li><strong>Monthly model attempts / deadletters / alerts:</strong> whether the judging allowance is exhausted, a report failed repeatedly, or operator attention is required.</li>
+</ul>
+<div class="callout warn"><strong>Alerts here are status records.</strong> They do not automatically send you an email, text or Slack message. A separate notification destination would be needed for that.</div>
+<p>For example, if ten calls ended but only six have reviews, “all six passed” is not a complete picture of the ten calls. Review coverage and agent quality are different numbers. Also exclude the coverage rows and component child rows when counting calls.</p>
+</section>
+
+<section id="decision"><h2>How to make your own final judgment</h2>
+<p>For each important call, ask: <strong>Did we finish the right task, save only an approved change, describe it truthfully, and respond quickly enough?</strong> Then ask whether you had enough evidence to answer.</p>
+<p>Investigate every failed or uncertain booking/confirmation check. Listen to a sample of apparently good calls too, when recordings are available. Include corrections, interruptions, different languages and digits in controlled listening tests. Turn confirmed failures into safe fictional regression examples.</p>
+<p>No report alone certifies the whole system as production grade. This setup makes the evidence, missing coverage and reviewer failures visible; human listening and independent checks remain part of supervision.</p>
+</section>
+<footer><p>Implementation references: <a href="../app/live_evaluations.py">automatic call reviewer</a>, <a href="../app/live_eval_evidence.py">evidence and latency checks</a>, <a href="../app/diagnostics.py">component evidence catalog</a>, <a href="../app/evaluation_spans.py">recorded trace children</a>.</p><p>Official LangSmith guidance: <a href="https://docs.langchain.com/langsmith/filter-traces-in-application">filter and save trace views</a> · <a href="https://docs.langchain.com/langsmith/annotate-traces-inline">add human notes and feedback</a>.</p></footer>
+</main></body></html>

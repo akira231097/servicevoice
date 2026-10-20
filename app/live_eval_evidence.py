@@ -15,10 +15,11 @@ from pathlib import Path
 import re
 import sqlite3
 
-from .domain import dealership_facts, TZ
+from .domain import dealership_facts, TZ, DomainError, normalize_services
 
-VERSION = "live-call-review-v2"
-DIMENSIONS = ("hallucination_free", "booking_accuracy", "confirmation_compliance", "action_truthfulness")
+VERSION = "live-call-review-v5"
+DIMENSIONS = ("hallucination_free", "booking_accuracy", "confirmation_compliance", "action_truthfulness",
+              "task_completion", "conversation_quality")
 MAX_MESSAGES = 500
 MAX_EVIDENCE_BYTES = 220_000
 SECRET = re.compile(r"Bearer\s+\S+|AIza[\w-]{20,}|(?:sk-|lsv2_)[\w-]{12,}|-----BEGIN[^\n]+-----", re.I)
@@ -67,6 +68,22 @@ def read_snapshot(path, call_id):
                   "results": rows("tool_results"), "operations": rows("tool_invocations", "call_id,status"),
                   "events": rows("events", "name,status,elapsed_ms,at"), "handoffs": rows("handoffs", "status,reason")}
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # Read the ordered service scope from the authoritative child rows.
+        # Older databases legitimately have no child table or singleton rows.
+        # Never seed/migrate the scheduler from a post-call reviewer.
+        if "appointment_services" in tables:
+            for appointment in result["appointments"]:
+                selected = list(db.execute("SELECT position,service FROM appointment_services WHERE appointment_id=? ORDER BY position LIMIT 5", (appointment["id"],)))
+                if selected:
+                    values = [r["service"] for r in selected]
+                    try:
+                        valid = normalize_services(appointment["service"], values)
+                    except DomainError:
+                        raise EvidenceError("invalid_appointment_services") from None
+                    if [r["position"] for r in selected] != list(range(len(selected))):
+                        raise EvidenceError("invalid_appointment_services")
+                    if len(valid) > 1:
+                        appointment["services"] = valid
         result["signatures"] = []
         if "gemini_tool_signatures" in tables:
             for r in db.execute("SELECT tool_call_id,fingerprint,extras FROM gemini_tool_signatures WHERE session_id=? AND provider_call_id=? LIMIT 501", (sid,call_id)):
@@ -97,6 +114,14 @@ def check(verdict, reason, refs=()):
     return {"verdict":verdict,"reason_code":reason,"evidence_refs":list(refs)}
 
 
+def service_scope(value):
+    """Compare the full ordered scope, retaining legacy singleton receipts."""
+    try:
+        return normalize_services(value.get("service"), value.get("services"))
+    except (DomainError, TypeError, AttributeError):
+        return None
+
+
 def integrity(snapshot):
     """Check every persisted appointment against its latest committed receipt.
 
@@ -116,16 +141,33 @@ def integrity(snapshot):
         a = receipt.get("appointment")
         if receipt.get("ok") is not True or not isinstance(a,dict) or not a.get("id"):
             return check("fail","committed_action_missing_receipt",["state"])
+        selected = service_scope(a)
+        if selected is None:
+            return check("fail","proposal_receipt_mismatch",["state"])
+        if receipt.get("action") != p["kind"] or a.get("status") != ("cancelled" if p["kind"] == "cancel" else "confirmed"):
+            return check("fail","proposal_receipt_mismatch",["state"])
         if p["kind"] == "book":
             payload = p["payload"]
-            if any(a.get(k) != payload.get(k) for k in ("service","slot_id")) or a.get("customer_name") != payload.get("customer",{}).get("name") or a.get("vehicle") != payload.get("customer",{}).get("vehicle"):
+            if selected != service_scope(payload) or any(a.get(k) != payload.get(k) for k in ("service","slot_id")) or a.get("customer_name") != payload.get("customer",{}).get("name") or a.get("vehicle") != payload.get("customer",{}).get("vehicle"):
+                return check("fail","proposal_receipt_mismatch",["state"])
+        elif p["kind"] in {"reschedule", "cancel"}:
+            payload = p["payload"]
+            previous = receipts.get(a["id"])
+            if (previous is None or payload.get("appointment_id") != a["id"]
+                    or any(a.get(k) != previous.get(k) for k in ("id", "reference", "customer_name", "vehicle"))
+                    or a.get("slot_id") != (payload.get("slot_id") if p["kind"] == "reschedule" else previous.get("slot_id"))):
+                return check("fail","proposal_receipt_mismatch",["state"])
+            expected = payload.get("services") if "services" in payload else service_scope(previous)
+            if expected is None or selected != expected:
+                return check("fail","proposal_receipt_mismatch",["state"])
+            if "previous_services" in payload and (previous is None or payload["previous_services"] != service_scope(previous)):
                 return check("fail","proposal_receipt_mismatch",["state"])
         receipts[a["id"]] = a
     if set(receipts) != {a["id"] for a in appointments}:
         return check("fail","appointment_commit_mismatch",["state"])
     for a in appointments:
         receipt = receipts[a["id"]]
-        if any(a[k] != receipt.get(k) for k in ("id","reference","service","slot_id","status")) or a["customer"].get("name") != receipt.get("customer_name") or a["customer"].get("vehicle") != receipt.get("vehicle"):
+        if service_scope(a) is None or service_scope(a) != service_scope(receipt) or any(a[k] != receipt.get(k) for k in ("id","reference","service","slot_id","status")) or a["customer"].get("name") != receipt.get("customer_name") or a["customer"].get("vehicle") != receipt.get("vehicle"):
             return check("fail","saved_booking_receipt_mismatch",["state"])
         initial = next((p for p in commits if p["kind"] == "book" and (p["result"] or {}).get("appointment",{}).get("id") == a["id"]),None)
         if initial is None or initial["payload"].get("customer") != a["customer"]:
@@ -185,6 +227,11 @@ def build_evidence(call, snapshot):
     local = {r["call_id"]:r["result"] for r in snapshot["results"]}
     signatures = {r["tool_call_id"]:r for r in snapshot["signatures"]}
     evidence, tools, transcript = {}, [], []
+    platform_reports={}
+    for message in messages:
+        if isinstance(message,dict) and message.get("role")=="tool_call_result" and isinstance(message.get("toolCallId"),str):
+            platform_reports.setdefault(message["toolCallId"],[]).append({"provenance":"untrusted_provider_result",
+                "reported_result":message.get("result"),"authoritative_scheduler_receipt":False})
     caller_count = 0
     seen = {}
     issues = []
@@ -198,7 +245,8 @@ def build_evidence(call, snapshot):
             key = f"turn:{len(transcript)+1}"
             evidence[key] = row
             transcript.append(row)
-        for tool in m.get("toolCalls",[]) if isinstance(m.get("toolCalls"),list) else []:
+        batch=m.get("toolCalls",[]) if isinstance(m.get("toolCalls"),list) else []
+        for tool in batch:
             if not isinstance(tool,dict) or not isinstance(tool.get("function"),dict):
                 issues.append("malformed_tool_evidence");continue
             tid,fn = tool.get("id"),tool["function"]
@@ -210,15 +258,51 @@ def build_evidence(call, snapshot):
             identity = canonical({"name":fn.get("name"),"arguments":args})
             if tid in seen:
                 if seen[tid] != identity:issues.append("conflicting_tool_identity")
+                if fn.get("name")=="endCall":issues.append("repeated_native_platform_attempt")
                 continue
             seen[tid] = identity
             signature = signatures.get(tid,{})
             verified = signature.get("fingerprint") == hashlib.sha256(identity.encode()).hexdigest()
             entry = {"name":fn.get("name"),"arguments":args,"sequence":index,"user_count":signature.get("user_count") if verified else None,
                      "gateway_issuance_verified":verified,"server_result":local.get(tid),"provider_user_count":caller_count}
-            if tid not in local:issues.append("tool_without_terminal_receipt")
+            if fn.get("name")=="endCall":
+                # This is the one supported Vapi-owned action, never a booking
+                # operation. The DB reader already scopes signatures to both
+                # this scheduler session and provider call. A matching native
+                # signature and current caller anchor establish only issuance.
+                native_verified=(len(batch)==1 and args=={} and verified
+                    and type(signature.get("user_count")) is int
+                    and signature["user_count"]>0 and signature["user_count"]==caller_count)
+                if native_verified:
+                    reason=call.get("endedReason")
+                    end_by_assistant=(True if reason in {"assistant-ended-call","assistant-said-end-call-phrase"}
+                        else False if reason=="customer-ended-call" else None) if isinstance(reason,str) else None
+                    entry.pop("server_result",None)
+                    entry["evidence_scope"]="platform_attempt"
+                    entry["platform_evidence"]={"action":"endCall","issuance_verified":True,
+                        "outcome":"unknown","authoritative_scheduler_receipt":False,
+                        "provider_ended_by_assistant":end_by_assistant,
+                        "provider_results":platform_reports.get(tid,[]),
+                        "limitations":"A native attempt is not verified execution, caller intent, farewell playback or a scheduler mutation. Provider termination is coverage only."}
+                else:
+                    entry["evidence_scope"]="unverified_platform_attempt"
+                    issues.append("unverified_native_platform_attempt")
+            else:
+                entry["evidence_scope"]="business_operation"
+                if tid not in local:issues.append("tool_without_terminal_receipt")
             key = f"tool:{len(tools)+1}"
             tools.append(entry);evidence[key] = entry
+    # Reconcile in both directions. A provider artifact can retain plausible
+    # dialogue while omitting the tool messages that actually reached this
+    # scheduler. The final saved state cannot reconstruct their chronology.
+    # Only persisted attempts/results require an observed tool identity: an
+    # issued-but-never-executed model signature is not a business operation.
+    persisted_attempts = set(local) | {r["call_id"] for r in snapshot["operations"]}
+    if persisted_attempts - seen.keys():
+        issues.append("persisted_tool_chronology_missing")
+    committed_actions = any(p["state"] == "committed" for p in snapshot["proposals"])
+    if committed_actions and not any(t["name"] == "confirm_action" for t in tools):
+        issues.append("committed_action_without_observed_confirmation")
     if not transcript or not any(r["role"] == "user" for r in transcript):
         issues.append("no_caller_transcript")
     created = datetime.fromtimestamp(snapshot["session"]["created"],timezone.utc)
@@ -241,7 +325,7 @@ def build_evidence(call, snapshot):
         elif t["user_count"] <= p["user_count"] or t["sequence"] <= p["sequence"]:
             order.append("fail")
         else:order.append("pass")
-    verdict = "fail" if "fail" in order else "uncertain" if "uncertain" in order else "pass" if order else "not_applicable"
+    verdict = "fail" if "fail" in order else "uncertain" if "uncertain" in order or committed_actions and not order else "pass" if order else "not_applicable"
     checks["confirmation_order"] = check(verdict,"later_user_turn_required_not_proof_of_assent",["state"])
     checks["evidence_complete"] = check("uncertain" if issues else "pass","incomplete_provider_or_receipt_evidence" if issues else "text_and_tool_receipts_present",["state"])
     if snapshot.get("source_available") is False:
@@ -255,8 +339,11 @@ def build_evidence(call, snapshot):
         appointment = result.get("appointment") or result.get("current_appointment") or {}
         if isinstance(appointment,dict) and isinstance(appointment.get("reference"),str):returned.add(appointment["reference"].upper())
     spoken = {m.group(0).upper() for row in transcript if row["role"] == "assistant" for m in REFERENCE.finditer(row["text"])}
-    checks["reference_consistency"] = check("uncertain" if spoken-returned else "pass" if spoken else "not_applicable",
-        "unverified_literal_reference_requires_review" if spoken-returned else "literal_reference_tokens_only_not_audio",["state"])
+    reference_unknown=bool(spoken-returned or returned and not spoken)
+    checks["reference_consistency"] = check("uncertain" if reference_unknown else "pass" if spoken else "not_applicable",
+        "unverified_literal_reference_requires_review" if spoken-returned else
+        "returned_reference_missing_complete_literal_requires_review" if returned and not spoken else
+        "literal_reference_tokens_only_not_audio",["state"])
     safe = Redactor(evidence).value(evidence)
     package = {"rubric_version":VERSION,"dimensions":list(DIMENSIONS),"evidence":safe,"mechanical_checks":checks,
                "evidence_issues":sorted(set(issues)),"limitations":["Stored transcript, not verified audio.","Same-model advisory judge; no guarantee of zero hallucinations."]}

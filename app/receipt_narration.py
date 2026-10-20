@@ -19,11 +19,11 @@ from zoneinfo import ZoneInfo
 
 from starlette.concurrency import run_in_threadpool
 
-from .domain import DomainError, SERVICES, TENANT, TZ
+from .domain import DomainError, SERVICES, TENANT, TZ, normalize_services, service_details, service_names
 from .tools import DEFINITIONS, Presentation
 from .issuance_context import user_context, decode_extras
 
-NARRATOR_VERSION = "receipt-en-2026-10-18-6"
+NARRATOR_VERSION = "receipt-en-2026-10-20-7"
 SUPPORTED = {"begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "prepare_reschedule", "prepare_cancellation", "confirm_action", "request_handoff", "withdraw_handoff"}
 _DIGIT_WORDS = dict(zip("0123456789", ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")))
 
@@ -151,9 +151,11 @@ def select(store, sid, provider_call_id, prepared):
                 # A bounded list is not a statement about every time that day.
                 # Recheck the same query against current capacity before speaking;
                 # a changed result falls back to normal reconciliation.
-                fresh = store.availability_result(db, args["service"], args.get("date"), args.get("time_filter"))
+                selected = normalize_services(args["service"], args.get("services"))
+                fresh = store.availability_result(db, args["service"], args.get("date"), args.get("time_filter"), services=selected)
                 if (any(result.get(key) != value for key, value in fresh.items())
                         or state.get("service") != args["service"]
+                        or normalize_services(state["service"], state.get("services")) != selected
                         or state.get("availability_query") != fresh["query"]
                         or state.get("slots") != fresh["slots"]
                         or state.get("proposal_id")
@@ -161,7 +163,10 @@ def select(store, sid, provider_call_id, prepared):
                     return Decision("availability_changed")
                 if fresh["slots"]:
                     offers = fresh["slots"][:2]
-                    text = f"Available {SERVICES[args['service']]['name']} intake times are " + " or ".join(times(slot["start"], context) for slot in offers) + ". "
+                    scope = service_names(selected)
+                    text = f"Available {scope} intake times are " + " or ".join(times(slot["start"], context) for slot in offers) + ". "
+                    if len(selected) > 1:
+                        text += "Each offer is one 60-minute intake visit covering all those services; repair completion is not promised. "
                     if fresh["total_matching"] > len(offers):
                         text += "There are more matching times. "
                     text += "These are offers, not reservations. Which works for you?"
@@ -177,6 +182,9 @@ def select(store, sid, provider_call_id, prepared):
                 if payload.get("presentation") != context or payload["summary"] != result.get("summary"):
                     return Decision("proposal_mismatch")
                 if proposal["kind"] == "book":
+                    selected = normalize_services(payload["service"], payload.get("services"))
+                    if any(result.get(key) != value for key, value in service_details(selected).items()):
+                        return Decision("proposal_mismatch")
                     slot = db.execute("SELECT start FROM slots WHERE id=? AND tenant=?", (payload["slot_id"], TENANT)).fetchone()
                     customer = payload["customer"]
                     # Decline markup/audio-tag syntax rather than alter customer data.
@@ -185,17 +193,34 @@ def select(store, sid, provider_call_id, prepared):
                     if not slot:return Decision("proposal_mismatch")
                     callback = spoken_phone(customer["phone"])
                     if callback is None:return Decision("unsupported_phone_format")
-                    text = f"{SERVICES[payload['service']]['name']} for {customer['name']}, {customer['vehicle']}, on {times(slot['start'], context)}. Callback {callback}. Would you like me to confirm this booking?"
+                    scope = service_names(selected)
+                    if len(selected) > 1:
+                        scope = f"One 60-minute intake visit covering {scope}"
+                    text = f"{scope} for {customer['name']}, {customer['vehicle']}, on {times(slot['start'], context)}. Callback {callback}. "
+                    if len(selected) > 1:
+                        text += "Repair completion is not promised. "
+                    text += "Would you like me to confirm this booking?"
                 else:
                     appointment = store.appointment(db, sid)
                     if not appointment or appointment["id"] != payload["appointment_id"] or appointment["status"] != "confirmed":
                         return Decision("appointment_changed")
+                    current = normalize_services(appointment["service"], appointment.get("services"))
+                    if "previous_services" in payload and payload["previous_services"] != current:
+                        return Decision("appointment_changed")
                     if proposal["kind"] == "cancel":
+                        if any(result.get(key) != value for key, value in service_details(current).items()):
+                            return Decision("proposal_mismatch")
                         text = f"Cancel appointment {appointment['reference']} for {appointment['service_name']} on {times(appointment['start'], context)}. Would you like me to confirm this cancellation?"
                     elif proposal["kind"] == "reschedule":
                         slot = db.execute("SELECT start FROM slots WHERE id=? AND tenant=?", (payload["slot_id"], TENANT)).fetchone()
                         if not slot:return Decision("proposal_mismatch")
-                        text = f"Move appointment {appointment['reference']} from {times(appointment['start'], context)} to {times(slot['start'], context)}. Service and vehicle stay the same. Would you like me to confirm this change?"
+                        selected = normalize_services(payload["services"][0], payload["services"]) if "services" in payload else current
+                        if any(result.get(key) != value for key, value in service_details(selected).items()):
+                            return Decision("proposal_mismatch")
+                        if selected != current or len(selected) > 1:
+                            text = f"Update appointment {appointment['reference']} to one 60-minute intake visit covering {service_names(selected)} on {times(slot['start'], context)}, for {appointment['customer_name']}, {appointment['vehicle']}. Repair completion is not promised. Would you like me to confirm this change?"
+                        else:
+                            text = f"Move appointment {appointment['reference']} from {times(appointment['start'], context)} to {times(slot['start'], context)}. Service and vehicle stay the same. Would you like me to confirm this change?"
                     else:return Decision("proposal_mismatch")
             elif name == "confirm_action":
                 appointment = store.appointment(db, sid)
@@ -204,7 +229,7 @@ def select(store, sid, provider_call_id, prepared):
                 action = result.get("action")
                 if action not in ("book", "reschedule", "cancel") or appointment["status"] != ("cancelled" if action == "cancel" else "confirmed"):
                     return Decision("appointment_changed")
-                text = f"Your {appointment['service_name']} appointment is {appointment['status']} for {times(appointment['start'], context)}. Your appointment reference is {appointment['reference']}."
+                text = f"Your appointment for {appointment['service_name']} is {appointment['status']} for {times(appointment['start'], context)}. Your appointment reference is {appointment['reference']}."
             elif name in ("request_handoff", "withdraw_handoff"):
                 saved = db.execute("SELECT * FROM handoffs WHERE session_id=? AND id=?", (sid, result.get("id"))).fetchone()
                 if not saved or any(result.get(key) != saved[key] for key in saved.keys()):

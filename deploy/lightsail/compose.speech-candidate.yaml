@@ -1,0 +1,78 @@
+# Isolated speech comparison. Never recreates the existing main service.
+name: servicevoice-speech-candidate
+services:
+  servicevoice-candidate:
+    # Exact accepted business image. No build, pull, new harness or worker changes.
+    image: sha256:e5c6f12d0f1fa2f2be3bb146337c50c6b433c4ddade9816d7484a00817556b3d
+    pull_policy: never
+    command: ["--mode", "provider"]
+    env_file:
+      - path: ${SERVICEVOICE_CANDIDATE_PRIVATE_ENV_FILE:?Set the separate candidate phone settings file outside the checkout}
+        format: raw
+    environment:
+      SERVICEVOICE_DB: /data/servicevoice.sqlite3
+      PUBLIC_BASE_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the accepted static public address}/speech-candidate
+      VAPI_CUSTOM_LLM_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the accepted static public address}/speech-candidate/llm
+    volumes:
+      - candidate-application-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 384m
+    cpus: 0.4
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "2"}
+    networks: [accepted-application]
+  servicevoice-speech-candidate:
+    # Build/review this image separately; it includes deploy/tts_server.py.
+    image: ${SERVICEVOICE_SPEECH_IMAGE:?Set the reviewed standalone speech image ID}
+    pull_policy: never
+    entrypoint: ["python", "deploy/tts_server.py"]
+    command: ["--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - path: ${SERVICEVOICE_SPEECH_PRIVATE_ENV_FILE:?Set the speech-only private environment file outside the checkout}
+        format: raw
+    environment:
+      GEMINI_TTS_MODEL: ${GEMINI_TTS_MODEL:-gemini-3.8-flash-lite-tts}
+      GEMINI_TTS_VOICE: ${GEMINI_TTS_VOICE:-Kore}
+      SERVICEVOICE_DIAGNOSTICS_ENABLED: "on"
+      SERVICEVOICE_TTS_DIAGNOSTICS_PATH: /data/tts-diagnostics.sqlite3
+    volumes:
+      - candidate-speech-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request;assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2)).get('status')=='ready'"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "2"}
+    networks: [accepted-application]
+networks:
+  accepted-application:
+    external: true
+    name: servicevoice-lightsail_application
+volumes:
+  candidate-application-data:
+  candidate-speech-data:

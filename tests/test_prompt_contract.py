@@ -15,10 +15,10 @@ from app.domain import Store
 
 
 def test_versioned_prompt_has_valid_sections_and_only_supported_variables():
-    assert SYSTEM_PROMPT_VERSION == "2026-10-18-gemini-agentic-18"
+    assert SYSTEM_PROMPT_VERSION == "2026-10-20-gemini-agentic-19-combined-intake"
     sections = ET.fromstring("<prompt>" + SYSTEM_PROMPT + "</prompt>")
     assert [section.tag for section in sections] == [
-        "role", "conversation", "presentation_metadata", "facts", "agent_loop", "evidence_and_availability", "recovery", "handoff_and_trust", "examples", "spoken_style"]
+        "role", "conversation", "presentation_metadata", "combined_service_visit", "facts", "agent_loop", "evidence_and_availability", "recovery", "handoff_and_trust", "examples", "spoken_style"]
     assert set(re.findall(r"{{([^}]+)}}", SYSTEM_PROMPT)) == {"current_date", "timezone"}
 
 

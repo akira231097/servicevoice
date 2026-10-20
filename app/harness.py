@@ -146,7 +146,18 @@ class ToolHarness:
         except asyncio.TimeoutError:
             return self._status_unavailable(operation_id,"deadline")
 
-    def _execute_registered(self,sid,name,arguments,call_id,opid):
+    def _record_diagnostic_result(self,context,name,opid,result):
+        if context is None:return
+        try:
+            context["diagnostics"].record("scheduler","receipt_observed",
+                "success" if result.get("ok") else "failure",call_id=context["call_id"],
+                turn_id=context.get("turn_id"),operation_id=opid,
+                duration_ms=0,
+                attributes={"tool_name":name,"receipt_present":"_receipt" in result,
+                    "error_code":result.get("error","none"),"evidence_source":"tool_receipt"})
+        except Exception:pass
+
+    def _execute_registered(self,sid,name,arguments,call_id,opid,diagnostic_context=None):
         """One worker hop, with separate durable boundaries around the effect.
 
         Each DB transaction remains short. Slow adapter I/O must not hold an
@@ -160,15 +171,18 @@ class ToolHarness:
             self._mark(sid,opid,"failed","missing_authoritative_result")
             return operation_error("operation_failed",opid,"No committed tool receipt exists. Do not claim the action completed.")
         self._mark(sid,opid,"completed" if authoritative.get("ok") else "rejected")
+        self._record_diagnostic_result(diagnostic_context,name,opid,authoritative)
         return authoritative
 
-    async def _work(self,sid,name,arguments,call_id,opid,fingerprint):
+    async def _work(self,sid,name,arguments,call_id,opid,fingerprint,diagnostic_context=None):
         try:
             async with self.admission_lock:
                 is_new,result=await run_in_threadpool(self._register,sid,name,arguments,call_id,opid,fingerprint)
-            if not is_new:return result
+            if not is_new:
+                if isinstance(result,dict) and "_receipt" in result:self._record_diagnostic_result(diagnostic_context,name,opid,result)
+                return result
             async with self.semaphore:
-                return await run_in_threadpool(self._execute_registered,sid,name,arguments,call_id,opid)
+                return await run_in_threadpool(self._execute_registered,sid,name,arguments,call_id,opid,diagnostic_context)
         except asyncio.CancelledError:
             # Cancellation cannot prove an upstream or worker-thread action was undone.
             await run_in_threadpool(self._mark,sid,opid,"unknown","worker_cancelled")
@@ -177,7 +191,9 @@ class ToolHarness:
             # Read committed evidence before classifying an exception after a potential commit.
             try:
                 authoritative=await self.operation(sid,opid)
-                if "_receipt" in authoritative:return authoritative
+                if "_receipt" in authoritative:
+                    self._record_diagnostic_result(diagnostic_context,name,opid,authoritative)
+                    return authoritative
                 if authoritative.get("error")=="status_unavailable":
                     return operation_error("operation_unknown",opid,
                         "The tool raised an error and its committed outcome could not be read. Check this same operation again or request an advisor; do not repeat the write or infer failure.")
@@ -186,15 +202,27 @@ class ToolHarness:
                 return operation_error("operation_unknown",opid,"The operation status could not be read. No outcome can be confirmed. Request an advisor.")
             return operation_error("operation_failed",opid,"The tool did not return a verified result. Check the appointment or request an advisor.")
 
-    async def run(self,sid,name,arguments,call_id):
+    async def run(self,sid,name,arguments,call_id,*,diagnostic_context=None):
         """Observe the caller's wait without changing accepted-effect semantics."""
         started=time.perf_counter()
         start_unix=time.time()
         result=None
         try:
-            result=await self._run(sid,name,arguments,call_id)
+            result=await self._run(sid,name,arguments,call_id,diagnostic_context=diagnostic_context)
             return result
         finally:
+            if diagnostic_context:
+                try:
+                    diagnostics=diagnostic_context["diagnostics"]
+                    opid="op_"+hashlib.sha256((sid+"\0"+call_id).encode()).hexdigest()[:24]
+                    outcome="success" if isinstance(result,dict) and result.get("ok") is True else "pending" if isinstance(result,dict) and result.get("error")=="operation_pending" else "unknown" if not isinstance(result,dict) or result.get("error") in {"operation_unknown","status_unavailable"} else "failure"
+                    attributes={"tool_name":name,"error_code":result.get("error","none") if isinstance(result,dict) else "waiter_interrupted",
+                        "receipt_present":isinstance(result,dict) and "_receipt" in result,
+                        "admitted":result.get("admitted") if isinstance(result,dict) else None,"evidence_source":"server_observed"}
+                    diagnostics.record("tool_harness","execution_finished",outcome,
+                        call_id=diagnostic_context["call_id"],turn_id=diagnostic_context.get("turn_id"),operation_id=opid,
+                        start_unix=start_unix,duration_ms=(time.perf_counter()-started)*1000,attributes=attributes)
+                except Exception:pass
             # No arguments, result bodies, caller identifiers or exceptions are
             # given to the trace exporter. It may never change the tool result.
             try:
@@ -210,7 +238,7 @@ class ToolHarness:
             except Exception:
                 pass
 
-    async def _run(self,sid,name,arguments,call_id):
+    async def _run(self,sid,name,arguments,call_id,*,diagnostic_context=None):
         if not isinstance(name,str) or name not in DEFINITIONS:
             return {"ok":False,"error":"unknown_tool","message":"Unsupported tool."}
         if not isinstance(call_id,str) or not 1<=len(call_id)<=200:
@@ -238,7 +266,7 @@ class ToolHarness:
                 return {**operation_error("harness_overloaded",opid,
                     "This attempt was not admitted and did not start an action. Retry the same call ID when capacity is available; if it was submitted earlier, check get_operation first."),
                     "admitted":False}
-            task=asyncio.create_task(self._work(sid,name,normalized,call_id,opid,fingerprint))
+            task=asyncio.create_task(self._work(sid,name,normalized,call_id,opid,fingerprint,diagnostic_context))
             self.inflight[key]=(fingerprint,opid,task)
             def finished(done):
                 if self.inflight.get(key,(None,None,None))[2] is done:self.inflight.pop(key,None)

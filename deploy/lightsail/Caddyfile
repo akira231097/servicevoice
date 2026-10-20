@@ -25,7 +25,7 @@
 	}
 	@provider {
 		method POST
-		path /webhooks/vapi/inbound /llm/chat/completions
+		path /webhooks/vapi/inbound /llm/chat/completions /tts/vapi
 	}
 	handle @provider {
 		request_body {

@@ -35,3 +35,5 @@ typing_extensions==4.16.0
 tzdata==2026.5
 urllib3==2.8.0
 uvicorn==0.54.0
+numpy==2.2.6
+soxr==1.1.0

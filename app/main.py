@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -34,6 +35,9 @@ from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
+from .diagnostics import NullDiagnostics, create_diagnostics, operation_identifier, turn_identifier
+from .gemini_tts import GeminiTTS, TTSError
+from .diagnostic_http import DiagnosticHTTPMiddleware
 
 ROOT=Path(__file__).resolve().parent.parent
 load_dotenv(ROOT/".env")
@@ -51,6 +55,15 @@ class ToolRequest(BaseModel):
     name:str=Field(max_length=100)
     arguments:dict
     call_id:str=Field(min_length=1,max_length=200)
+
+def _tool_diagnostic_context(diagnostics,call_id,tool_id,contexts):
+    """Use existing authorization metadata only; no extra database/network read."""
+    try:
+        value=contexts.get(tool_id,{}) if isinstance(contexts,dict) else {}
+        ordinal=value.get("user_count") if isinstance(value,dict) else None
+        return {"call_id":call_id,"turn_id":turn_identifier(call_id,ordinal),"diagnostics":diagnostics}
+    except Exception:
+        return None  # Missing diagnostic linkage cannot change an accepted effect.
 
 def create_app(db_path=None):
     from dotenv import dotenv_values
@@ -83,8 +96,16 @@ def create_app(db_path=None):
                         pass  # Optional diagnostic storage never prevents startup.
                 app.state.local_timings=timing_sink
                 app.state.gemini_gateway.timing_sink=timing_sink
+                diagnostic_path=Path(store.path).with_name(Path(store.path).stem+"-diagnostics.sqlite3")
+                try:
+                    diagnostics=await run_in_threadpool(create_diagnostics,diagnostic_path,settings())
+                except Exception:
+                    diagnostics=NullDiagnostics("initialization_failed")
+                app.state.diagnostics=diagnostics
+                app.state.gemini_gateway.diagnostics=diagnostics
                 app.state.telemetry_initialized=True
         await app.state.gemini_gateway.start()
+        await app.state.gemini_tts.start()
     async def shutdown_resources():
         app.state.telephony_http_closing=True
         pending=list(app.state.telephony_http_tasks)
@@ -94,10 +115,13 @@ def create_app(db_path=None):
         try:
             await app.state.gemini_gateway.close()
         finally:
+            await app.state.gemini_tts.close()
             try:await asyncio.wait_for(asyncio.shield(app.state.harness.close()),timeout=5)
             except asyncio.TimeoutError:pass  # Durable journal reconciles unfinished accepted operations.
             finally:
                 try:await asyncio.wait_for(asyncio.to_thread(app.state.local_timings.close,2),timeout=2.5)
+                except Exception:pass
+                try:await asyncio.wait_for(asyncio.to_thread(app.state.diagnostics.close,2),timeout=2.5)
                 except Exception:pass
                 # Exporter shutdown belongs off the event loop, after accepted
                 # effects have had their drain opportunity. Never fail shutdown.
@@ -117,6 +141,7 @@ def create_app(db_path=None):
     app.state.harness=ToolHarness(store)
     app.state.telemetry=NullTelemetry()
     app.state.local_timings=NullLocalTimingSink()
+    app.state.diagnostics=NullDiagnostics()
     app.state.telemetry_initialized=False
     app.state.telemetry_lock=asyncio.Lock()
     app.state.shutdown_resources=shutdown_resources
@@ -125,10 +150,18 @@ def create_app(db_path=None):
     app.state.rate=defaultdict(deque)
     app.state.rate_lock=threading.Lock()
 
+    def diagnose(component,event,outcome,*,call_id,**kwargs):
+        # Observation never controls admission, receipts or booking execution.
+        try:return app.state.diagnostics.record(component,event,outcome,call_id=call_id,**kwargs)
+        except Exception:return False
+    app.state.diagnose=diagnose
+
+    app.add_middleware(DiagnosticHTTPMiddleware,observer=diagnose)
+
     @app.middleware("http")
     async def local_console_boundary(request:Request,call_next):
         # Defense in depth. The public listener below has no operator-console routes at all.
-        if request.url.path not in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions"):
+        if request.url.path not in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi"):
             if request.url.hostname not in ("localhost","127.0.0.1","::1","testserver"):
                 return JSONResponse({"detail":"The operator console is local-only."},status_code=403)
             origin=request.headers.get("origin")
@@ -164,6 +197,32 @@ def create_app(db_path=None):
         from dotenv import dotenv_values
         return {**dotenv_values(ROOT/".env"),**os.environ}
 
+    app.state.gemini_tts=GeminiTTS(settings)
+
+    @app.post("/tts/vapi")
+    async def synthesize_voice(request:Request):
+        values=await run_in_threadpool(settings)
+        secret=values.get("GEMINI_TTS_BEARER_SECRET") or ""
+        supplied=request.headers.get("authorization","")
+        if not isinstance(secret,str) or len(secret)<32:
+            raise HTTPException(503,"Gemini speech is not configured.")
+        if not secrets.compare_digest(supplied.encode(),("Bearer "+secret).encode()):
+            raise HTTPException(401,"Invalid speech authentication.")
+        body=await read_webhook_json(request)
+        def observe(event):
+            call_id=event.get("provider_call_id")
+            if call_id:request.state.diagnostic_call_id=call_id
+            diagnose("tts",event.get("event","tts.unknown"),
+                "failure" if event.get("event")=="tts.failed" else "cancelled" if event.get("event")=="tts.cancelled" else "success",
+                call_id=call_id or "unbound_"+event["request_id"],request_id=event["request_id"],
+                start_unix=event.get("started_at_unix"),duration_ms=event.get("elapsed_ms"),attributes={k:event[k] for k in (
+                    "model","voice","sample_rate","input_characters","audio_bytes","error_code","failure_phase",
+                    "provider","provider_call_id_status","turn_id_status","first_audio_ms","upstream_http_status",
+                    "upstream_sample_rate","resampled","resampler","observation_scope","audio_duration_ms") if k in event})
+        try:return await app.state.gemini_tts.response(body,observer=observe)
+        except TTSError as exc:
+            raise HTTPException(getattr(exc,"status_code",502),getattr(exc,"code","speech_unavailable")) from None
+
     def config():
         # Reload only the explicit file; API keys never enter returned data.
         values=settings()
@@ -195,7 +254,14 @@ def create_app(db_path=None):
     @app.get("/api/observability-status")
     def observability_status():
         # This diagnostic is intentionally absent from the public listener.
-        return app.state.telemetry.status()
+        return {**app.state.telemetry.status(),"diagnostics":app.state.diagnostics.status()}
+
+    @app.get("/api/sessions/{sid}/diagnostics")
+    async def session_diagnostics(sid:str,x_session_token:str=Header(default="")):
+        session=await run_in_threadpool(auth,sid,x_session_token,True)
+        call_id=session["provider_call_id"]
+        if not call_id:return {"events":[],"coverage":{"status":"unbound","complete":False}}
+        return await run_in_threadpool(app.state.diagnostics.snapshot,call_id)
 
     @app.get("/")
     def index():return FileResponse(ROOT/"app/static/index.html")
@@ -407,7 +473,7 @@ def create_app(db_path=None):
     def mark_ended(sid):
         with store.connect() as db:db.execute("UPDATE sessions SET ended=1 WHERE id=?",(sid,))
 
-    async def process_webhook(message, *, phone=False, deadline=None, abandoned=None):
+    async def process_webhook(message, *, phone=False, deadline=None, abandoned=None, diagnostic_request=None):
         if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
         event_type=message.get("type")
         if not isinstance(event_type,str) or not 1<=len(event_type)<=100:
@@ -431,11 +497,15 @@ def create_app(db_path=None):
                 raise HTTPException(403,"Phone calls require their dedicated webhook.")
             sid=await run_in_threadpool(bind_provider_call,call,assistant)
         call_id=call["id"]
+        if diagnostic_request is not None:diagnostic_request.state.diagnostic_call_id=call_id
+        diagnose("webhook","call_bound","success",call_id=call_id,
+            request_id=getattr(getattr(diagnostic_request,"state",None),"diagnostic_request_id",None),
+            attributes={"evidence_source":"verified_session_binding"})
         if event_type=="tool-calls":
             # Provider auth is not execution provenance. Reject an entire batch
             # before any tool runs if the custom gateway did not issue it.
             try:
-                await run_in_threadpool(app.state.gemini_gateway.store.authorize_tool_batch,sid,call_id,calls)
+                diagnostic_contexts=await run_in_threadpool(app.state.gemini_gateway.store.authorize_tool_batch,sid,call_id,calls)
             except GatewayError as exc:
                 raise HTTPException(exc.status,exc.code) from None
             except sqlite3.Error:
@@ -451,7 +521,8 @@ def create_app(db_path=None):
                 if not may_continue:
                     result={"ok":False,"error":"session_ended","message":"Call ended. No new action was taken."}
                 else:
-                    result=await app.state.harness.run(sid,name,arguments,tid)
+                    context=_tool_diagnostic_context(app.state.diagnostics,call_id,tid,diagnostic_contexts)
+                    result=await app.state.harness.run(sid,name,arguments,tid,diagnostic_context=context)
                 try:
                     await run_in_threadpool(app.state.gemini_gateway.observations.record,sid,call_id,tid,result)
                 except (ObservationError,sqlite3.Error):
@@ -462,8 +533,11 @@ def create_app(db_path=None):
             return {"results":results}
         if event_type=="transcript" and message.get("transcriptType")=="final":
             await run_in_threadpool(save_transcript,sid,call_id,message)
+            diagnose("stt" if message.get("role")=="user" else "voice_runtime","final_transcript_received","success",call_id=call_id,
+                attributes={"transcript_role":message.get("role"),"transcript_final":True,"evidence_source":"provider_transcript_only"})
         if event_type=="end-of-call-report" or (event_type=="status-update" and message.get("status")=="ended"):
             await run_in_threadpool(mark_ended,sid)
+            diagnose("voice_runtime","call_ended","success",call_id=call_id,attributes={"evidence_source":"provider_terminal_event"})
         return {"received":True}
 
     @app.post("/webhooks/vapi")
@@ -475,7 +549,7 @@ def create_app(db_path=None):
             raise HTTPException(401,"Invalid webhook authentication.")
         body=await read_webhook_json(request)
         message=body.get("message") if isinstance(body,dict) else None
-        return await process_webhook(message)
+        return await process_webhook(message,diagnostic_request=request)
 
     @app.post("/webhooks/vapi/inbound")
     async def inbound_webhook(request:Request):
@@ -504,12 +578,21 @@ def create_app(db_path=None):
             message=body.get("message") if isinstance(body,dict) else None
             if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
             event_type=message.get("type")
+            async def observe_phone_effect(effect,event):
+                result=await asyncio.to_thread(effect,message,authorization,deadline=deadline,abandoned=abandoned)
+                # Identity is diagnostic evidence only after ingress validation
+                # succeeds, including work finishing after its HTTP waiter left.
+                verified_call_id=message["call"]["id"]
+                request.state.diagnostic_call_id=verified_call_id
+                diagnose("voice_runtime",event,"success",call_id=verified_call_id,
+                    attributes={"evidence_source":"verified_phone_ingress"})
+                return result
             if event_type=="assistant-request":
-                coroutine=asyncio.to_thread(ingress.admit,message,authorization,deadline=deadline,abandoned=abandoned)
+                coroutine=observe_phone_effect(ingress.admit,"call_bound")
             elif event_type=="end-of-call-report" or (event_type=="status-update" and message.get("status")=="ended"):
-                coroutine=asyncio.to_thread(ingress.end,message,authorization,deadline=deadline,abandoned=abandoned)
+                coroutine=observe_phone_effect(ingress.end,"call_ended")
             else:
-                coroutine=process_webhook(message,phone=True,deadline=deadline,abandoned=abandoned)
+                coroutine=process_webhook(message,phone=True,deadline=deadline,abandoned=abandoned,diagnostic_request=request)
             operation=asyncio.create_task(coroutine)
             app.state.telephony_http_tasks.add(operation)
             operation.add_done_callback(release)
@@ -540,8 +623,9 @@ def create_public_app(console):
         finally:
             await console.state.shutdown_resources()
     public=FastAPI(docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
+    public.add_middleware(DiagnosticHTTPMiddleware,observer=console.state.diagnose)
     for route in console.routes:
-        if getattr(route,"path",None) in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions"):public.router.routes.append(route)
+        if getattr(route,"path",None) in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi"):public.router.routes.append(route)
     public.add_exception_handler(DomainError,console.exception_handlers[DomainError])
     public.add_exception_handler(IngressError,console.exception_handlers[IngressError])
     public.add_exception_handler(CapacityError,console.exception_handlers[CapacityError])

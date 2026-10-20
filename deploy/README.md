@@ -87,7 +87,7 @@ Your own live container setup needs allowed egress, private runtime credentials,
 
 For inbound-phone mode, use a dedicated assistant/organization/number identity and the independent phone webhook credential, enable `SERVICEVOICE_TELEPHONY_ENABLED=on`, configure the custom Gemini profile/key/gateway credential, then validate the real provider contract. Readiness only checks the local configuration and database; it does not prove the number, assistant or credentials work remotely.
 
-The native host dashboard cannot issue a session for the isolated container database. Any future browser-based live use must create and bind its session through the local console that owns the same container database. Private environment values are runtime inputs, never Docker build arguments. `*_FILE` is supported for the five allowlisted secret keys when files are mounted read-only under `/run/secrets`; direct environment values and file values for the same key are rejected as ambiguous. Nothing in this package deploys to AWS.
+The native host dashboard cannot issue a session for the isolated container database. Any future browser-based live use must create and bind its session through the local console that owns the same container database. Private environment values are runtime inputs, never Docker build arguments. `*_FILE` is supported for the allowlisted secret keys, including `GEMINI_TTS_BEARER_SECRET`, when files are mounted read-only under `/run/secrets`; direct environment values and file values for the same key are rejected as ambiguous. Nothing in this package deploys to AWS.
 
 ## Verification
 

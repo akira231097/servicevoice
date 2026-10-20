@@ -20,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
@@ -43,6 +44,7 @@ CORE = {
     "handoffs": "id session_id reason status created",
 }
 OPTIONAL = {
+    "appointment_services": "appointment_id position service",
     "gemini_tool_signatures": "provider_call_id tool_call_id session_id fingerprint extras group_id ordinal group_size expires",
     "provider_tool_policies": "provider_call_id session_id assistant_id policy",
     "tool_observations": "session_id provider_call_id tool_call_id digest result result_bytes observed expires",
@@ -61,13 +63,80 @@ PRIMARY_KEYS = {
     "gemini_tool_signatures": ("provider_call_id", "tool_call_id"),
     "tool_observations": ("session_id", "provider_call_id", "tool_call_id", "digest"),
     "advisor_case_metadata": ("handoff_id",), "telephony_bindings": ("provider_call_id",),
+    "appointment_services": ("appointment_id", "position"),
 }
 UNIQUE_KEYS = {
+    "appointment_services": ("appointment_id", "service"),
     "sessions": ("provider_call_id",), "slots": ("tenant", "start"), "appointments": ("reference",),
     "tool_invocations": ("session_id", "call_id"), "transcripts": ("session_id", "event_id"),
     "handoffs": ("session_id",), "provider_tool_policies": ("session_id",),
     "advisor_case_audit": ("handoff_id", "revision"), "telephony_bindings": ("session_id",),
 }
+
+_SQL_TOKENS = re.compile(
+    r"(?P<comment>--[^\r\n]*|/\*[\s\S]*?\*/)|"
+    r'(?P<quoted>"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])|'
+    r"(?P<string>'(?:[^']|'')*')|(?P<token>>=|<=|!=|<>|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s])")
+
+
+def _check_expressions(statement):
+    """Read CHECK tokens without mistaking a comment/string for a constraint.
+
+    SQLite exposes columns, keys and foreign keys through PRAGMAs, but does
+    not offer a CHECK-constraint PRAGMA. Only the known position expression is
+    accepted below; arbitrary expressions are not executed as a validation probe.
+    """
+    tokens = []
+    for match in _SQL_TOKENS.finditer(statement or ""):
+        if match.lastgroup == "comment":
+            continue
+        token = match.group()
+        if match.lastgroup == "quoted":
+            token = token[1:-1].replace('""', '"').replace("``", "`")
+        tokens.append("<literal>" if match.lastgroup == "string" else token.upper())
+    result = []
+    for index, token in enumerate(tokens):
+        if token != "CHECK":
+            continue
+        if tokens[index + 1:index + 2] != ["("]:
+            return None
+        depth = 1
+        expression = []
+        for child in tokens[index + 2:]:
+            depth += (child == "(") - (child == ")")
+            if depth == 0:
+                break
+            expression.append(child)
+        if depth:
+            return None
+        result.append(tuple(expression))
+    return result
+
+
+def _appointment_services_schema(db, statement):
+    """Validate the optional child contract while keeping legacy files optional."""
+    info = list(db.execute('PRAGMA table_xinfo("appointment_services")'))
+    expected = [("appointment_id", "TEXT"), ("position", "INTEGER"), ("service", "TEXT")]
+    if (len(info) != len(expected)
+            or any(row["name"] != name or row["type"].strip().upper() != kind
+                   or row["notnull"] != 1 or row["dflt_value"] is not None or row["hidden"] != 0
+                   for row, (name, kind) in zip(info, expected))):
+        raise BackupError("incompatible_column_constraints")
+    foreign = [tuple(row[key] for key in ("seq", "table", "from", "to", "on_update", "on_delete", "match"))
+               for row in db.execute('PRAGMA foreign_key_list("appointment_services")')]
+    if foreign != [(0, "appointments", "appointment_id", "id", "NO ACTION", "NO ACTION", "NONE")]:
+        raise BackupError("incompatible_foreign_key_constraints")
+    unique = []
+    for index in db.execute('PRAGMA index_list("appointment_services")'):
+        if index["unique"]:
+            if index["partial"]:
+                raise BackupError("incompatible_key_constraints")
+            escaped = index["name"].replace('"', '""')
+            unique.append(tuple(row["name"] for row in db.execute(f'PRAGMA index_info("{escaped}")')))
+    if set(unique) != {("appointment_id", "position"), ("appointment_id", "service")}:
+        raise BackupError("incompatible_key_constraints")
+    if _check_expressions(statement) != [("POSITION", ">=", "0")]:
+        raise BackupError("incompatible_check_constraints")
 
 
 class BackupError(Exception):
@@ -174,6 +243,8 @@ def _schema(db, deadline):
         raise BackupError("incompatible_schema")
     if any(name in tables for name in ("gemini_tool_signatures", "telephony_bindings")) and "provider_tool_policies" not in tables:
         raise BackupError("incompatible_schema")
+    if "appointment_services" in tables:
+        _appointment_services_schema(db, found["appointment_services"]["sql"])
     entries = [dict(found[name]) for name in sorted(found)]
     return tables, digest(entries)
 
@@ -206,6 +277,13 @@ def _verify(db, deadline):
     _require_empty(db, "SELECT 1 FROM appointments a LEFT JOIN slots s ON s.id=a.slot_id WHERE s.id IS NULL OR a.tenant!=s.tenant LIMIT 1", "appointment_slot_mismatch")
     _require_empty(db, "SELECT 1 FROM slots s LEFT JOIN appointments a ON a.slot_id=s.id AND a.status='confirmed' GROUP BY s.id HAVING s.capacity<=0 OR COUNT(a.id)>s.capacity LIMIT 1", "capacity_invariant_failed")
     _require_empty(db, "SELECT 1 FROM appointments WHERE status NOT IN ('confirmed','cancelled') LIMIT 1", "invalid_appointment_state")
+    if "appointment_services" in tables:
+        # No child rows is valid for a legacy single-service appointment. Rows
+        # that do exist describe one ordered, bounded service set for its parent.
+        _require_empty(db, "SELECT 1 FROM appointment_services x LEFT JOIN appointments a ON a.id=x.appointment_id WHERE a.id IS NULL LIMIT 1", "appointment_services_parent_mismatch")
+        _require_empty(db, "SELECT 1 FROM appointment_services WHERE typeof(position)!='integer' OR position<0 OR service NOT IN ('oil_change','tires','brakes','diagnostic') LIMIT 1", "invalid_appointment_service")
+        _require_empty(db, "SELECT 1 FROM appointment_services GROUP BY appointment_id HAVING COUNT(*)>4 OR MIN(position)!=0 OR MAX(position)!=COUNT(*)-1 LIMIT 1", "appointment_services_order_mismatch")
+        _require_empty(db, "SELECT 1 FROM appointment_services x JOIN appointments a ON a.id=x.appointment_id WHERE x.position=0 AND x.service!=a.service LIMIT 1", "appointment_services_primary_mismatch")
     _require_empty(db, "SELECT 1 FROM proposals WHERE kind NOT IN ('book','reschedule','cancel') OR state NOT IN ('pending','superseded','dismissed','committed') LIMIT 1", "invalid_proposal_state")
     _require_empty(db, "SELECT 1 FROM tool_invocations WHERE status NOT IN ('queued','running','unknown','failed','completed','rejected') LIMIT 1", "invalid_operation_state")
     for table, fields in JSON_FIELDS.items():

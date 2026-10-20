@@ -1,0 +1,59 @@
+{
+  "name": "servicevoice-speech-evaluations",
+  "services": {
+    "speech-call-evaluator": {
+      "image": "${SERVICEVOICE_SPEECH_EVAL_IMAGE:?Set the reviewed candidate evaluator image ID}",
+      "pull_policy": "never",
+      "env_file": [
+        {
+          "path": "${SERVICEVOICE_SPEECH_EVAL_ENV_FILE:?Set a separate candidate evaluator environment file outside the checkout}",
+          "format": "raw"
+        }
+      ],
+      "environment": {
+        "SERVICEVOICE_EVAL_SOURCE_DB": "/evidence/servicevoice.sqlite3",
+        "SERVICEVOICE_EVAL_DIAGNOSTICS_PATH": "/speech-evidence/tts-diagnostics.sqlite3",
+        "SERVICEVOICE_EVAL_OUTBOX": "/evaluations/outbox.sqlite3",
+        "SERVICEVOICE_EVAL_PROJECT": "servicevoice-speech-candidate",
+        "SERVICEVOICE_ENVIRONMENT": "staging",
+        "VAPI_EVAL_ASSISTANT_ID": "1a2caeaa-21c5-4a3c-ada1-a4b2f5fa8ff7",
+        "SERVICEVOICE_EVAL_MONTHLY_LIMIT": "200",
+        "SERVICEVOICE_EVAL_MAX_FAILURES": "8",
+        "SERVICEVOICE_EVAL_LOOKBACK_HOURS": "24",
+        "SERVICEVOICE_EVAL_POLL_SECONDS": "30",
+        "SERVICEVOICE_EVAL_LATENCY_TARGET_MS": "2000"
+      },
+      "volumes": [
+        "candidate-evaluation-evidence:/evidence:ro",
+        "candidate-speech-evidence:/speech-evidence:ro",
+        "candidate-evaluation-data:/evaluations"
+      ],
+      "read_only": true,
+      "tmpfs": ["/tmp:rw,nosuid,nodev,noexec,size=16m"],
+      "user": "10001:10001",
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "pids_limit": 48,
+      "mem_limit": "256m",
+      "cpus": 0.25,
+      "init": true,
+      "restart": "unless-stopped",
+      "stop_grace_period": "90s",
+      "logging": {
+        "driver": "local",
+        "options": {"max-size": "5m", "max-file": "2"}
+      }
+    }
+  },
+  "volumes": {
+    "candidate-evaluation-evidence": {
+      "external": true,
+      "name": "servicevoice-speech-candidate_candidate-application-data"
+    },
+    "candidate-speech-evidence": {
+      "external": true,
+      "name": "servicevoice-speech-candidate_candidate-speech-data"
+    },
+    "candidate-evaluation-data": {}
+  }
+}

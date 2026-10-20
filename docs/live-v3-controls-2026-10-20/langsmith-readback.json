@@ -1,0 +1,39 @@
+{
+  "native_experiment": true,
+  "dataset_id": null,
+  "experiment_id": null,
+  "experiment_name": null,
+  "dataset_name": null,
+  "experiment_url": null,
+  "dataset_url": null,
+  "project_url": null,
+  "checks": {
+    "workspace_verified": true,
+    "native_reference_dataset_bound": true,
+    "all_nine_examples_present": true,
+    "all_nine_runs_present": true,
+    "all_63_feedback_records_present": true,
+    "all_expected_labels_preserved": true,
+    "all_actual_outputs_preserved": true,
+    "all_reference_example_links_preserved": true,
+    "all_feedback_scores_preserved": true
+  },
+  "readback_verified": true,
+  "example_count": 9,
+  "run_count": 9,
+  "feedback_count": 63,
+  "limitations": [
+    "Authored synthetic known-answer controls test evaluator sensitivity, not real agent performance.",
+    "Expected target labels are authored, not independent human calibration; nine cases are not a representative benchmark.",
+    "The evaluator shares the Gemini model family with the agent and can share its biases.",
+    "Stored text and fictional scheduler evidence do not verify spoken audio, recognition, pronunciation, consent heard, or caller satisfaction.",
+    "Scores in this experiment must not be mixed with live-call production averages."
+  ],
+  "public_copy": {
+    "resource_identifiers_and_urls_redacted": true,
+    "experiment_and_dataset_names_redacted": true,
+    "langsmith_entry_url": "https://smith.langchain.com/",
+    "readback_scope": "Historical API readback of private resources. Counts and check results are retained; target identifiers, names and URLs are withheld in this public copy.",
+    "navigation": "Sign in to your authorized workspace, then select the dataset and experiment created by your own evaluation run. The general entry URL is not a verified link to the private experiment."
+  }
+}

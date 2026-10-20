@@ -24,6 +24,7 @@ API_BASE = "https://api.vapi.ai"
 from app.voice_profiles import MODEL_PROFILES, VOICE_PROFILES, profile_catalog, select_profiles, select_transcriber
 from app.gemini_gateway import MAX_OUTPUT_TOKENS
 from app.tool_schema import provider_schema
+from app.call_lifecycle import CLOSING_POLICY, enabled as closing_enabled, native_tool
 
 
 def normalize_tools(schemas: list[dict]) -> list[dict]:
@@ -97,6 +98,10 @@ def assistant_payload(prompt: str, schemas: list[dict], env: dict, *, apply: boo
         raise ValueError("SYSTEM_PROMPT must be a nonempty string.")
     model, voice, credentials, _ = select_profiles(env, model_profile=model_profile, voice_profile=voice_profile,
                                                   apply=apply, allow_experimental=allow_experimental)
+    native_closing=closing_enabled(env)
+    if native_closing and model.get("provider")!="custom-llm":
+        raise ValueError("Native end-call opt-in requires the guarded custom Gemini gateway.")
+    if native_closing:prompt += "\n" + CLOSING_POLICY
     transcriber, transcription_credentials = select_transcriber(env, apply=apply)
     credentials = list(dict.fromkeys([*credentials, *transcription_credentials]))
     if "url" in model:
@@ -110,7 +115,7 @@ def assistant_payload(prompt: str, schemas: list[dict], env: dict, *, apply: boo
             **model,
             "maxTokens": MAX_OUTPUT_TOKENS if model.get("provider") == "custom-llm" else 600,
             "messages": [{"role": "system", "content": prompt}],
-            "tools": normalize_tools(schemas),
+            "tools": normalize_tools(schemas) + ([native_tool()] if native_closing else []),
         },
         "transcriber": transcriber,
         "voice": voice,
@@ -193,7 +198,7 @@ def main(argv=None) -> int:
         args.output.with_suffix(".meta.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print(f"Redacted assistant preview: {args.output.resolve()}")
         print(f"Profiles: {manifest['model_profile']} / {manifest['voice_profile']}; metadata saved alongside preview.")
-        print(f"Configured {len(payload['model']['tools'])} business tools; recording is disabled.")
+        print(f"Configured {len([tool for tool in payload['model']['tools'] if tool['type']=='function'])} business tools; recording is disabled.")
         if not args.apply:
             print("Dry run complete. No external requests were made.")
             return 0

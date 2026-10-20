@@ -19,10 +19,17 @@ services:
       LANGSMITH_PROJECT: servicevoice-cloud
       SERVICEVOICE_LANGSMITH_BUDGET_PATH: /data/langsmith-budget.sqlite3
       SERVICEVOICE_TIMING_PERSISTENCE: "on"
+      # Derived <database-stem>-diagnostics.sqlite3 is in the same durable /data volume.
+      SERVICEVOICE_DIAGNOSTICS_ENABLED: "on"
       SERVICEVOICE_ENVIRONMENT: production
       VAPI_MODEL_PROFILE: gemini-3.8-flash-custom
+      # Existing settings retain the prior voice; new settings explicitly select Gemini.
+      VAPI_VOICE_PROFILE: ${VAPI_VOICE_PROFILE:-elliot-v2}
+      GEMINI_TTS_MODEL: ${GEMINI_TTS_MODEL:-gemini-3.8-flash-lite-tts}
+      GEMINI_TTS_VOICE: ${GEMINI_TTS_VOICE:-Kore}
       PUBLIC_BASE_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}
       VAPI_CUSTOM_LLM_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}/llm
+      VAPI_CUSTOM_TTS_URL: https://${SERVICEVOICE_PUBLIC_HOST:?Set the static public IPv4 or DNS name}/tts/vapi
     # No published application or console port. Caddy is the only public entry.
     volumes:
       - application-data:/data
