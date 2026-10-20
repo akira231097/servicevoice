@@ -214,6 +214,33 @@ confirmed audible barge-in. Likewise, provider pipeline cycles are not caller
 utterances. Conflicting interruption flags retain their original scopes and an
 unresolved interpretation instead of becoming fabricated interruption counts.
 
+New automatic reviews can capture the ended call's provider log through a
+separate bounded reader. It requires the authenticated call and organization,
+checks the configured assistant identity, and uses an explicitly configured
+exact storage-host allowlist.
+It sends no Vapi administration credential to storage, follows no redirects,
+and retains no signed URL, raw headers or transcript content in the export.
+An empty allowlist disables this source; expiration, rejection, malformed data
+or a limit produces a fixed unavailable reason rather than a clean empty trace.
+
+Inspect `provider_observations` in the call review and `voice.provider.*`
+children in LangSmith. A speech/turn/pipeline event is a recorded timestamp
+instant: its zero-length span is not an execution duration. A provider model
+interval needs a shared explicit span ID and unique chronological boundaries.
+Unmatched speech starts/stops remain separate observations. Completed output
+followed by a cleanup abort ends at completion and is not labelled a failed
+response. These evidence children do not call another model.
+
+The capture is limited to 16 MiB compressed, 128 MiB expanded, 4 MiB per line,
+10,000 source rows and a 15-second deadline. Provider child export is capped at
+4,000 and shares the trace's overall child budget; omitted and rejected counts
+remain visible. `status=observed` describes the successful bounded fetch, while
+its coverage remains partial. It does not certify the caller's experience.
+Only new unfrozen reviews capture this source. Export retries reuse the same
+stored sanitized evidence; completed older reviews are not recaptured or
+rejudged. Child builders revalidate cached projected fields rather than copying
+unknown text, while fixed known filtering/loss counts remain visible.
+
 Separate forensic feedback may flag an automatic judge's blind spots without
 rewriting its original verdict. Human listening reports, deterministic receipt
 checks, provider termination and advisory text grades must remain distinguishable.

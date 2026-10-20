@@ -73,7 +73,7 @@ def test_separate_review_image_includes_combined_scope_import_dependencies():
     assert copies[0].split()[1:-1] == [
         "app/domain.py", "app/live_eval_evidence.py", "app/live_evaluations.py",
         "app/diagnostics.py", "app/evaluation_spans.py",
-        "app/generation_observability.py", "app/observability.py",
+        "app/generation_observability.py", "app/observability.py", "app/provider_logs.py",
     ]
     assert 'ENTRYPOINT ["python", "-m", "app.live_evaluations"]' in dockerfile
     assert '"-c"' in dockerfile and "health.json" in dockerfile

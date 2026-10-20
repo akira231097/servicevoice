@@ -27,7 +27,9 @@ from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evide
     canonical, check, latency, missing_snapshot, read_snapshot, read_timings, readonly)
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
 from .evaluation_spans import build_component_runs
-from .generation_observability import project_gateway_timings, build_gateway_generation_runs
+from .generation_observability import (project_gateway_timings, build_gateway_generation_runs,
+    build_provider_observation_runs)
+from .provider_logs import capture_provider_log_sync, safe_provider_capture, validate_trusted_hosts
 from .diagnostics import REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage
 
 MODEL = "gemini-3.8-flash"
@@ -132,10 +134,14 @@ class Config:
     assistant_id: str = ""
     diagnostics_path: Path | None = None
     max_failures: int = 8
+    provider_log_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls,env=None):
         env = os.environ if env is None else env
+        raw_hosts=env.get("SERVICEVOICE_EVAL_PROVIDER_LOG_HOSTS","")
+        if not isinstance(raw_hosts,str):raise ValueError("invalid_evaluation_configuration")
+        provider_hosts=tuple(item.strip() for item in raw_hosts.split(",")) if raw_hosts.strip() else ()
         config = cls(source=Path(env.get("SERVICEVOICE_EVAL_SOURCE_DB", "/evidence/servicevoice.sqlite3")),
             outbox=Path(env.get("SERVICEVOICE_EVAL_OUTBOX", "/evaluations/outbox.sqlite3")),
             vapi_key=env.get("VAPI_EVALUATION_API_KEY", ""),gemini_key=env.get("GEMINI_API_KEY", ""),
@@ -149,11 +155,12 @@ class Config:
             lookback_hours=int(env.get("SERVICEVOICE_EVAL_LOOKBACK_HOURS", "24")),
             assistant_id=env.get("VAPI_EVAL_ASSISTANT_ID", ""),
             diagnostics_path=Path(env["SERVICEVOICE_EVAL_DIAGNOSTICS_PATH"]) if env.get("SERVICEVOICE_EVAL_DIAGNOSTICS_PATH") else None,
-            max_failures=int(env.get("SERVICEVOICE_EVAL_MAX_FAILURES", "8")))
+            max_failures=int(env.get("SERVICEVOICE_EVAL_MAX_FAILURES", "8")),provider_log_hosts=provider_hosts)
         config.validate()
         return config
 
     def validate(self):
+        validate_trusted_hosts(self.provider_log_hosts)
         if (self.endpoint not in OFFICIAL_ENDPOINTS or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{0,63}",self.project)
                 or any(not 16 <= len(k) <= 512 or any(ord(c)<33 or ord(c)>126 for c in k) for k in (self.vapi_key,self.gemini_key,self.langsmith_key))
                 or str(UUID(self.workspace)) != self.workspace
@@ -164,6 +171,7 @@ class Config:
                 or type(self.max_failures) is not int or not 1 <= self.max_failures <= 30
                 or self.source.resolve() == self.outbox.resolve()
                 or self.diagnostics_path is not None and self.diagnostics_path.resolve() == self.outbox.resolve()
+                or self.provider_log_hosts and not self.organization
                 or self.environment not in {"local","development","staging","production"}):
             raise ValueError("invalid_evaluation_configuration")
 
@@ -382,7 +390,7 @@ def judge(client,key,package):
     return parse_judgment(parsed,package)
 
 
-def public_report(package,judgment,call,timings,config,*,diagnostics=None,semantic_status=None):
+def public_report(package,judgment,call,timings,config,*,diagnostics=None,semantic_status=None,provider_capture=None):
     """Strict export boundary. No transcripts, arguments, raw names or judge prose."""
     checks=dict(package["mechanical_checks"])
     for dimension in DIMENSIONS:
@@ -451,7 +459,7 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     elif not isinstance(diagnostics.get("configuration"),dict):
         diagnostics={**diagnostics,"configuration":{"id":None,"provenance":"unavailable",
             "provider_effective_configuration":"unknown"}}
-    return {"review_version":VERSION,"review_source_sha256":source_hash,"checks":checks,"latency":metrics,
+    report={"review_version":VERSION,"review_source_sha256":source_hash,"checks":checks,"latency":metrics,
         "review_process":{"semantic_status":semantic_status,"judge_model":MODEL,"dimensions":list(DIMENSIONS),
             "judge_prompt_revision":JUDGE_PROMPT_REVISION,"judge_prompt_sha256":JUDGE_PROMPT_SHA256,
             "diagnostics_coverage_revision":REVIEW_DIAGNOSTICS_REVISION,
@@ -474,6 +482,9 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
         "needs_review":any(v["verdict"] in {"fail","uncertain"} for v in checks.values()),
         "scope":"Advisory review of stored text plus scheduler evidence; provider internals and exact heard audio remain unverified.",
         "privacy":"Transcripts, customer details, tool arguments and judge prose excluded from this LangSmith export."}
+    if provider_capture is not None:
+        report["provider_observations"]=safe_provider_capture(provider_capture,call["id"])
+    return report
 
 
 def feedback_rows(run_id,report):
@@ -494,6 +505,11 @@ def feedback_rows(run_id,report):
     yield {"key":"provider_ended_by_assistant","score":int(assistant_end) if type(assistant_end) is bool else None,
         "value":assistant_end if type(assistant_end) is bool else "unknown",
         "comment":"Coverage only: recognized provider end reason. Does not establish correct goodbye timing or automatic-hangup acceptance."}
+    if "provider_observations" in report:
+        capture=report["provider_observations"]
+        yield {"key":"provider_log_available","score":1 if capture.get("status")=="observed" else None,
+            "value":capture.get("status","unavailable"),
+            "comment":"Coverage only: bounded provider log capture, not agent quality, audible interruption or phone playback proof."}
     for key,value in report["latency"].items():
         if type(value) in (int,float):
             yield {"key":"latency_"+key,"score":value,"value":value,"comment":"Milliseconds, except measured_turns (count). Lower latency is better."}
@@ -535,7 +551,7 @@ class LangSmith:
     def trace_runs(self,project,trace):
         """Official trace query returns all runs; keep an explicit byte/row cap."""
         fields=["id","session_id","trace_id","parent_run_id","name","run_type","error",
-            "inputs","outputs","dotted_order","start_time","end_time"]
+            "inputs","outputs","dotted_order","start_time","end_time","extra","tags"]
         response=self.request("POST","/api/v1/runs/query",body={"session":[project],"trace":trace,"limit":100,"select":fields},limit=8*1024*1024)
         rows=response.get("runs") if isinstance(response,dict) else None
         if not isinstance(rows,list) or len(rows)>9001:
@@ -625,9 +641,33 @@ class LangSmith:
         generation_plan=build_gateway_generation_runs(report.get("gateway_generations") or project_gateway_timings([]),
             root_run_id=run_id,root_dotted_order=body["dotted_order"],project_id=project)
         children=component_plan["runs"]+generation_plan["runs"]
+        provider_plan=None
+        if "provider_observations" in report:
+            capture=safe_provider_capture(report["provider_observations"],call_id)
+            projection=capture.get("projection")
+            if projection is not None:
+                available=max(0,9000-len(children))
+                provider_plan=build_provider_observation_runs(projection,root_run_id=run_id,
+                    root_dotted_order=body["dotted_order"],project_id=project,expected_call_id=call_id,
+                    max_runs=max(1,min(4000,available)))
+                if not available:
+                    provider_plan["coverage"]["export_limit_omitted_spans"]+=len(provider_plan["runs"])
+                    provider_plan["coverage"].update(exported_point_event_spans=0,exported_model_interval_spans=0,
+                        trace_child_budget_exhausted=True)
+                    provider_plan["runs"]=[]
+            else:
+                provider_plan={"runs":[],"coverage":{"state":capture["status"],
+                    "reason_code":capture["reason_code"],"complete_provider_visibility":False,
+                    "audible_interruption_count":None,"late_phone_packet_discard_verified":False}}
+            children+=provider_plan["runs"]
         if len(children)>9000 or len({r["id"]for r in children})!=len(children):
             raise EvidenceError("component_export_identity_or_capacity_invalid")
         body["outputs"]={**report,"trace_export":component_plan["coverage"],"gateway_generation_export":generation_plan["coverage"]}
+        if provider_plan is not None:
+            # Cached reports cross the same fixed-schema export boundary as
+            # newly captured evidence. Never forward unknown persisted fields.
+            body["outputs"]["provider_observations"]=capture
+            body["outputs"]["provider_observation_export"]=provider_plan["coverage"]
         try:self.request("GET","/runs/"+run_id)
         except EvidenceError as exc:
             if str(exc)!="http_404":raise
@@ -636,12 +676,23 @@ class LangSmith:
                 if str(create)!="http_409":raise
         # Reconcile the immutable payload before attaching any feedback.
         saved=self.readback("/runs/"+run_id,"run_readback_ingestion_pending")
-        if not isinstance(saved,dict) or saved.get("session_id")!=project or saved.get("outputs")!=body["outputs"]:
+        def valid_labels(existing,expected):
+            tags=existing.get("tags") if isinstance(existing,dict) else None
+            metadata=(existing.get("extra") or {}).get("metadata") if isinstance(existing,dict) and isinstance(existing.get("extra"),dict) else None
+            return (type(tags) is list and all(type(tag) is str for tag in tags)
+                and len(tags)==len(set(tags)) and set(tags)==set(expected["tags"])
+                and isinstance(metadata,dict)
+                and all(metadata.get(key)==value for key,value in expected["extra"]["metadata"].items()))
+        if (not isinstance(saved,dict)
+                or any(saved.get(key)!=body.get(key) for key in ("id","session_id","trace_id","parent_run_id","name","run_type","inputs","outputs","dotted_order"))
+                or any(not self.same_time(saved.get(key),body.get(key)) for key in ("start_time","end_time"))
+                or not valid_labels(saved,body)):
             raise EvidenceError("run_readback_mismatch_or_ingestion_pending")
         def valid_child(existing,child):
             return (isinstance(existing,dict)
                 and all(existing.get(k)==child.get(k) for k in ("id","session_id","trace_id","parent_run_id","name","run_type","error","inputs","outputs","dotted_order"))
-                and all(self.same_time(existing.get(k),child.get(k)) for k in ("start_time","end_time")))
+                and all(self.same_time(existing.get(k),child.get(k)) for k in ("start_time","end_time"))
+                and valid_labels(existing,child))
 
         # Official batch ingestion and trace readback avoid hundreds of
         # per-child requests. Existing immutable children are checked first.
@@ -689,6 +740,7 @@ class LangSmith:
         return {"run_id":run_id,"project_id":project,
             "component_spans":len(component_plan["runs"]),
             "gateway_generation_spans":len(generation_plan["runs"]),
+            "provider_observation_spans":len(provider_plan["runs"]) if provider_plan is not None else 0,
             "url":f"https://smith.langchain.com/o/{self.config.workspace}/projects/p/{project}/r/{run_id}"}
 
     def coverage(self,status,now):
@@ -818,7 +870,10 @@ class Worker:
                     # Diagnostic failure cannot hide call grades or modify a booking.
                     diagnostics=None
                 report=public_report(package,judgment,call,read_timings(timing_path,cid),self.config,
-                    diagnostics=diagnostics,semantic_status=semantic_status)
+                    diagnostics=diagnostics,semantic_status=semantic_status,
+                    provider_capture=capture_provider_log_sync(call,expected_call_id=cid,
+                        expected_org_id=self.config.organization,expected_assistant_id=self.config.assistant_id or None,
+                        trusted_hosts=self.config.provider_log_hosts))
                 if semantic_status in {"assessed","assessed_with_uncertainty"}:
                     # Authoritative evidence can downgrade a permissive model
                     # verdict. Coverage describes finalized grades, not the raw

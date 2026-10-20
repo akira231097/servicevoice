@@ -313,3 +313,297 @@ def project_provider_generations(rows, call_id):
             "No text/time/count heuristic is used to assign audio to a generation.",
             "Vapi/carrier queues, RTP packets and phone playout are outside this backend's demonstrated control.",
         ], "privacy": "Fixed event names, validated IDs, counts and timestamps only; no transcript, headers, audio or customer fields."}
+
+
+PROVIDER_SPAN_VERSION = "provider-observation-spans-v1"
+MAX_PROVIDER_RUNS = 4_000
+_PROVIDER_SPAN_EVENTS = frozenset(_EVENTS.values())
+
+
+class ProviderSpanError(GenerationEvidenceError):
+    """Fixed provider-span validation codes; never contain source text."""
+
+
+def _provider_instant(value):
+    return datetime.fromtimestamp(value / 1000, timezone.utc)
+
+
+def _safe_provider_events(projected):
+    """Revalidate cached projections without copying arbitrary keys/prose."""
+    if (not isinstance(projected, dict)
+            or projected.get("schema_version") != VERSION
+            or _uuid(projected.get("call_id")) is None):
+        raise ProviderSpanError("invalid_provider_projection")
+    raw = projected.get("events")
+    if not isinstance(raw, list) or len(raw) > MAX_EVENTS:
+        raise ProviderSpanError("invalid_or_oversized_provider_events")
+    unique = {}; conflicts = set(); skipped = Counter(); duplicates = 0
+    # The historical projector retains a span UUID on an event even when its
+    # trace ID was absent. Its model groups alone certify explicit trace+span
+    # eligibility. Preserve that distinction rather than reconstructing a
+    # previously rejected interval from the UUID and nearby timestamps.
+    groups = projected.get("model_generations", [])
+    if not isinstance(groups, list) or len(groups) > MAX_EVENTS:
+        raise ProviderSpanError("invalid_or_oversized_provider_model_identities")
+    bound = set(); binding_count = 0
+    for group in groups:
+        if not isinstance(group, dict):
+            skipped["invalid_provider_model_identity"] += 1; continue
+        span, indices = _uuid(group.get("provider_model_span_id")), group.get("source_entry_indices")
+        if (span is None or group.get("identity_basis") != "explicit_provider_trace_and_span_ids"
+                or not isinstance(indices, list) or any(type(index) is not int or not 0 <= index < MAX_EVENTS for index in indices)):
+            skipped["invalid_provider_model_identity"] += 1; continue
+        binding_count += len(indices)
+        if binding_count > MAX_EVENTS:
+            raise ProviderSpanError("invalid_or_oversized_provider_model_identities")
+        bound.update((span, index) for index in indices)
+    for source in raw:
+        if not isinstance(source, dict):
+            skipped["invalid_provider_event"] += 1
+            continue
+        index, kind = source.get("source_entry_index"), source.get("event")
+        if (type(index) is not int or not 0 <= index < MAX_EVENTS
+                or type(kind) is not str or kind not in _PROVIDER_SPAN_EVENTS):
+            skipped["invalid_provider_event"] += 1
+            continue
+        span = _uuid(source.get("provider_model_span_id")) if kind in _MODEL_EVENTS else None
+        eligible = span is not None and ((span, index) in bound or
+            "model_generations" not in projected and source.get("provider_model_identity_basis") == "explicit_provider_trace_and_span_ids")
+        if span is not None and not eligible:
+            skipped["model_span_trace_binding_unavailable"] += 1
+        row = {"source_entry_index": index, "event": kind,
+            "observed_unix_ms": _milliseconds(source.get("observed_unix_ms")),
+            "provider_turn_id": _turn(source.get("provider_turn_id")),
+            "provider_previous_turn_id": _turn(source.get("provider_previous_turn_id")),
+            "provider_model_span_id": span if eligible else None,
+            "provider_model_identity_basis": "explicit_provider_trace_and_span_ids" if eligible else None,
+            "identity_basis": "explicit_provider_fields", "timing_basis": "provider_reported"}
+        if index in unique:
+            if unique[index] != row:
+                conflicts.add(index)
+            else:
+                duplicates += 1
+        else:
+            unique[index] = row
+    for index in conflicts:
+        unique.pop(index, None)
+    if conflicts:
+        skipped["conflicting_source_entry_identity"] += len(conflicts)
+    return sorted(unique.values(), key=lambda row: row["source_entry_index"]), dict(skipped), duplicates
+
+
+def sanitize_provider_projection(projected, expected_call_id):
+    """Project stored vendor observations again before the SaaS boundary.
+
+    The authenticated caller supplies the expected call independently. Counts,
+    text, headers, purported model intervals and explanatory prose in a cached
+    projection never become trusted export fields merely by being persisted.
+    """
+    rows, skipped, duplicates = _safe_provider_events(projected)
+    if _uuid(expected_call_id) is None or projected["call_id"] != expected_call_id:
+        raise ProviderSpanError("provider_projection_call_scope_mismatch")
+    issues = Counter(skipped)
+    prior = projected.get("summary", {})
+    if not isinstance(prior, dict):
+        prior = {}; issues["invalid_prior_projection_summary_fields"] += 1
+    allowed_issues = {"invalid_provider_event", "conflicting_source_entry_identity", "invalid_provider_flag_fields",
+        "invalid_provider_model_identity", "model_span_trace_binding_unavailable",
+        "invalid_source_projection_skip_fields", "invalid_provider_request_metadata",
+        "invalid_provider_request_metadata_fields", "conflicting_provider_request_metadata_identity",
+        "invalid_prior_projection_summary_fields"}
+    prior_issues = prior.get("rejected_field_counts", {})
+    if not isinstance(prior_issues, dict):
+        prior_issues = {}; issues["invalid_prior_projection_summary_fields"] += 1
+    for name, value in prior_issues.items():
+        if type(name) is str and name in allowed_issues and type(value) is int and 0 <= value <= 1_000_000:
+            issues[name] += value
+        else:
+            issues["invalid_prior_projection_summary_fields"] += 1
+    def prior_duplicates(key):
+        value = prior.get(key, 0)
+        if type(value) is int and 0 <= value <= MAX_EVENTS:
+            return value
+        issues["invalid_prior_projection_summary_fields"] += 1
+        return 0
+    duplicates += prior_duplicates("exact_duplicate_events_ignored")
+    metadata_duplicates = prior_duplicates("exact_duplicate_request_metadata_ignored")
+    source_skipped = {}
+    raw_skipped = projected.get("skipped", prior.get("source_projection_skipped_counts", {}))
+    if not isinstance(raw_skipped, dict):
+        raw_skipped = {}; issues["invalid_source_projection_skip_fields"] += 1
+    allowed_skips = {"attributes_unavailable", "conflicting_call_identity", "unbound_call_identity",
+        "relevant_timestamp_unavailable", "model_span_identity_unavailable"}
+    for name, value in raw_skipped.items():
+        if (type(name) is str and name in allowed_skips and type(value) is int and 0 <= value <= MAX_EVENTS):
+            source_skipped[name] = value
+        else:
+            issues["invalid_source_projection_skip_fields"] += 1
+    raw_flags = projected.get("provider_flag_evidence", {})
+    if not isinstance(raw_flags, dict):
+        raw_flags = {}; issues["invalid_provider_flag_fields"] += 1
+    flags = {}
+    for key in ("pipeline_was_interruption_values", "request_assistant_turn_interrupted_values"):
+        raw = raw_flags.get(key, {})
+        if not isinstance(raw, dict):
+            raw = {}; issues["invalid_provider_flag_fields"] += 1
+        flags[key] = {}
+        for name, value in raw.items():
+            if (type(name) is str and name in {"true", "false", "unknown"}
+                    and type(value) is int and 0 <= value <= MAX_EVENTS):
+                flags[key][name] = value
+            else:
+                issues["invalid_provider_flag_fields"] += 1
+    flags.update(scope_reconciliation="not_established",
+        interpretation="Different provider flags do not independently prove audible interruption; their semantics and scopes may differ.")
+    raw_metadata = projected.get("provider_request_metadata", [])
+    if not isinstance(raw_metadata, list) or len(raw_metadata) > MAX_EVENTS:
+        raise ProviderSpanError("invalid_or_oversized_provider_metadata")
+    metadata = {}; conflicts = set()
+    for source in raw_metadata:
+        if not isinstance(source, dict):
+            issues["invalid_provider_request_metadata"] += 1; continue
+        index = source.get("source_entry_index")
+        stamp = _milliseconds(source.get("provider_request_timestamp_unix_ms"))
+        if type(index) is not int or not 0 <= index < MAX_EVENTS or stamp is None:
+            issues["invalid_provider_request_metadata"] += 1; continue
+        row = {"source_entry_index": index, "provider_request_timestamp_unix_ms": stamp}
+        for key in ("provider_num_assistant_turns", "provider_num_user_turns", "provider_num_model_request_in_turn"):
+            row[key] = _counter(source.get(key))
+            if source.get(key) is not None and row[key] is None:
+                issues["invalid_provider_request_metadata_fields"] += 1
+        value = source.get("provider_assistant_turn_interrupted")
+        row["provider_assistant_turn_interrupted"] = value if type(value) is bool else None
+        if value is not None and type(value) is not bool:
+            issues["invalid_provider_request_metadata_fields"] += 1
+        if index in metadata:
+            if metadata[index] == row: metadata_duplicates += 1
+            else: conflicts.add(index)
+        else: metadata[index] = row
+    for index in conflicts:
+        metadata.pop(index, None)
+    if conflicts: issues["conflicting_provider_request_metadata_identity"] += len(conflicts)
+    counts = Counter(row["event"] for row in rows)
+    return {"schema_version": VERSION, "call_id": expected_call_id, "events": rows,
+        "provider_flag_evidence": flags,
+        "provider_request_metadata": [metadata[index] for index in sorted(metadata)],
+        "summary": {"event_counts": dict(sorted(counts.items())),
+            "source_projection_skipped_counts": dict(sorted(source_skipped.items())),
+            "explicit_provider_model_span_id_count": len({row["provider_model_span_id"] for row in rows
+                if row["provider_model_span_id"] is not None}),
+            "exact_duplicate_events_ignored": duplicates,
+            "exact_duplicate_request_metadata_ignored": metadata_duplicates,
+            "rejected_field_counts": dict(sorted(issues.items()))},
+        "coverage": {"state": "provider_reported_partial" if rows else "unavailable", "complete": False,
+            "provider_turn_is_caller_turn": False,
+            "local_gateway_generation_join": "unavailable_without_explicit_shared_wire_id",
+            "tts_generation_join": "unavailable_without_explicit_shared_wire_id",
+            "rtp_generation_ids_observed": False, "late_phone_packet_discard_verified": False,
+            "audible_caller_interruption_count": None}}
+
+
+def build_provider_observation_runs(projected, *, root_run_id, root_dotted_order,
+                                    project_id, expected_call_id, max_runs=MAX_PROVIDER_RUNS):
+    """Build direct-root observations using explicit IDs and recorded times.
+
+    A timestamped event is a point observation: start=end does not claim a
+    measured execution duration. Model intervals require unambiguous recorded
+    boundaries. Speech starts/stops are never paired using proximity, and no
+    provider turn/model identity is joined to local gateway or TTS identities.
+    """
+    segments = root_dotted_order.split(".") if isinstance(root_dotted_order, str) else []
+    if (_uuid(root_run_id) is None or _uuid(project_id) is None or not segments
+            or any(not _DOT_SEGMENT.fullmatch(segment) for segment in segments)
+            or not segments[-1].endswith(root_run_id)
+            or _uuid(expected_call_id) is None
+            or type(max_runs) is not int or not 1 <= max_runs <= MAX_PROVIDER_RUNS):
+        raise ProviderSpanError("invalid_provider_span_destination_or_limit")
+    rows, invalid, duplicates = _safe_provider_events(projected)
+    if projected["call_id"] != expected_call_id:
+        raise ProviderSpanError("provider_projection_call_scope_mismatch")
+    root = UUID(root_run_id); runs = []; skipped = Counter(invalid); groups = defaultdict(list)
+
+    def child(kind, identity, name, start_ms, end_ms, inputs, outputs, metadata):
+        rid = str(uuid5(root, PROVIDER_SPAN_VERSION + ":" + kind + ":" + identity))
+        start, end = _provider_instant(start_ms), _provider_instant(end_ms)
+        return {"id": rid, "trace_id": root_run_id, "parent_run_id": root_run_id,
+            "session_id": project_id, "name": name, "run_type": "chain", "error": None,
+            "start_time": start.isoformat(timespec="microseconds"),
+            "end_time": end.isoformat(timespec="microseconds"),
+            "dotted_order": root_dotted_order + "." + start.strftime("%Y%m%dT%H%M%S%fZ") + rid,
+            "inputs": inputs, "outputs": {**outputs, "gateway_generation_id": None,
+                "tts_generation_id": None, "phone_playback_verified": False,
+                "late_phone_packet_discard_verified": False,
+                "audible_interruption_count": None},
+            "tags": [PROVIDER_SPAN_VERSION, "provider-reported", "not-an-additional-model-call",
+                "point-observation-not-duration" if kind == "event" else "explicit-provider-model-interval"],
+            "extra": {"metadata": {"record_kind": "provider_" + kind,
+                "provider_span_schema_version": PROVIDER_SPAN_VERSION, "capture_policy": "content-free-v1",
+                "parentage_basis": "call_review_root_only_no_inferred_causal_parent", **metadata}}}
+
+    for row in rows:
+        if row["provider_model_span_id"] is not None:
+            groups[row["provider_model_span_id"]].append(row)
+        stamp = row["observed_unix_ms"]
+        if stamp is None:
+            skipped["point_event_timestamp_unavailable"] += 1
+            continue
+        runs.append(child("event", str(row["source_entry_index"]), "voice." + row["event"], stamp, stamp,
+            {"event": row["event"], "source_entry_index": row["source_entry_index"]},
+            {"observed_event": row, "timing_basis": "recorded_provider_event_instant_not_execution_duration"},
+            {"source_entry_index": row["source_entry_index"], "provider_turn_id": row["provider_turn_id"],
+             "provider_model_span_id": row["provider_model_span_id"],
+             "timing_basis": "recorded_provider_event_instant_not_execution_duration"}))
+
+    interval_count = 0
+    for span, group in sorted(groups.items()):
+        selected = {name: [row for row in group if row["event"] == name] for name in _MODEL_EVENTS}
+        starts = selected["provider.model_started"]; complete = selected["provider.model_completed"]
+        abort = selected["provider.model_abort_label"]; first = selected["provider.model_first_token"]
+        if len(starts) != 1 or len(complete) > 1 or len(abort) > 1 or not (complete or abort):
+            skipped["model_interval_boundary_ambiguous_or_missing"] += 1
+            continue
+        start = starts[0]["observed_unix_ms"]
+        end_row = complete[0] if complete else abort[0]
+        end = end_row["observed_unix_ms"]
+        if start is None or end is None or end < start:
+            skipped["model_interval_chronology_unavailable"] += 1
+            continue
+        if (any(row["observed_unix_ms"] is None or not start <= row["observed_unix_ms"] <= end for row in first)
+                or (complete and abort and (abort[0]["observed_unix_ms"] is None
+                    or abort[0]["observed_unix_ms"] < end
+                    or abort[0]["source_entry_index"] <= complete[0]["source_entry_index"]))):
+            skipped["model_interval_chronology_unavailable"] += 1
+            continue
+        classification = ("completed_then_cleanup_abort_label" if complete and abort
+            else "completed" if complete else "aborted_without_observed_output" if not first
+            else "ambiguous_or_incomplete")
+        interval = {"provider_model_span_id": span,
+            "provider_turn_id_at_start": starts[0]["provider_turn_id"],
+            "provider_turn_id_at_abort": abort[0]["provider_turn_id"] if abort else None,
+            "started_unix_ms": start, "completed_unix_ms": complete[0]["observed_unix_ms"] if complete else None,
+            "abort_label_unix_ms": abort[0]["observed_unix_ms"] if abort else None,
+            "first_token_unix_ms": first[0]["observed_unix_ms"] if len(first) == 1 else None,
+            "observed_duration_ms": end - start, "classification": classification,
+            "source_entry_indices": [row["source_entry_index"] for row in group],
+            "identity_basis": "explicit_provider_trace_and_span_ids",
+            "timing_basis": "recorded_provider_model_boundaries"}
+        runs.append(child("model_span", span, "voice.provider.model_generation", start, end,
+            {"provider_model_span_id": span, "identity_basis": interval["identity_basis"]},
+            {"observed_model_interval": interval}, {"provider_model_span_id": span,
+                "timing_basis": interval["timing_basis"]}))
+        interval_count += 1
+
+    runs.sort(key=lambda run: (run["start_time"], run["id"]))
+    omitted = max(0, len(runs) - max_runs)
+    runs = runs[:max_runs]
+    event_count = sum(run["extra"]["metadata"]["record_kind"] == "provider_event" for run in runs)
+    return {"runs": runs, "coverage": {"schema_version": PROVIDER_SPAN_VERSION,
+        "input_projected_events": len(projected["events"]), "valid_projected_events": len(rows),
+        "exact_duplicate_events_ignored": duplicates, "exported_point_event_spans": event_count,
+        "exported_model_interval_spans": len(runs) - event_count,
+        "observed_model_intervals_before_export_limit": interval_count,
+        "export_limit_omitted_spans": omitted, "skipped_event_counts": dict(sorted(skipped.items())),
+        "complete_provider_visibility": False, "provider_turn_is_caller_turn": False,
+        "speech_start_stop_pairs_inferred": False, "gateway_or_tts_generation_join": "unavailable_without_explicit_shared_wire_id",
+        "audible_interruption_count": None, "late_phone_packet_discard_verified": False,
+        "interpretation": "Provider-reported point events and explicit model intervals only. Cleanup abort labels do not establish failed responses; pipeline cycles are not caller utterances. No audio pairing, causal parentage, phone playback or late packet discard is inferred."}}

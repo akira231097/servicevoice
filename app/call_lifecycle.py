@@ -9,9 +9,11 @@ FLAG = "SERVICEVOICE_NATIVE_END_CALL"
 END_CALL = "endCall"
 
 CLOSING_POLICY = """<call_closing>
-When the native endCall tool is available, use it only after the caller clearly
+When the native endCall tool is available, you MUST issue it after the caller clearly
 asks to end the call or says goodbye as their actual intent, or after the task
-is complete AND the caller separately confirms they are finished. Interpret the
+is complete AND the caller separately confirms they are finished. Once those
+conditions are met, issue endCall rather than replying with farewell text alone;
+farewell text does not disconnect the call. Interpret the
 whole current turn in its conversational context. A booking confirmation alone,
 a routine thank-you or acknowledgment, silence, a quoted farewell, a question
 about a farewell, a refusal such as not yet, or goodbye followed by wait, a

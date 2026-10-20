@@ -38,6 +38,15 @@ LANGSMITH_WORKSPACE_ID=<workspace UUID>
 VAPI_PHONE_ORG_ID=<Vapi organization UUID>
 ```
 
+Optional provider-log capture uses `SERVICEVOICE_EVAL_PROVIDER_LOG_HOSTS`, a
+comma-separated allowlist of at most two exact validated Vapi R2 storage hosts.
+Approve the hosts independently; do not derive trust from an incoming artifact
+URL or use a wildcard. Leave it empty to disable this source explicitly.
+This setting requires the scoped Vapi organization and does not require another
+credential. Storage requests use a separate unauthenticated client, no redirects
+and no environment proxy. Signed storage URLs and raw log content are never
+published to LangSmith.
+
 Do not copy the old evaluator environment wholesale. The candidate assistant,
 project, evidence paths and 200-attempt monthly budget are fixed in the Compose
 document. The 24-hour initial capture window is persisted in its own outbox; it
@@ -94,12 +103,13 @@ use explicit persisted generation identities and measured start/duration only.
 Legacy request IDs must not be promoted into generation IDs. An older timing
 row without the new stamp remains unavailable lineage coverage. Gateway events
 are not joined to vendor audio by timing, text, matching counts or adjacency.
-Copy all seven source modules listed by the separate evaluator Dockerfile.
+Copy all eight source modules listed by the separate evaluator Dockerfile.
 The evidence reader now imports `normalize_services` from `app/domain.py` to
 check every service in a combined visit; copying only the six review/projection
 modules leaves that import unavailable in an older base image. Diagnostics also
 depends on the observability generation-field allowlist, even though this worker
-does not start a voice tracer or call controller.
+does not start a voice tracer or call controller. Provider capture adds
+`app/provider_logs.py`; omitting it prevents the current worker from importing.
 
 After starting, verify the resolved image ID, both read-only mount flags, worker
 health, call ID, review version, six score rows, latency metrics and LangSmith
@@ -123,6 +133,19 @@ the exact call ID and valid recorded timing. A custom TTS request without that
 identity cannot be attached to a call using text, approximate timestamps or
 guesswork. The worker must show missing coverage rather than invent a complete
 trace.
+
+For new unfrozen reviews, the bounded provider reader can add explicit
+provider turn/model/speech observations. Its status, fixed unavailable reason,
+source hash, partial coverage and source-row counts appear in
+`provider_observations`; child export counts appear in
+`provider_observation_export`. `voice.provider.*` event spans are timestamp
+instants, while model spans require recorded start/end boundaries and a shared
+explicit provider span ID. They are not gateway/TTS joins or acoustic proof.
+The reader has a 15-second deadline and fixed compressed/expanded/line/row
+limits. Export caps are explicit. Frozen pending exports retain their original
+payload, and completed historical reviews are not requeued for this addition.
+Readback checks include the recorded IDs, values, times, metadata and tag set;
+successful ingestion alone is not the verification result.
 
 The six dimensions review text and authoritative scheduler receipts. They do
 not certify what a person heard, reference pronunciation, barge-in, natural

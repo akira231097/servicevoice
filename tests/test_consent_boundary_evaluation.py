@@ -6,6 +6,18 @@ import httpx
 import pytest
 
 from scripts import evaluate_consent_boundaries as evaluator
+from scripts import evaluate_gemini
+
+
+@pytest.fixture(autouse=True)
+def consent_fixture_tool_deadline(monkeypatch):
+    # These disposable-scheduler tests measure consent boundaries, not tool
+    # latency. A busy Windows CI runner can exceed the live 1.5-second deadline
+    # and feed operation_pending to the deliberately finite mock conversation.
+    # Deadline/recovery behavior remains covered by the harness timing tests.
+    harness = evaluate_gemini.ToolHarness
+    monkeypatch.setattr(evaluate_gemini, "ToolHarness",
+        lambda store: harness(store, timeout_seconds=30, status_timeout_seconds=5))
 
 
 def provider(*, defect=None):
