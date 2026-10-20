@@ -141,7 +141,7 @@ source hash, partial coverage and source-row counts appear in
 `provider_observation_export`. `voice.provider.*` event spans are timestamp
 instants, while model spans require recorded start/end boundaries and a shared
 explicit provider span ID. They are not gateway/TTS joins or acoustic proof.
-The reader has a 15-second deadline and fixed compressed/expanded/line/row
+The reader has a 45-second deadline and fixed compressed/expanded/line/row
 limits. Export caps are explicit. Frozen pending exports retain their original
 payload, and completed historical reviews are not requeued for this addition.
 Readback checks include the recorded IDs, values, times, metadata and tag set;

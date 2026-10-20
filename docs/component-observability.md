@@ -231,8 +231,8 @@ Unmatched speech starts/stops remain separate observations. Completed output
 followed by a cleanup abort ends at completion and is not labelled a failed
 response. These evidence children do not call another model.
 
-The capture is limited to 16 MiB compressed, 128 MiB expanded, 4 MiB per line,
-10,000 source rows and a 15-second deadline. Provider child export is capped at
+The capture is limited to 32 MiB compressed, 256 MiB expanded, 4 MiB per line,
+10,000 source rows and a 45-second deadline. Provider child export is capped at
 4,000 and shares the trace's overall child budget; omitted and rejected counts
 remain visible. `status=observed` describes the successful bounded fetch, while
 its coverage remains partial. It does not certify the caller's experience.

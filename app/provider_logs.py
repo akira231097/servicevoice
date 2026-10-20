@@ -80,17 +80,17 @@ class CaptureError(ValueError):
 
 @dataclass(frozen=True)
 class Limits:
-    compressed_bytes:int=16*1024*1024
-    expanded_bytes:int=128*1024*1024
+    compressed_bytes:int=32*1024*1024
+    expanded_bytes:int=256*1024*1024
     line_bytes:int=4*1024*1024
     events:int=MAX_EVENTS
-    deadline_seconds:float=15.0
+    deadline_seconds:float=45.0
 
     def validate(self):
-        for value,maximum in ((self.compressed_bytes,16*1024*1024),(self.expanded_bytes,128*1024*1024),
+        for value,maximum in ((self.compressed_bytes,32*1024*1024),(self.expanded_bytes,256*1024*1024),
                               (self.line_bytes,4*1024*1024),(self.events,MAX_EVENTS)):
             if type(value) is not int or not 1<=value<=maximum:raise CaptureError('invalid_capture_limits')
-        if type(self.deadline_seconds) not in (int,float) or not math.isfinite(self.deadline_seconds) or not 0<self.deadline_seconds<=15:
+        if type(self.deadline_seconds) not in (int,float) or not math.isfinite(self.deadline_seconds) or not 0<self.deadline_seconds<=45:
             raise CaptureError('invalid_capture_limits')
 
 
@@ -343,7 +343,7 @@ def safe_provider_capture(capture,expected_call_id):
         if (state!='observed' or reason!='provider_log_projected' or requests!=1 or status!=200
                 or capture.get('storage_profile')!=STORAGE_PROFILE or capture.get('artifact_field') not in {'presignedLogUrl','logUrl'}
                 or capture.get('call_key')!=hashlib.sha256(expected_call_id.encode()).hexdigest()):return unavailable()
-        for name,maximum in (('wire_bytes',16*1024*1024),('expanded_bytes',128*1024*1024),('source_rows',MAX_EVENTS)):
+        for name,maximum in (('wire_bytes',32*1024*1024),('expanded_bytes',256*1024*1024),('source_rows',MAX_EVENTS)):
             value=capture.get(name)
             if type(value) is not int or not 1<=value<=maximum:return unavailable()
         digest=capture.get('wire_sha256')

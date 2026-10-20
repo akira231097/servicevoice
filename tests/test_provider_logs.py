@@ -6,6 +6,7 @@ import json
 import logging
 from urllib.parse import urlencode
 from uuid import uuid4
+import zlib
 
 import httpx
 import pytest
@@ -342,3 +343,69 @@ def test_repeated_capture_boundary_preserves_known_source_rejections_without_ref
     assert once==twice and once['status']=='observed'
     assert once['projection']['summary']['rejected_field_counts']['invalid_provider_event']==1
     assert once['projection']['summary']['source_projection_skipped_counts']['conflicting_call_identity']==1
+
+
+def test_default_and_hard_capacity_bounds_allow_normal_large_calls_without_relaxing_line_or_event_limits():
+    limits=m.Limits();limits.validate()
+    assert limits.compressed_bytes==32*1024*1024
+    assert limits.expanded_bytes==256*1024*1024 and limits.deadline_seconds==45.0
+    assert limits.line_bytes==4*1024*1024 and limits.events==10000
+
+
+@pytest.mark.parametrize('field,value',[
+    ('compressed_bytes',32*1024*1024+1),('expanded_bytes',256*1024*1024+1),
+    ('deadline_seconds',45.001),('line_bytes',4*1024*1024+1),('events',10001),
+])
+def test_capacity_hard_maxima_still_reject_before_any_network(field,value):
+    limits=m.Limits(**{field:value})
+    result,requests=invoke(limits=limits)
+    assert result['reason_code']=='invalid_capture_limits' and result['projection'] is None and requests==[]
+
+
+def test_streamed_21mib_storage_object_is_captured_and_sanitized_without_materializing_a_large_fixture():
+    class LargeStream(httpx.AsyncByteStream):
+        closed=False
+        wire_bytes=0
+        maximum_emitted_chunk=0
+        async def __aiter__(self):
+            # Stored DEFLATE blocks make wire size representative rather than
+            # collapsing repetitive padding. Only one <=64KiB piece is yielded
+            # at once; no giant compressed body or file fixture is constructed.
+            compressor=zlib.compressobj(level=0,wbits=16+zlib.MAX_WBITS)
+            for index in range(42):
+                prefix=(json.dumps(event(time=1792533005405+index))[:-1]+',"ignored_padding":"').encode()
+                for piece in (prefix,)+(b'x'*m.CHUNK,)*8+(b'"}\n',):
+                    encoded=compressor.compress(piece)
+                    for start in range(0,len(encoded),m.CHUNK):
+                        chunk=encoded[start:start+m.CHUNK]
+                        self.wire_bytes+=len(chunk);self.maximum_emitted_chunk=max(self.maximum_emitted_chunk,len(chunk))
+                        yield chunk
+            encoded=compressor.flush()
+            for start in range(0,len(encoded),m.CHUNK):
+                chunk=encoded[start:start+m.CHUNK]
+                self.wire_bytes+=len(chunk);self.maximum_emitted_chunk=max(self.maximum_emitted_chunk,len(chunk))
+                yield chunk
+        async def aclose(self):self.closed=True
+    stream=LargeStream();requests=[]
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(200,stream=stream)
+    result=asyncio.run(m.capture_provider_log(call(),expected_call_id=CALL,expected_org_id=ORG,
+        expected_assistant_id=ASSISTANT,trusted_hosts=HOSTS,_transport=httpx.MockTransport(handler)))
+    assert result['status']=='observed' and result['network_requests']==len(requests)==1
+    assert 21*1024*1024<result['wire_bytes']==stream.wire_bytes<32*1024*1024
+    assert 21*1024*1024<result['expanded_bytes']<256*1024*1024
+    assert result['source_rows']==42 and len(result['projection']['events'])==42
+    assert stream.closed and stream.maximum_emitted_chunk<=m.CHUNK
+    assert m.safe_provider_capture(result,CALL)['status']=='observed'
+    text=json.dumps(result)
+    for forbidden in ('ignored_padding','PRIVATE',BASE,'X-Amz-'):assert forbidden not in text
+
+
+@pytest.mark.parametrize('field,maximum',[('wire_bytes',32*1024*1024),('expanded_bytes',256*1024*1024)])
+def test_public_metadata_accepts_updated_capacity_ceiling_but_rejects_above_it(field,maximum):
+    original,_=invoke();original[field]=maximum
+    assert m.safe_provider_capture(original,CALL)['status']=='observed'
+    original[field]=maximum+1
+    safe=m.safe_provider_capture(original,CALL)
+    assert safe['status']=='unavailable' and safe['reason_code']=='provider_log_capture_invalid'
