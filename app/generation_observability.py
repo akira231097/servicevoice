@@ -12,6 +12,8 @@ import math
 import re
 from uuid import UUID, uuid5
 
+from .observability import safe_timing_decision_code
+
 VERSION = "generation-observability-v1"
 MAX_EVENTS = 10_000
 _TURN = re.compile(r"^(?:0|[1-9][0-9]{0,8})$")
@@ -91,6 +93,11 @@ def project_gateway_timings(rows):
         for name, allowed in _GATEWAY_ENUMS.items():
             value = source.get(name)
             row[name] = value if type(value) is str and value in allowed else None
+        for name in ("narration_reason", "jev_reason", "eof_drain_outcome"):
+            # Frozen older review rows omitted these optional fields. Preserve
+            # that shape so an export retry cannot change immutable children.
+            if name in source:
+                row[name] = safe_timing_decision_code(source[name])
         for name, minimum in (("generation_sequence", 1), ("checkpoint_rejections", 0)):
             value = source.get(name)
             row[name] = value if type(value) is int and minimum <= value <= 100_000_000 else None

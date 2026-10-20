@@ -79,6 +79,25 @@ must use the call bound to that session. Do not accept an arbitrary caller
 query ID in a public diagnostic endpoint. The provider listener should expose
 only required authenticated voice routes, not the operator console.
 
+The automatic reviewer reads the business sidecar derived from its scheduler
+path and, when configured at a distinct path, the additional speech sidecar in
+`SERVICEVOICE_EVAL_DIAGNOSTICS_PATH`. That setting is additive: selecting the
+speech ledger must not hide gateway, tool, scheduler or receipt observations.
+Both sources are read-only and queried for the same exact call. An identical
+configured path is read once.
+
+The combined report retains each source's coverage and configuration identity.
+A missing, malformed, truncated or stale source remains visible even when the
+other source contains useful events. Different configurations are retained;
+the reader does not relabel speech observations as business configuration or
+invent turn/generation links. Identical events can be deduplicated, while
+conflicting event identities cannot silently become trusted evidence.
+In the call review, inspect `diagnostics.sources` for each source's state,
+counts and configuration IDs. `diagnostics.configuration` describes only the
+business runtime; `diagnostics.configurations` retains the observed source
+configurations. `coverage_revision=call-diagnostic-sources-v1` identifies the
+additive-reader contract. It does not imply every source had events for that call.
+
 ## Read coverage before judging success
 
 `coverage.state=observed` means some valid application evidence was stored with
@@ -92,6 +111,10 @@ Missing storage is `unavailable`, never a successful empty call. An unclean
 process termination can lose queued events; that boundary is acknowledged
 rather than presenting asynchronous logging as a lossless transaction log.
 The durable business journal remains authoritative for saved appointments.
+When multiple diagnostic ledgers are configured, inspect their source-level
+coverage as well as the union. A useful partial union does not make a missing
+source complete. An event count of zero also does not prove a component ran or
+failed.
 
 ## Evaluate the complete appointment scope
 

@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 from .observability import _generation_fields
 
 VERSION = "component-diagnostics-v1"
+REVIEW_DIAGNOSTICS_REVISION = "call-diagnostic-sources-v1"
 _HASH = re.compile(r"^[a-f0-9]{64}$")
 _ID = re.compile(r"^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$")
 _TURN = re.compile(r"^turn_[a-f0-9]{24}$")
@@ -308,6 +309,109 @@ def read_call_diagnostics(path, call_id, limit=1000):
 
 
 read_diagnostics = read_call_diagnostics
+
+
+def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=2000):
+    """Read one call from the business ledger and a distinct configured ledger.
+
+    Paths are trusted worker configuration, never event content, and are not
+    exported. The fixed source roles describe where evidence was captured, not
+    an inferred audio/generation relationship. A missing or damaged sibling
+    cannot remove valid evidence. The union is capped at 2,000 events, including
+    when each individual ledger has more evidence than fits in that union.
+    """
+    key=call_key(call_id)
+    if key is None or type(limit) is not int or not 1 <= limit <= 2000:
+        return {**_empty("invalid_read_scope",key),"coverage_revision":REVIEW_DIAGNOSTICS_REVISION,"sources":[]}
+    business=Path(source).with_name(Path(source).stem+"-diagnostics.sqlite3")
+    specs=[("business_runtime","scheduler_derived_sidecar",business)]
+    if diagnostics_path is not None:
+        specs.append(("configured_runtime","explicit_diagnostics_path",Path(diagnostics_path)))
+    distinct={};sources=[];events={};event_sources={};conflicting_events=set();configs={};conflicting_configs=set()
+    exact_duplicates=0;read_count=0
+    for role,provenance,path in specs:
+        try:
+            resolved=path.resolve()
+        except (OSError,ValueError,RuntimeError):
+            resolved=None
+        if resolved is not None and resolved in distinct:
+            distinct[resolved]["also_configured"]=True
+            continue
+        try:
+            snapshot=read_call_diagnostics(resolved,call_id,limit) if resolved is not None else _empty("diagnostics_unavailable",key)
+        except (OSError,sqlite3.Error,ValueError,TypeError,KeyError):
+            snapshot=_empty("diagnostics_unavailable",key)
+        raw_rows=snapshot["events"]
+        rows=[row for row in raw_rows if snapshot.get("call_key")==key and row.get("call_key")==key]
+        rejected_scope=len(raw_rows)-len(rows)
+        source_coverage=deepcopy(snapshot["coverage"])
+        if rejected_scope:
+            source_coverage.update(state="incomplete",complete=False,
+                rejected_call_scope_events=rejected_scope,
+                reason_codes=sorted(set(source_coverage["reason_codes"])|{"call_scope_mismatch"}))
+        used_configs={row["config_id"] for row in rows}
+        scoped_configs=[record for record in snapshot.get("configurations",[]) if record["id"] in used_configs]
+        preferred=snapshot.get("configuration")
+        if preferred is not None and preferred["id"] not in used_configs:preferred=None
+        if preferred is None and scoped_configs:preferred=scoped_configs[-1]
+        entry={"role":role,"provenance":provenance,"also_configured":role=="configured_runtime",
+            "coverage":source_coverage,"configuration":preferred,
+            "configurations":scoped_configs,"read_event_count":len(raw_rows),
+            "scoped_event_count":len(rows),"rejected_call_scope_events":rejected_scope}
+        sources.append(entry)
+        if resolved is not None:distinct[resolved]=entry
+        read_count+=len(raw_rows)
+        for manifest in entry["configurations"]:
+            cid=manifest["id"]
+            if cid in configs and configs[cid]!=manifest:conflicting_configs.add(cid)
+            else:configs[cid]=manifest
+        for row in rows:
+            eid=row["event_id"]
+            if eid in events:
+                if events[eid]!=row:conflicting_events.add(eid)
+                else:exact_duplicates+=1
+            else:events[eid]=row
+            event_sources.setdefault(eid,set()).add(role)
+    # Never choose one of two contradictory persisted identities as truth.
+    for cid in conflicting_configs:configs.pop(cid,None)
+    rejected_config_events={eid for eid,row in events.items() if row["config_id"] in conflicting_configs}
+    for eid in conflicting_events|rejected_config_events:events.pop(eid,None)
+    ordered=sorted(events.values(),key=lambda row:(row["start_unix"],row["event_id"]))
+    omitted=max(0,len(ordered)-limit)
+    selected=ordered[:limit]
+    for row in selected:
+        row["source_roles"]=sorted(event_sources[row["event_id"]])
+    for entry in sources:
+        entry["exported_event_count"]=sum(entry["role"] in row["source_roles"] for row in selected)
+        entry["configuration_ids"]=[record["id"] for record in entry["configurations"]]
+        # A conflicting identity is retained as an ID and explicit loss code,
+        # never as a selected supposedly authoritative configuration record.
+        entry["configurations"]=[record for record in entry["configurations"] if record["id"] not in conflicting_configs]
+        if entry["configuration"] and entry["configuration"]["id"] in conflicting_configs:entry["configuration"]=None
+    reasons=set()
+    states=[entry["coverage"]["state"] for entry in sources]
+    if "unavailable" in states:reasons.add("diagnostic_source_unavailable")
+    if "incomplete" in states:reasons.add("diagnostic_source_incomplete")
+    if conflicting_events:reasons.add("conflicting_event_identity")
+    if conflicting_configs:reasons.add("conflicting_configuration_identity")
+    if omitted:reasons.add("combined_event_limit_exceeded")
+    for entry in sources:reasons.update(entry["coverage"]["reason_codes"])
+    primary=sources[0].get("configuration") if sources else None
+    dropped=[entry["coverage"].get("dropped_events") for entry in sources]
+    state="observed" if not reasons else "incomplete" if any(value in {"observed","incomplete"} for value in states) else "unavailable"
+    return {"schema_version":VERSION,"coverage_revision":REVIEW_DIAGNOSTICS_REVISION,"call_key":key,
+        "configuration":primary,"configuration_scope":"business_runtime_only",
+        "configurations":[configs[cid] for cid in sorted(configs)],"sources":sources,"events":selected,
+        "coverage":{"state":state,"complete":False,"event_count":len(selected),"source_count":len(sources),
+            "read_event_count":read_count,"exact_duplicate_events_ignored":exact_duplicates,
+            "conflicting_event_id_count":len(conflicting_events),"conflicting_configuration_id_count":len(conflicting_configs),
+            "rejected_call_scope_events":sum(entry["rejected_call_scope_events"] for entry in sources),
+            "events_rejected_due_to_configuration_conflict":len(rejected_config_events),"union_events_omitted":omitted,
+            "dropped_events":sum(dropped) if all(type(value) is int for value in dropped) else None,
+            "truncated":bool(omitted or any(entry["coverage"].get("truncated") for entry in sources)),
+            "retention_pruned":any(entry["coverage"].get("retention_pruned") for entry in sources),
+            "reason_codes":sorted(reasons),
+            "interpretation":"Independent call-scoped ledgers; primary configuration is business runtime only. Source roles and timestamps do not establish audio playback, TTS-to-generation lineage or causal joins."}}
 
 
 def component_coverage(snapshot):

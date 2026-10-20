@@ -43,6 +43,51 @@ def test_explicit_generation_and_sse_lineage_retained_without_inferred_join():
     assert result['coverage']['audible_interruption_count'] is None
 
 
+@pytest.mark.parametrize('field,code', [
+    ('narration_reason','verified_receipt'),
+    ('narration_reason','presentation_missing_or_changed'),
+    ('jev_reason','not_first_user_turn'),
+    ('jev_reason','action_or_complex_request'),
+    ('eof_drain_outcome','eof'),
+])
+def test_recorded_fixed_decision_codes_survive_projection_and_span_export(field,code):
+    source=row();source[field]=code
+    projected=project_gateway_timings([source])
+    child=build_gateway_generation_runs(projected,**destination())['runs'][0]
+    assert projected['generations'][0][field]==code
+    assert child['outputs']['observed_generation'][field]==code
+    assert child['outputs']['phone_playback_verified'] is False
+
+
+@pytest.mark.parametrize('value',['private_customer_name','Bearer PRIVATE KEY',{'code':'verified_receipt'},3,None])
+def test_decision_codes_never_copy_unknown_or_private_values(value):
+    source=row();source.update(narration_reason=value,jev_reason=value,eof_drain_outcome=value)
+    result=build_gateway_generation_runs(project_gateway_timings([source]),**destination())
+    observed=result['runs'][0]['outputs']['observed_generation']
+    assert all(observed[key] is None for key in ('narration_reason','jev_reason','eof_drain_outcome'))
+    assert 'private_customer_name' not in json.dumps(result)
+    assert 'PRIVATE KEY' not in json.dumps(result)
+
+
+def test_conflicting_decision_codes_do_not_silently_rewrite_one_generation():
+    source=row();source['jev_reason']='not_first_user_turn'
+    changed=copy.deepcopy(source);changed['jev_reason']='verified_static_faq'
+    result=project_gateway_timings([source,changed])
+    assert result['generations']==[]
+    assert result['coverage']['skipped_row_counts']=={'conflicting_generation_identity':1}
+
+
+def test_legacy_frozen_projection_keeps_absent_optional_codes_on_export_retry():
+    projected=project_gateway_timings([row()]);target=destination()
+    original=build_gateway_generation_runs(projected,**target)
+    cached=json.loads(json.dumps(projected))
+    retried=build_gateway_generation_runs(cached,**target)
+    assert retried==original
+    optional={'narration_reason','jev_reason','eof_drain_outcome'}
+    assert not optional.intersection(cached['generations'][0])
+    assert not optional.intersection(retried['runs'][0]['outputs']['observed_generation'])
+
+
 def test_old_request_id_never_becomes_a_generation_identity():
     source = row();source.pop('generation_id')
     result = project_gateway_timings([source])

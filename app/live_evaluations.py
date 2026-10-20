@@ -28,6 +28,7 @@ from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evide
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
 from .evaluation_spans import build_component_runs
 from .generation_observability import project_gateway_timings, build_gateway_generation_runs
+from .diagnostics import REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage
 
 MODEL = "gemini-3.8-flash"
 GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -453,6 +454,8 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     return {"review_version":VERSION,"review_source_sha256":source_hash,"checks":checks,"latency":metrics,
         "review_process":{"semantic_status":semantic_status,"judge_model":MODEL,"dimensions":list(DIMENSIONS),
             "judge_prompt_revision":JUDGE_PROMPT_REVISION,"judge_prompt_sha256":JUDGE_PROMPT_SHA256,
+            "diagnostics_coverage_revision":REVIEW_DIAGNOSTICS_REVISION,
+            "diagnostics_source_sha256":hashlib.sha256(Path(__file__).with_name("diagnostics.py").read_bytes()).hexdigest(),
             "advisory":True,"human_calibration":"not_established_by_this_review"},
         "evidence_coverage":{"spoken_audio_verified":None,
             "spoken_audio_status":"unverified_no_independent_listening_evidence_in_this_review",
@@ -809,9 +812,7 @@ class Worker:
                 timing_path=self.config.source.with_name(self.config.source.stem+"-gateway-timings.sqlite3")
                 diagnostics=None
                 try:
-                    from .diagnostics import read_call_diagnostics,component_coverage
-                    diagnostics_path=self.config.diagnostics_path or self.config.source.with_name(self.config.source.stem+"-diagnostics.sqlite3")
-                    diagnostics=read_call_diagnostics(diagnostics_path,cid)
+                    diagnostics=read_review_diagnostics(self.config.source,cid,self.config.diagnostics_path)
                     diagnostics={**diagnostics,"components":component_coverage(diagnostics)}
                 except (ImportError,sqlite3.Error,OSError,ValueError,TypeError):
                     # Diagnostic failure cannot hide call grades or modify a booking.

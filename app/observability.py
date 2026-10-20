@@ -542,6 +542,13 @@ _TIMING_DURATIONS = frozenset({"tool_signature_persist", "upstream_eof_drain", "
 _TIMING_COUNTS = frozenset({"history_messages", "history_tool_results", "upstream_events", "text_chunks",
                           "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests"})
 _TIMING_USAGE = frozenset({"input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"})
+
+
+def safe_timing_decision_code(value):
+    """Export a recorded fixed decision code; unknown/free text stays absent."""
+    return value if type(value) is str and value in _TIMING_CODES else None
+
+
 _SHORT_HASH = re.compile(r"^[a-f0-9]{16}$")
 _REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
 _FAQ_VERSION = re.compile(r"^jev-static-faq-\d{4}-\d{2}-\d{2}-\d{1,3}$")
@@ -562,8 +569,7 @@ def safe_timing_row(row):
     safe = {"request_id": request_id, "call_key": call_key, "started_at_unix": started,
             "route": row["route"], "outcome": row["outcome"]}
     for key in ("narration_reason", "jev_reason", "eof_drain_outcome"):
-        value = row.get(key)
-        safe[key] = value if type(value) is str and value in _TIMING_CODES else None
+        safe[key] = safe_timing_decision_code(row.get(key))
     for key in ("system_prompt_sha256", "source_result_sha256", "output_text_sha256"):
         value = row.get(key)
         safe[key] = value if type(value) is str and _HASH.fullmatch(value) else None

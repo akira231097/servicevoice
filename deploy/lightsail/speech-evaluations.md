@@ -24,7 +24,7 @@ Record the resulting evaluator image ID and set
 image implicitly. Before starting it, run the image's import smoke check:
 
 ```sh
-docker run --rm --entrypoint python "$SERVICEVOICE_SPEECH_EVAL_IMAGE" -c 'from app.live_evaluations import Config, Worker; from app.evaluation_spans import build_component_runs; from app.diagnostics import read_call_diagnostics; from app.generation_observability import project_gateway_timings, build_gateway_generation_runs; print("review imports ready")'
+docker run --rm --entrypoint python "$SERVICEVOICE_SPEECH_EVAL_IMAGE" -c 'from app.live_evaluations import Config, Worker; from app.evaluation_spans import build_component_runs; from app.diagnostics import read_call_diagnostics, read_review_diagnostics; from app.generation_observability import project_gateway_timings, build_gateway_generation_runs; print("review imports ready")'
 ```
 
 Create a separate, mode-0600 environment file outside the checkout. Set
@@ -58,6 +58,20 @@ names must exist; Compose must fail rather than silently create empty evidence:
 - `servicevoice-speech-candidate_candidate-application-data`
 - `servicevoice-speech-candidate_candidate-speech-data`
 
+The reviewer always reads the business diagnostic ledger derived from
+`SERVICEVOICE_EVAL_SOURCE_DB`: `/evidence/servicevoice-diagnostics.sqlite3` in
+this package. `SERVICEVOICE_EVAL_DIAGNOSTICS_PATH` adds the distinct speech
+ledger, `/speech-evidence/tts-diagnostics.sqlite3`; it does not replace the
+business ledger. Both are queried for the same call through the existing
+read-only mounts. If both paths resolve to the same ledger, read it once.
+Preserve both sets of configuration identities and source-level coverage in
+the union. Missing or degraded speech evidence must not erase useful business
+events or turn an incomplete report into a complete one, and vice versa.
+The exported `diagnostics.sources` records those independent states and
+configuration IDs. The primary `diagnostics.configuration` remains business-only,
+including when only speech events are available. The coverage revision is
+`call-diagnostic-sources-v1`; completed older reviews retain their frozen payloads.
+
 The current worker contract is `live-call-review-v5`. It retains v4's six semantic
 dimensions, conservative reference-text uncertainty and separate acoustic and
 termination coverage. Completed v4 reviews remain valid and are not automatically
@@ -89,7 +103,10 @@ does not start a voice tracer or call controller.
 
 After starting, verify the resolved image ID, both read-only mount flags, worker
 health, call ID, review version, six score rows, latency metrics and LangSmith
-readback. A healthy worker alone does not establish that a particular call was
+readback. Verify that automatic call reviews contain the available business and
+speech observations together, with honest source-level coverage. A separately
+published synthetic business trace does not establish that the automatic
+worker read both ledgers. A healthy worker alone does not establish that a particular call was
 reviewed. Judge requests are bounded to three attempts per call and 200 model
 attempts per month; upload retries reuse the frozen review. Stop this companion
 to roll back review processing; the voice and booking services remain running.
