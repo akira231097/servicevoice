@@ -41,8 +41,11 @@ def test_warmed_exact_text_lookup_owns_no_disk_io_and_never_splices_names(tmp_pa
     result, metadata = cache.lookup_pcm(PHRASES["neutral_ack"], 16000, model=cache.spec.model, voice="Kore")
     assert result == pcm and metadata["cache_asset_id"] == asset["asset_id"]
     assert metadata["cache_manifest_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
-    for text in ("Mm-hmm. Alex", "Mm-hmm. ", "mm-hmm.", "I booked it.", "Let me check that, Sarath."):
+    assert metadata["cache_text_normalized"] is False
+    for text in ("Mm-hmm. Alex", "Mm-hmm.\u00a0", "mm-hmm.", "I booked it.", "Let me check that, Sarath."):
         assert cache.lookup_pcm(text, 16000) is None
+    padded, padded_metadata = cache.lookup_pcm(" \tMm-hmm. \r\n",16000)
+    assert padded == pcm and padded_metadata["cache_text_normalized"] is True
     assert cache.lookup_pcm(PHRASES["neutral_ack"], 8000) is None
     assert cache.lookup_pcm(PHRASES["neutral_ack"], True) is None
     assert cache.lookup_pcm(PHRASES["neutral_ack"], 16000, voice="Zephyr") is None

@@ -32,7 +32,7 @@ CONCURRENCY=4
 _ATTRIBUTES=("model","voice","sample_rate","input_characters","audio_bytes","error_code","failure_phase",
     "provider","provider_call_id_status","turn_id_status","first_audio_ms","upstream_http_status",
     "upstream_sample_rate","resampled","resampler","audio_duration_ms","observation_scope",
-    "cache_hit","cache_asset_id","cache_request_sha256","cache_manifest_sha256","cached_sample_rate","synthesis_source")
+    "cache_hit","cache_text_normalized","cache_asset_id","cache_request_sha256","cache_manifest_sha256","cached_sample_rate","synthesis_source")
 
 
 def _validate(values):

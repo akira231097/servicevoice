@@ -34,6 +34,7 @@ CONTRACT_IDS = (
     "competing_bookings_respect_capacity",
 )
 CUSTOMER = {"customer_name": "Alex Morgan", "phone": "5125550142", "vehicle": "2021 Toyota Camry"}
+CORRECTNESS_FIXTURE_TIMEOUT_SECONDS = 10
 
 
 class ContractFailure(Exception):
@@ -43,7 +44,10 @@ class ContractFailure(Exception):
 class Fixture:
     def __init__(self, path, row):
         self.store = Store(path)
-        self.harness = ToolHarness(self.store)
+        # These disposable fixtures evaluate business invariants, not the speed
+        # of a hosted runner's disk. Keep production deadline tests separate;
+        # never retry or promote pending results to verified receipts here.
+        self.harness = ToolHarness(self.store, timeout_seconds=CORRECTNESS_FIXTURE_TIMEOUT_SECONDS)
         self.sid = self.store.create_session("live")["id"]
         self.row = row
         self.sequence = 0

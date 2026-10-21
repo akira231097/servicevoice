@@ -45,7 +45,9 @@ def setup(tmp_path, monkeypatch, enabled="on"):
     config = {"GEMINI_GATEWAY_SECRET": SECRET, "GEMINI_API_KEY": "test-only", "SERVICEVOICE_RECEIPT_NARRATION": enabled}
     gateway = install_gateway(app, lambda: config, lambda *args: sid, client=httpx.AsyncClient(transport=httpx.MockTransport(provider)))
     gateway.store.pin_call_policy(sid, cid, "test-assistant", {"VAPI_MODEL_PROFILE": "gemini-3.8-flash-custom"})
-    harness = ToolHarness(store)
+    # Receipt/schema correctness is independent of hosted-runner disk speed.
+    # Dedicated harness tests retain the production 1.5-second wait deadline.
+    harness = ToolHarness(store, timeout_seconds=10)
     env = SimpleNamespace(store=store, sid=sid, cid=cid, app=app, gateway=gateway, harness=harness,
                           sent=sent, config=config, history=[{"role": "user", "content": "Please help me book a service."}], serial=0)
     return env

@@ -67,7 +67,7 @@ def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_pat
                 transport=httpx.ASGITransport(app=app), base_url="http://testserver"))
             reply = await client.post("/tts/vapi", headers={
                 "authorization": "Bearer " + values["GEMINI_TTS_BEARER_SECRET"]}, json={
-                "message": {"type": "voice-request", "text": PHRASES["moment"],
+                "message": {"type": "voice-request", "text": PHRASES["moment"]+" ",
                     "sampleRate": 16000, "call": {"id": call}},
                 "unrelated_private_text": "PRIVATE CUSTOMER 5125550142"})
             assert reply.status_code == 200
@@ -96,6 +96,7 @@ def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_pat
                 "cache_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
                 "cached_sample_rate": 16000, "synthesis_source": "pregenerated_cache"}
     complete = events["tts.completed"]["attributes"]
+    assert complete["cache_text_normalized"] is True
     assert complete["audio_bytes"] == len(pcm)
     assert complete["audio_duration_ms"] == len(pcm) / (16000 * 2) * 1000
     assert complete["observation_scope"] == "server_bytes_only_not_audible_playback"
