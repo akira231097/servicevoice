@@ -451,7 +451,8 @@ export class DuplexSession {
       this.ignoredEnergyOnsets.cooldown += 1; return;
     }
     const state = { generation: this.generation, mainAllowed: this.mainAllowed,
-      wasMainSpeaking: this.mainSpeaking, buffer: [], bytes: 0, timer: null };
+      wasMainSpeaking: this.mainSpeaking, buffer: [], bytes: 0, timer: null,
+      startedAt: this.runtime.now(), extended: false };
     this.provisional = state;
     this.provisionalAttempts += 1;
     // A short cached clip must not lose its ending to unconfirmed noise.
@@ -466,6 +467,19 @@ export class DuplexSession {
   recoverProvisional(reason) {
     const state = this.provisional;
     if (!state || this.closed) return;
+    if (reason === 'confirmation_timeout' && this.localSpeaking && !state.extended
+        && !this.callerSpeaking && this.generation === state.generation) {
+      // Delayed provider confirmation must not cause a short burst of the old
+      // answer during sustained caller energy. This is still a heuristic:
+      // unconfirmed noise recovers at one fixed800ms ceiling, never indefinitely.
+      const remaining = state.startedAt + 800 - this.runtime.now();
+      if (remaining > 0) {
+        state.extended = true;
+        state.timer = this.runtime.setTimeout(() => this.recoverProvisional('confirmation_timeout'), remaining);
+        this.emit('provisional_extended', { reason: 'sustained_local_energy', maximum_hold_ms: 800 });
+        return;
+      }
+    }
     this.provisional = null; this.runtime.clearTimeout(state.timer);
     if (this.callerSpeaking || this.generation !== state.generation) {
       this.playback.stopMain();
@@ -499,16 +513,23 @@ export class DuplexSession {
     const interruptedWaiting = this.haveUserUtterance && !this.userTurnClosed
       && (this.coordinator.cue?.phase === 'waiting' || !this.userTurnHasMainAudio)
       && this.coordinator.hasWaitingAudioStarted();
-    const resumed = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed && !interruptedWaiting
+    const confirmedWaitingResume = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed
+      && this.coordinator.waitingAttemptUtteranceId === this.coordinator.utteranceId
+      && (['provider_speech_event', 'provider_interruption_event'].includes(source)
+        || (source === 'user_transcript' && this.localSpeaking))
+      && this.runtime.now() - this.lastUserStoppedAt < 15000;
+    const preserveFacts = interruptedWaiting || confirmedWaitingResume;
+    const resumed = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed && !preserveFacts
       && this.runtime.now() - this.lastUserStoppedAt < 15000;
     const priorDrained = this.assistantOutputFinished && !this.mainSpeaking && !hadProvisionalOutput
-      && !this.provisional && this.playback?.main?.size === 0 && !resumed && !interruptedWaiting;
-    if (resumed || interruptedWaiting) this.ordinaryTurnDrained = false;
+      && !this.provisional && this.playback?.main?.size === 0 && !resumed && !preserveFacts;
+    if (resumed || preserveFacts) this.ordinaryTurnDrained = false;
     this.callerSpeaking = true;
     if (!resumed) {
-      // Speech after an actually voiced waiting cue owns a fresh turn, but an
-      // interrupted caller's already supplied facts remain in the local context.
-      if (!interruptedWaiting) { this.partial = ''; this.finalSegments = []; }
+      // Real speech after a waiting request may have consumed a server-side
+      // reservation even before playback. A fresh epoch retains previous facts
+      // and leaves the rolling global budget spent; no reservation is refunded.
+      if (!preserveFacts) { this.partial = ''; this.finalSegments = []; }
       else if (!this.finalSegments.length && this.partial) this.finalSegments = [this.partial];
       this.revision = 0;
       this.haveUserUtterance = true; this.userTurnHasMainAudio = false;
@@ -599,8 +620,8 @@ export class DuplexSession {
       }
       if (this.preStartPcm && this.quarantinePreStartPcm(pcm)) return;
       if (this.provisional) {
-        //350ms of16kHz mono PCM, independent of provider packet chunk size.
-        if (this.provisional.bytes + pcm.byteLength <= 11200) {
+        // Hard800ms ceiling covers the single sustained-energy extension.
+        if (this.provisional.bytes + pcm.byteLength <= 25600) {
           this.provisional.buffer.push(pcm.slice()); this.provisional.bytes += pcm.byteLength;
         } else this.rejectOutput('provisional_buffer_full', pcm.byteLength, peak(pcm) > 64);
         return;
@@ -654,11 +675,27 @@ export class DuplexSession {
         if (!rawText) return;
         const final = message.transcriptType === 'final';
         const sameText = this.partial && speechText(rawText) === speechText(this.partial);
+        const quietTail = !this.callerSpeaking && !this.providerSpeaking && !this.localSpeaking && this.partial
+          && !this.userTurnClosed && this.runtime.now() - this.lastUserStoppedAt <= 750;
+        const normalized = speechText(rawText);
+        const knownTail = quietTail && [this.partial, this.finalSegments.at(-1)].some(value => value
+          && (speechText(value) === normalized || (!final && speechText(value).startsWith(normalized))));
+        if (knownTail) {
+          // Some providers replay partial prefixes after final yield. Detect
+          // these BEFORE userStarted: they carry no new words or voice and must
+          // not cancel an already reserved waiting cue. Safety gates still run.
+          const blocked = this.snapshotHardBlocked || sensitive(rawText) || sensitive(this.partial);
+          if (blocked) this.cancelWaitingPreparation('sensitive_state_changed');
+          this.coordinator.setSensitive(blocked);
+          this.coordinator.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(rawText) || listeningSensitive(this.partial));
+          this.emit('transcript_refinement_ignored', { transcript_type: final ? 'final' : 'partial', reason: 'endpointing_tail_known_words' });
+          if (final) { this.lastUserTranscriptFinal = true; this.lastFinal = this.partial; }
+          return;
+        }
         // Delayed ASR finals/refinements in the endpointing tail belong to the
         // just-yielded utterance until new speech is actually observed. They
         // cannot manufacture a 3ms caller turn and cut a complete cue.
-        const trailing = !this.callerSpeaking && !this.providerSpeaking && !this.localSpeaking && this.partial
-          && final && !this.userTurnClosed && this.runtime.now() - this.lastUserStoppedAt <= 750;
+        const trailing = quietTail && final;
         if (!this.callerSpeaking && !trailing) this.userStarted('user_transcript');
         const assembled = this.assembleTranscript(rawText, final), text = assembled.text;
         // Raw and accumulated safety checks run even for repeated ASR values.

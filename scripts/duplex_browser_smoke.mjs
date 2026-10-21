@@ -24,6 +24,7 @@ const args = process.argv.slice(2);
 const value = flag => { const at = args.indexOf(flag); return at < 0 ? null : args[at + 1]; };
 const run = args.includes('--run'), live = args.includes('--live');
 const waitingOnly = args.includes('--waiting-only');
+const timingBoundariesOnly = args.includes('--timing-boundaries-only');
 const requireWaiting = args.includes('--require-waiting') || waitingOnly;
 const plan = { kind: 'duplex_browser_audio_graph', mode: run ? live ? 'live_isolated_provider' : 'offline_provider_replay' : 'plan_only',
   calls_started: 0, external_requests: 0, microphone_hardware_used: false, phone_number_used: false,
@@ -207,6 +208,113 @@ async function yieldFixtureCaller(text = 'What are the usual maintenance options
   await until(async () => await eventCount('caller_stopped') > stopped, 'fixture_caller_did_not_yield');
   return page.evaluate(() => ({ origin_ms: window.duplexSession.startAt,
     released_at_ms: window.duplexSession.events.findLast(row => row.kind === 'caller_stopped').at_ms }));
+}
+
+async function timingBoundaryReplay() {
+  report.replay_scope = 'live22_endpointing_and_provisional_boundaries_only';
+  report.timing_boundaries = [];
+  await newFixtureSession({ decisionDelayMs: 500, waitingPhrase: 'one_sec', predictionEnabled: false,
+    predictionControlReason: 'retain_pending_wait_through_known_endpointing_tail' });
+  const tailSession = sessions;
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+  const text = 'The vehicle is a blue sedan that needs routine service.';
+  const release = await yieldFixtureCaller(text);
+  const before = await page.evaluate(() => ({ epoch: window.duplexSession.coordinator.utteranceId,
+    revision: window.duplexSession.revision, generation: window.duplexSession.generation,
+    releases: window.duplexSession.events.filter(row => row.kind === 'caller_stopped').length }));
+  await delay(Math.max(0, release.origin_ms + release.released_at_ms + 228 - await page.evaluate(() => performance.now())));
+  for (const transcript of ['The vehicle is a blue sedan', text]) {
+    sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript, turn: 1 });
+    await delay(12);
+  }
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: text, turn: 1 });
+  await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 8000
+    && row.ended_ms && !row.stopped)), 'endpointing_tail_canceled_waiting_clip');
+  const tail = await page.evaluate(() => ({ events: window.duplexSession.events,
+    epoch: window.duplexSession.coordinator.utteranceId, revision: window.duplexSession.revision,
+    generation: window.duplexSession.generation, graph: window.duplexGraphEvidence }));
+  assert.deepEqual({ epoch: tail.epoch, revision: tail.revision, generation: tail.generation },
+    { epoch: before.epoch, revision: before.revision, generation: before.generation });
+  assert.equal(selections(tailSession).length, 1, 'known_tail_spent_extra_waiting_request');
+  assert.equal(tail.events.filter(row => row.kind === 'caller_stopped').length, before.releases, 'known_tail_created_false_turn');
+  assert.ok(tail.events.some(row => row.kind === 'transcript_refinement_ignored' && row.reason === 'endpointing_tail_known_words'));
+  report.timing_boundaries.push({ case: 'known_partial_tail_at228ms', complete_waiting_cues: 1,
+    actual_selections: 1, same_epoch_revision_generation: true, events: tail.events, graph: tail.graph });
+  report.checks.known_endpointing_tail_preserved_one_complete_wait = true;
+
+  await newFixtureSession({ decisionDelayMs: 500, waitingPhrase: 'just_a_sec', predictionEnabled: false,
+    predictionControlReason: 'actual_caller_resume_during_reserved_waiting_request' });
+  const resumeSession = sessions;
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+  await yieldFixtureCaller(text);
+  await until(() => selections(resumeSession).length === 1, 'resume_waiting_request_missing');
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 2 });
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript: 'Actually the sedan is red instead.', turn: 2 });
+  await until(() => page.evaluate(() => window.duplexSession.coordinator.utteranceId === 2), 'real_resume_did_not_get_fresh_epoch');
+  await yieldFixtureCaller('Actually the sedan is red instead.', { turn: 2 });
+  await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 9600
+    && row.ended_ms && !row.stopped)), 'real_resume_lost_fresh_waiting_clip');
+  const resumed = await page.evaluate(() => ({ events: window.duplexSession.events,
+    epoch: window.duplexSession.coordinator.utteranceId,
+    facts_preserved: window.duplexSession.partial.includes('blue sedan') && window.duplexSession.partial.includes('red instead'),
+    graph: window.duplexGraphEvidence }));
+  assert.deepEqual(selections(resumeSession).map(row => row.epoch), [1, 2]);
+  assert.ok(selections(resumeSession).every(row => !row.follow_up));
+  assert.ok(resumed.facts_preserved); assert.equal(resumed.epoch, 2);
+  assert.equal(resumed.events.filter(row => row.kind === 'cue_started').length, 1);
+  report.timing_boundaries.push({ case: 'real_resume_during_pending_wait', actual_selections: 2,
+    epochs: [1, 2], facts_preserved: true, played_cues: 1, events: resumed.events, graph: resumed.graph });
+  report.checks.actual_resume_received_fresh_wait_without_refunding_old_request = true;
+
+  for (const confirmationMs of [529, null]) {
+    await newFixtureSession();
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 1 });
+    const stream = streamMain(provider, 2.0);
+    await until(async () => await eventCount('main_started') === 1, 'boundary_main_missing');
+    await setMic(.25);
+    await until(async () => await eventCount('provisional_barge_in') === 1, 'boundary_provisional_pause_missing');
+    const pause = await page.evaluate(() => ({ origin: window.duplexSession.startAt,
+      at: window.duplexSession.events.find(row => row.kind === 'provisional_barge_in').at_ms }));
+    if (confirmationMs !== null) {
+      await delay(Math.max(0, pause.origin + pause.at + confirmationMs - await page.evaluate(() => performance.now())));
+      sendJson(provider, { type: 'user-interrupted', turn: 2 });
+      await until(async () => await eventCount('provisional_confirmed') === 1, 'late_provider_confirmation_missing');
+    } else await until(async () => await eventCount('provisional_resumed') === 1, 'fixed_noise_ceiling_did_not_recover', 1500);
+    await stream;
+    const boundary = await page.evaluate(() => {
+      const tail = window.duplexSession.context.recordBlocks.flatMap(block => [...block]).slice(-8000);
+      return { origin: window.duplexSession.startAt, events: window.duplexSession.events,
+        graph: window.duplexGraphEvidence, metrics: window.duplexSession.metrics(),
+        recorded_tail_samples: tail.length, recorded_tail_rms: Math.sqrt(tail.reduce((sum, x) => sum + x * x, 0) / tail.length) };
+    });
+    const extensions = boundary.events.filter(row => row.kind === 'provisional_extended');
+    const recovered = boundary.events.find(row => row.kind === 'provisional_resumed');
+    assert.equal(extensions.length, 1, 'provisional_hold_was_not_single_extension');
+    if (confirmationMs !== null) {
+      assert.equal(recovered, undefined, 'old_main_resumed_before_late_confirmation');
+      const confirmed = boundary.events.find(row => row.kind === 'provisional_confirmed');
+      assert.ok(confirmed.at_ms - pause.at >= 500 && confirmed.at_ms - pause.at < 650, 'late_confirmation_timing_not_exercised');
+      const quiet = boundary.graph.samples.filter(row => row.at_ms >= boundary.origin + pause.at + 80);
+      // The graph sampler stores only non-silent observations. Require signal
+      // before the pause and independently verify the recorded post-gain tail.
+      assert.ok(boundary.graph.samples.some(row => row.at_ms < boundary.origin + pause.at && row.rms > .01)
+        && quiet.length === 0 && boundary.recorded_tail_samples === 8000 && boundary.recorded_tail_rms < .001,
+      'old_main_leaked_during_confirmed_interruption');
+      report.checks.late529ms_confirmation_kept_actual_graph_quiet = true;
+      report.timing_boundaries.push({ case: 'provider_confirmation_after529ms', confirmation_after_pause_ms: confirmed.at_ms - pause.at,
+        resumed_before_confirmation: false, recorded_tail_samples: boundary.recorded_tail_samples,
+        recorded_tail_rms: boundary.recorded_tail_rms, events: boundary.events, graph: boundary.graph, metrics: boundary.metrics });
+    } else {
+      const heldMs = recovered.at_ms - pause.at;
+      assert.ok(heldMs >= 790 && heldMs < 900, 'noise_ceiling_was_not_fixed800ms');
+      assert.ok(recovered.buffered_bytes <= 25600, 'provisional_buffer_bound_exceeded');
+      assert.ok(boundary.graph.samples.some(row => row.at_ms > boundary.origin + recovered.at_ms + 80 && row.rms > .01), 'noise_recovery_left_main_silent');
+      report.checks.unconfirmed_sustained_noise_recovered_at_fixed800ms = true;
+      report.timing_boundaries.push({ case: 'unconfirmed_sustained_noise', held_ms: heldMs,
+        buffered_bytes: recovered.buffered_bytes, events: boundary.events, graph: boundary.graph });
+    }
+    await setMic(0);
+  }
 }
 
 async function completedListeningCaller() {
@@ -532,7 +640,9 @@ try {
         start_at_ms: window.duplexSession.startAt, input_frames: window.duplexSession.inputFrames,
       }), start);
       const pause = interrupted.rows.find(row => row.kind === 'provisional_barge_in');
-      const confirmation = interrupted.rows.find(row => row.kind === 'provisional_confirmed');
+      const confirmation = interrupted.rows.find(row => row.kind === 'provisional_confirmed'
+        || (['barge_in', 'caller_started'].includes(row.kind)
+          && ['provider_interruption_event', 'provider_speech_event', 'user_transcript'].includes(row.source)));
       const answered = interrupted.rows.some(row => row.kind === 'main_started' && row.at_ms > start.end_ms);
       const graphQuiet = pause && confirmation && !interrupted.graph.some(row => !row.cue
         && row.at_ms - interrupted.start_at_ms > pause.at_ms + 80
@@ -800,6 +910,8 @@ try {
       report.external_requests++; return route.abort('blockedbyclient');
     });
     await page.goto(base + '/probe', { waitUntil: 'domcontentloaded' });
+    if (timingBoundariesOnly) await timingBoundaryReplay();
+    else {
     await newFixtureSession();
     await setMic(0.25);
     await until(() => uplink.some(frame => frame.nonzero), 'synthetic_microphone_had_no_signal');
@@ -1588,6 +1700,7 @@ try {
     report.long_conversation = { session_count: 1, turns: 6, waiting_cues: 6, main_answers: 6,
       first_to_last_cue_ms: longDuration, phase_cooldown_ms: 1000, deliberately_spaced_15s_window_regression: true, clocks_or_budgets_modified: false };
     report.checks.six_real_clock_turns_survived_15s_windows_and_four_cue_lifetime_regression = true;
+    }
     report.checks.exact_20ms_input_frames = uplink.every(frame => frame.bytes === 640);
     assert.equal(report.checks.exact_20ms_input_frames, true);
     report.checks.browser_errors = errors.length; assert.equal(errors.length, 0);

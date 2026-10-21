@@ -23,7 +23,7 @@ function clock() {
 function pcm(value = 1000) { const data = new Uint8Array(640); const view = new DataView(data.buffer); for (let i = 0; i < 320; i++) view.setInt16(i * 2, value, true); return data; }
 function reply(json, status = 200) { return { ok: status >= 200 && status < 300, status, json: async () => json }; }
 function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen = true } = {}) {
-  const time = clock(), requests = [], sockets = [], contexts = [], microphones = [], events = [];
+  const time = clock(), requests = [], sockets = [], contexts = [], microphones = [], events = [], socketCreated = deferred();
   const tracks = [{ enabled: true, stopped: 0, stop() { this.stopped++; } }];
   const stream = { getTracks: () => tracks, getAudioTracks: () => tracks };
   const audio = pcm(), hash = createHash('sha256').update(audio).digest('hex');
@@ -42,6 +42,7 @@ function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen 
   }
   class Socket {
     constructor(url) { this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.listeners = new Map(); this.sent = []; sockets.push(this);
+      socketCreated.resolve(this);
       if (autoOpen) queueMicrotask(() => { if (this.readyState === 0) { this.readyState = 1; this.emit('open'); } }); }
     addEventListener(name, fn) { if (!this.listeners.has(name)) this.listeners.set(name, []); this.listeners.get(name).push(fn); }
     emit(name, value) { for (const fn of this.listeners.get(name) || []) fn(value); }
@@ -78,6 +79,7 @@ function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen 
     },
   } });
   return { session, time, requests, sockets, contexts, microphones, output, tracks, stream, events,
+    firstSocket: socketCreated.promise,
     get mediaRequests() { return mediaRequests; },
     cues: () => requests.filter(row => row.url.endsWith('/duplex/cue') && !row.body.prepare_only),
     preparations: () => requests.filter(row => row.url.endsWith('/duplex/cue') && row.body.prepare_only) };
@@ -563,6 +565,57 @@ test('duplicate and late punctuated ASR finals do not create tiny turns or cut a
   assert.ok(f.events.some(x => x.kind === 'transcript_refinement_ignored')); await f.session.stop();
 });
 
+test('late partial-prefix replay228ms after yield keeps an approved waiting request and its original budget', async () => {
+  const held = deferred(); const f = fixture({ handler: request => request.url.endsWith('/duplex/cue') && !request.body.prepare_only ? held.promise : null });
+  await f.session.start(); transcript(f.session, 'Please explain the regular service options', true); await f.time.advance(160);
+  const epoch = f.session.coordinator.epoch, generation = f.session.generation, revision = f.session.revision;
+  await f.time.advance(228); const selected = f.cues()[0]; assert.ok(selected);
+  for (const value of ['Please explain', 'Please explain the regular', 'Please explain the regular service options']) transcript(f.session, value);
+  transcript(f.session, 'Please explain the regular service options.', true);
+  assert.equal(f.session.coordinator.epoch, epoch); assert.equal(f.session.revision, revision);
+  assert.equal(f.session.generation, generation); assert.equal(f.session.callerSpeaking, false);
+  assert.equal(selected.options.signal.aborted, false);
+  held.resolve(reply({ phrase_id: 'moment', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 }));
+  await flush(); await f.time.advance(400); assert.equal(f.output.cues.length, 1); assert.equal(f.cues().length, 1);
+  assert.equal(f.events.some(row => row.kind === 'caller_resumed'), false); await f.session.stop();
+});
+
+for (const change of ['Actually explain tire repairs instead', 'Please stop', 'Please explain the regular service options for trucks']) {
+  test(`a genuinely changed tail still cancels the old waiting request: ${change}`, async () => {
+    const held = deferred(); const f = fixture({ handler: request => request.url.endsWith('/duplex/cue') && !request.body.prepare_only ? held.promise : null });
+    await f.session.start(); transcript(f.session, 'Please explain the regular service options', true); await f.time.advance(388);
+    const selected = f.cues()[0]; transcript(f.session, change);
+    assert.equal(selected.options.signal.aborted, true);
+    held.resolve(reply({ phrase_id: 'moment', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 }));
+    await flush(); assert.equal(f.output.cues.length, 0); await f.session.stop();
+  });
+}
+
+for (const source of ['provider', 'local_and_transcript']) {
+  test(`real ${source} speech after a reserved waiting request gets one new epoch without losing prior facts`, async () => {
+    const held = deferred(); let reservations = 0;
+    const f = fixture({ handler: request => {
+      if (!request.url.endsWith('/duplex/cue') || request.body.prepare_only) return null;
+      reservations++;
+      return reservations === 1 ? held.promise : reply({ phrase_id: 'moment', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 });
+    } });
+    await f.session.start(); transcript(f.session, 'The vehicle is a blue sedan', true); await f.time.advance(388);
+    const first = f.cues()[0], old = f.session.coordinator.utteranceId;
+    if (source === 'provider') speech(f.session, 'user', 'started');
+    else f.session.onLocalSpeech(true);
+    transcript(f.session, 'Actually the sedan is red', true);
+    assert.equal(f.session.coordinator.utteranceId, old + 1); assert.equal(first.options.signal.aborted, true);
+    speech(f.session, 'user', 'started'); assert.equal(f.session.coordinator.utteranceId, old + 1);
+    assert.ok(f.session.partial.includes('blue sedan')); assert.ok(f.session.partial.includes('red'));
+    held.resolve(reply({ phrase_id: 'moment', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 }));
+    speech(f.session, 'user', 'stopped'); f.session.onLocalSpeech(false); await f.time.advance(1100);
+    assert.equal(f.output.cues.length, 1); assert.equal(reservations, 2);
+    assert.equal(f.cues()[1].body.epoch, old + 1); assert.equal(f.cues()[1].body.follow_up, undefined);
+    assert.equal(f.session.coordinator.requestTimes.length >= 2, true, 'Rolling attempts are not refunded by the fresh epoch');
+    await f.session.stop();
+  });
+}
+
 test('ten separated false energy bursts can pause one main generation at most twice', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
   const generation = f.session.generation;
@@ -908,7 +961,12 @@ test('a paid call returned after Stop is terminated through the scoped stop endp
 
 test('Stop cancels an unfinished WebSocket handshake immediately and clears its deadline', async () => {
   const f = fixture({ autoOpen: false }), starting = f.session.start();
-  for (let i = 0; i < 30 && !f.sockets.length; i++) await new Promise(resolve => setImmediate(resolve));
+  let timer;
+  try {
+    await Promise.race([f.firstSocket, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('fixture_socket_creation_deadline')), 5000);
+    })]);
+  } finally { clearTimeout(timer); }
   assert.equal(f.sockets.length, 1); await f.session.stop(); await starting;
   assert.equal(f.sockets[0].readyState, 3); assert.equal(f.time.pending, 0);
   assert.equal(f.requests.filter(row => row.url.endsWith('/duplex/stop')).length, 1);
@@ -973,11 +1031,14 @@ test('real provider speech corroborates provisional interruption and destroys bu
   await f.time.advance(400); assert.equal(f.output.resumes, 0); await f.session.stop();
 });
 
-test('sustained background energy cannot deadlock the main answer past the350ms confirmation window', async () => {
+test('sustained background energy gets only one extension and recovers at the fixed800ms ceiling', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
   const generation = f.session.generation; f.microphones[0].options.onSpeech(true);
   for (let count = 0; count < 17; count++) { f.session.receive(pcm(1800).buffer); await f.time.advance(20); }
   assert.equal(f.output.main.length, 1); await f.time.advance(10);
+  assert.ok(f.session.provisional); assert.equal(f.output.resumes, 0);
+  assert.equal(f.events.filter(event => event.kind === 'provisional_extended').length, 1);
+  await f.time.advance(449); assert.equal(f.output.resumes, 0); await f.time.advance(1);
   assert.equal(f.session.provisional, null); assert.equal(f.output.resumes, 1);
   assert.equal(f.output.main.length, 18); assert.equal(f.session.generation, generation);
   assert.equal(f.session.localSpeaking, true); assert.equal(f.session.callerSpeaking, false);
@@ -985,11 +1046,32 @@ test('sustained background energy cannot deadlock the main answer past the350ms 
   f.session.receive(pcm(1900).buffer); assert.equal(f.output.main.length, 19); await f.session.stop();
 });
 
+test('provider confirmation529ms after local pause destroys the old queue without any intermediate resume', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+  f.session.onLocalSpeech(true);
+  for (let i = 0; i < 26; i++) { f.session.receive(pcm(1800).buffer); await f.time.advance(20); }
+  await f.time.advance(9); message(f.session, { type: 'user-interrupted' });
+  assert.equal(f.session.provisional, null); assert.equal(f.output.resumes, 0); assert.equal(f.output.main.length, 1);
+  assert.ok(f.events.some(row => row.kind === 'provisional_confirmed' && row.source === 'provider_interruption_event'));
+  f.session.receive(pcm(1900).buffer); await f.time.advance(1000); assert.equal(f.output.main.length, 1);
+  assert.equal(f.session.mainAllowed, false); await f.session.stop();
+});
+
+test('confirmation after the800ms noise ceiling still revokes current main and never replays its saved suffix', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+  f.session.onLocalSpeech(true); f.session.receive(pcm(1800).buffer); await f.time.advance(850);
+  assert.equal(f.output.resumes, 1); assert.equal(f.output.main.length, 2);
+  message(f.session, { type: 'user-interrupted' }); const accepted = f.output.main.length;
+  f.session.receive(pcm(1900).buffer); await f.time.advance(1000);
+  assert.equal(f.output.main.length, accepted); assert.equal(f.session.generation, null);
+  assert.equal(f.session.ordinaryTurnDrained, false); await f.session.stop();
+});
+
 test('provisional output buffer is bounded and Stop removes its timer without recovery', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
   f.microphones[0].options.onSpeech(true);
-  for (let count = 0; count < 30; count++) f.session.receive(pcm().buffer);
-  assert.ok(f.session.provisional.bytes <= 11200); assert.ok(f.session.discardedOutputBytes > 0);
+  for (let count = 0; count < 50; count++) f.session.receive(pcm().buffer);
+  assert.equal(f.session.provisional.bytes, 25600); assert.ok(f.session.discardedOutputBytes > 0);
   await f.session.stop(); await f.time.advance(400);
   assert.equal(f.session.provisional, null); assert.equal(f.output.resumes, 0); assert.equal(f.time.pending, 0);
 });
@@ -1172,15 +1254,13 @@ for (const audible of [false, true]) {
     f.output.cues[0].hasAudiblyStarted = () => audible;
     const oldEpoch = f.session.coordinator.utteranceId, oldText = f.session.partial;
     speech(f.session, 'user', 'started'); transcript(f.session, 'Actually the vehicle is a red sedan instead', true);
-    assert.equal(f.session.coordinator.utteranceId, oldEpoch + Number(audible));
+    assert.equal(f.session.coordinator.utteranceId, oldEpoch + 1);
     assert.ok(f.session.partial.includes(oldText)); assert.ok(f.session.partial.includes('red sedan'));
     assert.equal(f.output.cues[0].stopped, true);
     speech(f.session, 'user', 'stopped'); await f.time.advance(1500);
-    if (audible) {
-      assert.equal(f.output.cues.length, 2); assert.equal(f.cues().at(-1).body.epoch, oldEpoch + 1);
-      assert.equal(f.cues().at(-1).body.follow_up, undefined, 'Fresh caller turn is not a continuation hold');
-      assert.equal(f.session.coordinator.cueTimes.length, 2, 'New epoch retains rolling spend');
-    } else assert.equal(f.output.cues.length, 1, 'Padding-only cancellation does not refund the spent cue');
+    assert.equal(f.output.cues.length, 2); assert.equal(f.cues().at(-1).body.epoch, oldEpoch + 1);
+    assert.equal(f.cues().at(-1).body.follow_up, undefined, 'Fresh caller turn is not a continuation hold');
+    assert.equal(f.session.coordinator.cueTimes.length, 2, 'Neither padding nor voiced cancellation refunds rolling spend');
     await f.session.stop();
   });
 }
