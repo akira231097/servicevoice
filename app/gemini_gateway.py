@@ -30,6 +30,9 @@ from .tool_observations import ObservationError, ToolObservationStore
 from .receipt_narration import BoundedSelector, NARRATOR_VERSION
 from .jev_faq import FAQ_VERSION, JevFaqRouter
 from .jev_classifier import JEV_MODEL
+from .backchannel_policy import BackchannelPolicy
+from .backchannel_catalog import PHRASES
+from .backchannel_budget import BackchannelBudget
 from .issuance_context import user_context
 from .diagnostics import turn_identifier
 from .call_lifecycle import END_CALL, CLOSING_POLICY, UNKNOWN_ATTEMPT_CONTEXT, enabled as closing_enabled, schema as closing_schema
@@ -43,6 +46,7 @@ GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/compl
 TIMING_CAPACITY = 256
 EOF_DRAIN_SECONDS = 0.05
 EOF_DRAIN_BYTES = 16 * 1024
+ACK_DELAY_SECONDS = 0.55
 
 
 class RequestTiming:
@@ -771,6 +775,10 @@ class GeminiGateway:
         self._wal_anchor = None
         self._wal_anchor_startup_task = None
         self.wal_anchor_status = "disabled"
+        self.backchannel_policy = BackchannelPolicy(connection_capacity=self.limits.concurrency)
+        self.backchannel_budget = BackchannelBudget()
+        self.backchannel_cache_ready = False
+        self.backchannel_reads = set()
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -887,6 +895,21 @@ class GeminiGateway:
                 self._wal_anchor_startup_task.add_done_callback(
                     lambda task:None if task.cancelled() else task.exception())
             await asyncio.shield(self._wal_anchor_startup_task)
+        if config.get("SERVICEVOICE_BACKCHANNELS") == "on":
+            if not isinstance(config.get("VAPI_BACKCHANNEL_ASSISTANT_ID"),str) or not config["VAPI_BACKCHANNEL_ASSISTANT_ID"]:
+                raise RuntimeError("backchannel_candidate_identity_required")
+            def warm_cache():
+                from .backchannel_audio import BackchannelAudioCache, AudioSpec
+                path = Path(config.get("SERVICEVOICE_BACKCHANNEL_AUDIO_MANIFEST", ""))
+                cache = BackchannelAudioCache(path.parent, AudioSpec(
+                    model=config.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
+                    voice=config.get("GEMINI_TTS_VOICE", "Kore")))
+                cache.load_manifest(path)
+                return all(cache.lookup_pcm(PHRASES[p], 16000) is not None
+                           for p in ("neutral_ack", "acknowledge", "moment"))
+            self.backchannel_cache_ready = await run_in_threadpool(warm_cache)
+            if not self.backchannel_cache_ready:raise RuntimeError("backchannel_cache_not_ready")
+            await self.backchannel_policy.start()
         return await self.faq.start()
 
     async def _close_wal_anchor(self):
@@ -909,7 +932,9 @@ class GeminiGateway:
             await self.client.aclose()
         finally:
             try:await self.faq.close()
-            finally:await self._close_wal_anchor()
+            finally:
+                try:await self.backchannel_policy.close()
+                finally:await self._close_wal_anchor()
 
     def _release(self, call_id, timing=None):
         # Event-loop-local, synchronous removal cannot be interrupted midway.
@@ -938,7 +963,7 @@ class GeminiGateway:
         generation.superseded.set()
         task = generation.task
         if task is not None and not task.done():
-            task.cancel()
+            if not task.cancelling():task.cancel()
         elif self.owners.get(generation.call_id) is generation:
             # Covers handle -> unstarted OwnedStream, or a downstream send.
             # No model work is running in this phase. Retain the lease until
@@ -981,7 +1006,8 @@ class GeminiGateway:
     async def _neutral_stream(self, request, timing=None):
         if await request.is_disconnected():
             return
-        response_id="chatcmpl-"+uuid4().hex
+        response_id=(timing.row.get("sse_response_id") if timing is not None
+                     and timing.row.get("backchannel",{}).get("emitted_ms") is not None else None) or "chatcmpl-"+uuid4().hex
         if timing is not None and not timing.finished:timing.row["neutral_sse_response_id"]=response_id
         yield sse({"id":response_id,"object":"chat.completion.chunk",
                    "created":int(time.time()),"model":MODEL,
@@ -1108,7 +1134,7 @@ class GeminiGateway:
                 if generation is not None:
                     generation.disconnected=True
                     generation.timing.note_time("downstream_disconnect_at_ms")
-                owner.cancel()
+                if not owner.cancelling():owner.cancel()
                 return
             await asyncio.sleep(0.1)
 
@@ -1131,6 +1157,11 @@ class GeminiGateway:
         call_id = call["id"]
         request.state.diagnostic_call_id=call_id
         diagnostic_context={"call_id":call_id}
+        expected_backchannel_assistant = config.get("VAPI_BACKCHANNEL_ASSISTANT_ID")
+        diagnostic_context["backchannel_enabled"] = (
+            config.get("SERVICEVOICE_BACKCHANNELS") == "on"
+            and isinstance(expected_backchannel_assistant, str) and bool(expected_backchannel_assistant)
+            and call.get("assistantId") == expected_backchannel_assistant)
         timing = RequestTiming(call_id, received_at, self.timings,
             lambda row,session:self._observe_timing(row,session,diagnostic_context),sid)
         timing.row["generation_sequence"]=sequence
@@ -1241,6 +1272,12 @@ class GeminiGateway:
                 watch_stop.set()
                 watcher.cancel()
                 with suppress(asyncio.CancelledError):await watcher
+        if timing.diagnostic_context.get("backchannel_enabled") and self.backchannel_cache_ready:
+            return OwnedStream(self._backchannel_stream(request,config,key,upstream,sid,call_id,started,timing),
+                               lambda:self._cleanup_backchannel(call_id,timing))
+        return await self._generate_upstream(request,key,upstream,sid,call_id,started,timing)
+
+    async def _generate_upstream(self,request,key,upstream,sid,call_id,started,timing):
         response = None
         watch_stop = asyncio.Event()
         watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
@@ -1277,6 +1314,156 @@ class GeminiGateway:
                                        allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[]))),
                            lambda: self._cleanup(response, call_id, timing))
 
+    def _backchannel_context(self,sid,call_id):
+        # Optional read-only context; failure suppresses the cue, never the answer.
+        with self.narration.store.read_connection(0.05) as db:
+            row=db.execute("SELECT state,ended,provider_call_id FROM sessions WHERE id=?",(sid,)).fetchone()
+            if not row or row["ended"] or row["provider_call_id"] != call_id:return {"allow_turn":False}
+            state=json.loads(row["state"])
+            pending=db.execute("SELECT 1 FROM tool_invocations WHERE session_id=? AND status IN ('queued','running','unknown') LIMIT 1",(sid,)).fetchone()
+            return {"allow_turn":True,"stage":state.get("stage"),
+                    "active_confirmation":state.get("stage")=="confirmation",
+                    "has_pending_proposal":bool(state.get("proposal_id")),
+                    "has_pending_operation":bool(pending),"ended":False}
+
+    async def _backchannel_stream(self,request,config,key,upstream,sid,call_id,started,timing):
+        """One bounded acknowledgment in the existing owned Vapi stream.
+
+        Main work starts immediately. No live-control URL, second speaker,
+        speculative tool prose, dynamic name or booking authority is added.
+        """
+        streams=[]
+        async def prime_answer():
+            self._phase(timing,True)
+            stream=await self._generate_upstream(request,key,upstream,sid,call_id,started,timing)
+            streams.append(stream)
+            first=await anext(stream.body_iterator)
+            return stream,first
+        async def choose():
+            from .backchannel_policy import BackchannelDecision
+            try:
+                async with asyncio.timeout(.45):
+                    if len(self.backchannel_reads)>=self.limits.concurrency:
+                        return BackchannelDecision(reason="context_unavailable")
+                    read=asyncio.create_task(run_in_threadpool(self._backchannel_context,sid,call_id))
+                    self.backchannel_reads.add(read)
+                    def read_done(task):
+                        self.backchannel_reads.discard(task)
+                        if not task.cancelled():task.exception()
+                    read.add_done_callback(read_done)
+                    context=await asyncio.shield(read)
+                    def requested():timing.row["backchannel"]["requests"]=1
+                    return await self.backchannel_policy.choose(upstream["messages"],config.get("TYPESAFE_API_KEY"),context=context,on_request=requested)
+            except Exception:
+                return BackchannelDecision(reason="context_unavailable")
+        timing.row["backchannel"]={"phrase_id":"silence","reason":"pending","emitted_ms":None,
+                                    "classification_ms":None,"probability":None,"confidence":None,"requests":0,
+                                    "policy_elapsed_ms":None,"language_choice":None,"language_probability":None,
+                                    "language_confidence":None,"audible_playback":"unverified"}
+        timing.row["sse_response_id"]="chatcmpl-"+uuid4().hex
+        primary=asyncio.create_task(prime_answer())
+        policy=asyncio.create_task(choose())
+        timing.backchannel_tasks=(primary,policy)
+        timing.backchannel_streams=streams
+        try:
+            # Do not fill ordinary short pauses. Primary completion always wins.
+            done,_=await asyncio.wait((primary,),timeout=ACK_DELAY_SECONDS)
+            if primary in done:primary.result()  # Preserve genuine errors before a released owner is checked.
+            self._checkpoint(timing)
+            record=timing.row["backchannel"]
+            # Preserve a completed parallel classification even if the primary
+            # answer wins; unknown/in-flight probabilities remain unknown.
+            decision=None
+            if policy.done() and not policy.cancelled():
+                try:decision=policy.result()
+                except Exception:
+                    from .backchannel_policy import BackchannelDecision
+                    decision=BackchannelDecision(reason="classifier_unavailable")
+                record.update(phrase_id=decision.phrase_id,reason=decision.reason,
+                              classification_ms=decision.classification_ms,probability=decision.probability,
+                              confidence=decision.confidence,policy_elapsed_ms=decision.elapsed_ms,
+                              language_choice=decision.language_choice,language_probability=decision.language_probability,
+                              language_confidence=decision.language_confidence)
+            if primary in done:
+                record["reason"]="primary_ready"
+            elif decision is not None:
+                self._backchannel_observation(timing,"backchannel.selected",None)
+                if decision.phrase_id in {"neutral_ack","acknowledge","moment"}:
+                    context=user_context(upstream["messages"])
+                    allowed,reason=self.backchannel_budget.consume(call_id,context["user_count"] if context else 0)
+                    record["reason"]=reason
+                    if allowed and not primary.done():
+                        self._checkpoint(timing)
+                        elapsed=round((time.monotonic()-started)*1000,3)
+                        record["emitted_ms"]=elapsed
+                        self._payload(timing)
+                        self._backchannel_observation(timing,"backchannel.emitted",elapsed)
+                        yield sse({"id":timing.row["sse_response_id"],"object":"chat.completion.chunk",
+                            "created":int(time.time()),"model":MODEL,"choices":[{"index":0,"delta":{
+                                "role":"assistant","content":PHRASES[decision.phrase_id]+" <flush /> "},"finish_reason":None}]})
+            else:record["reason"]="policy_not_ready"
+            if record["emitted_ms"] is None:self._backchannel_observation(timing,"backchannel.suppressed",None)
+            stream,first=await asyncio.shield(primary)
+            self._checkpoint(timing)
+            yield first
+            async for part in stream.body_iterator:
+                self._checkpoint(timing)
+                yield part
+        except GenerationSuperseded:
+            if self._obsolete(timing):
+                timing.outcome="superseded"
+                async for part in self._neutral_stream(request,timing):yield part
+            else:
+                timing.outcome="upstream_unavailable"
+                yield sse({"error":{"code":"generation_unavailable","message":"Voice generation could not complete. No appointment outcome is inferred."}})
+        except asyncio.CancelledError:
+            if self._obsolete(timing) and not timing.generation.disconnected:
+                timing.outcome="superseded"
+                async for part in self._neutral_stream(request,timing):yield part
+            else:
+                timing.outcome="cancelled"
+                raise
+        except Exception:
+            timing.outcome="upstream_unavailable"
+            yield sse({"error":{"code":"generation_unavailable","message":"Voice generation could not complete. No appointment outcome is inferred."}})
+        finally:
+            await self._cleanup_backchannel(call_id,timing)
+
+    async def _cleanup_backchannel(self,call_id,timing):
+        cleanup=getattr(timing,"backchannel_cleanup_task",None)
+        if cleanup is None:
+            async def finish():
+                tasks=getattr(timing,"backchannel_tasks",())
+                for task in tasks:
+                    if not task.done() and not task.cancelling():task.cancel()
+                await asyncio.gather(*tasks,return_exceptions=True)
+                for stream in getattr(timing,"backchannel_streams",()):
+                    try:await stream.body_iterator.aclose()
+                    finally:await stream.cleanup()
+                await self._cleanup_narration(call_id,timing)
+            cleanup=asyncio.create_task(finish())
+            timing.backchannel_cleanup_task=cleanup
+        # A departing HTTP waiter never abandons physical provider cleanup.
+        with suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(cleanup),timeout=self.limits.cleanup_seconds)
+
+    def _backchannel_observation(self,timing,event,elapsed):
+        if self.diagnostics is None:return
+        try:
+            record=timing.row["backchannel"]
+            self.diagnostics.record("gateway",event,"observed",
+                call_id=timing.diagnostic_context["call_id"],turn_id=timing.diagnostic_context.get("turn_id"),
+                request_id=timing.row["request_id"],
+                start_unix=timing.row["started_at_unix"] if elapsed is not None else None,duration_ms=elapsed,
+                attributes={"generation_id":timing.row["generation_id"],"backchannel_phrase":record["phrase_id"],
+                    "backchannel_reason":record["reason"],"classifier_ms":record["classification_ms"],
+                    "backchannel_probability":record["probability"],"backchannel_confidence":record["confidence"],
+                    "classifier_requests":record["requests"],"policy_elapsed_ms":record["policy_elapsed_ms"],
+                    "backchannel_language":record["language_choice"],"backchannel_language_probability":record["language_probability"],
+                    "backchannel_language_confidence":record["language_confidence"],
+                    "evidence_source":"server_observed","observation_scope":"server_bytes_only_not_audible_playback"})
+        except Exception:pass
+
     async def _cleanup_narration(self, call_id, timing):
         if timing.generation is not None and timing.generation.response is not None:
             await self._cleanup(timing.generation.response,call_id,timing)
@@ -1285,7 +1472,7 @@ class GeminiGateway:
         timing.finish()
 
     async def _narrate(self, request, text, timing, source="servicevoice-receipt"):
-        response_id = "chatcmpl-" + uuid4().hex
+        response_id = timing.row.get("sse_response_id") or "chatcmpl-" + uuid4().hex
         timing.row["sse_response_id"]=response_id
         def chunk(delta, reason=None):
             return {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -1327,7 +1514,7 @@ class GeminiGateway:
         # generation emits commands only; the following verified result owns
         # the outcome speech. Text-only generations retain their exact words.
         text_parts, text_bytes = [], 0
-        response_id = "chatcmpl-" + uuid4().hex
+        response_id = timing.row.get("sse_response_id") or "chatcmpl-" + uuid4().hex
         timing.row["sse_response_id"]=response_id
         watch_stop = asyncio.Event()
         watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))

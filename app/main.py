@@ -213,12 +213,13 @@ def create_app(db_path=None):
             call_id=event.get("provider_call_id")
             if call_id:request.state.diagnostic_call_id=call_id
             diagnose("tts",event.get("event","tts.unknown"),
-                "failure" if event.get("event")=="tts.failed" else "cancelled" if event.get("event")=="tts.cancelled" else "success",
+                "failure" if event.get("event")=="tts.failed" else "cancelled" if event.get("event")=="tts.cancelled" else "success" if event.get("event")=="tts.completed" else "started",
                 call_id=call_id or "unbound_"+event["request_id"],request_id=event["request_id"],
                 start_unix=event.get("started_at_unix"),duration_ms=event.get("elapsed_ms"),attributes={k:event[k] for k in (
                     "model","voice","sample_rate","input_characters","audio_bytes","error_code","failure_phase",
                     "provider","provider_call_id_status","turn_id_status","first_audio_ms","upstream_http_status",
-                    "upstream_sample_rate","resampled","resampler","observation_scope","audio_duration_ms") if k in event})
+                    "upstream_sample_rate","resampled","resampler","observation_scope","audio_duration_ms",
+                    "cache_hit","cache_asset_id","cache_request_sha256","cache_manifest_sha256","cached_sample_rate","synthesis_source") if k in event})
         try:return await app.state.gemini_tts.response(body,observer=observe)
         except TTSError as exc:
             raise HTTPException(getattr(exc,"status_code",502),getattr(exc,"code","speech_unavailable")) from None
