@@ -48,8 +48,10 @@ class BackchannelDecision:
     language_confidence: float | None = None
 
 
-def eligible_state(messages, context=None):
+def eligible_state(messages, context=None, *, minimum_words=3):
     """Data minimization and deterministic exclusion precede any provider call."""
+    if type(minimum_words) is not int or not 1 <= minimum_words <= 3:
+        return None, "invalid_context"
     if context is not None:
         if not isinstance(context, dict):return None, "invalid_context"
         if "allow_turn" in context and context["allow_turn"] is not True:return None, "turn_not_allowed"
@@ -69,7 +71,7 @@ def eligible_state(messages, context=None):
     # This restriction applies only to these English cached clips. The primary
     # reasoning model continues to handle all languages without this policy.
     if not text.isascii() or _LANGUAGE_REQUEST.search(text):return None, "cached_language_unverified"
-    if len(text.split()) < 3:return None, "short_or_ambiguous"
+    if len(text.split()) < minimum_words:return None, "short_or_ambiguous"
     # "Oil change" names a service; other uses of "change" can revise an action.
     control_text = re.sub(r"\boil\s+change\b", "oil service", text, flags=re.I)
     if _CONTROL.search(control_text):return None, "sensitive_utterance"

@@ -310,6 +310,65 @@ def test_scheduler_becoming_protected_during_classification_suppresses_a_previou
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("identical_callback", [False, True])
+@pytest.mark.parametrize("change", ["none", "confirmation", "ended"])
+def test_cue_reuses_only_identical_authenticated_snapshot_and_always_revalidates(tmp_path, identical_callback, change):
+    async def run():
+        async with harness(tmp_path) as h:
+            reads = []
+
+            def fresh_snapshot(sid, token):
+                reads.append("snapshot")
+                h.store.authorize(sid, token, True)
+                return h.store.snapshot(sid)
+
+            def distinct_authorize(sid, token):
+                reads.append("authorize")
+                # This intentionally returns only a Store session row. Reusing
+                # it as scheduler state would incorrectly suppress safe cues.
+                return h.store.authorize(sid, token)
+
+            h.control.snapshot = fresh_snapshot
+            h.control.authorize = fresh_snapshot if identical_callback else distinct_authorize
+
+            def during_classification(*_):
+                if change == "confirmation":
+                    h.store.update(h.first["id"], {"stage": "confirmation"})
+                elif change == "ended":
+                    end_session(h.store, h.first["id"])
+            h.policy.callback = during_classification
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue())
+            assert response.status_code == 200, response.text
+            assert reads == (["snapshot", "snapshot"] if identical_callback else
+                ["authorize", "snapshot", "snapshot"])
+            assert len(h.policy.calls) == 1
+            if change == "none":
+                assert response.json()["phrase_id"] == "neutral_ack"
+            else:
+                assert response.json()["phrase_id"] == "silence"
+                assert response.json()["reason"] == "scheduler_changed"
+                assert response.json()["expires_in_ms"] == 0
+            assert not h.calls
+    asyncio.run(run())
+
+
+def test_identical_authenticated_snapshot_failure_stops_before_classifier_or_session_creation(tmp_path):
+    async def run():
+        async with harness(tmp_path) as h:
+            reads = []
+
+            def fresh_snapshot(sid, token):
+                reads.append(sid)
+                h.store.authorize(sid, token, True)
+                return h.store.snapshot(sid)
+            h.control.authorize = h.control.snapshot = fresh_snapshot
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.second), json=cue())
+            assert response.status_code == 401
+            assert reads == [h.first["id"]]
+            assert not h.policy.calls and not h.calls and not h.control.sessions
+    asyncio.run(run())
+
+
 def test_barge_in_event_cancels_an_inflight_selection_without_waiting_for_the_classifier(tmp_path):
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()

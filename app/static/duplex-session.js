@@ -34,6 +34,7 @@ export class DuplexSession {
     this.answerGaps = []; this.inputBytes = 0; this.evidenceRequests = new Set();
     this.endedSession = false; this.providerStop = null; this.stopping = null; this.handshakeCancel = null;
     this.lastProviderUserTurn = null;
+    this.snapshotHardBlocked = false; this.snapshotReadSequence = 0;
     this.provisional = null;
   }
 
@@ -233,6 +234,8 @@ export class DuplexSession {
     this.coordinator.userSpeechStopped();
     this.generation = `playback-${++this.generationSequence}`;
     this.coordinator.beginGeneration(this.generation); this.mainAllowed = false;
+    // Refresh phase gates at turn yield; main output never awaits this read.
+    void this.refreshSnapshot();
     this.callbacks.status?.('Preparing reply'); this.emit('caller_stopped');
   }
 
@@ -290,7 +293,7 @@ export class DuplexSession {
           && (text.startsWith(this.partial) || this.partial.startsWith(text));
         if (!this.callerSpeaking && !trailingFinal) this.userStarted('user_transcript');
         this.partial = text; this.revision += 1;
-        this.coordinator.setSensitive(sensitive(text));
+        this.coordinator.setSensitive(this.snapshotHardBlocked || sensitive(text));
         if (message.transcriptType === 'final') this.coordinator.updateFinal(text, { revision: this.revision });
         else if (this.callerSpeaking) this.coordinator.updatePartial(text, { revision: this.revision });
         if (message.transcriptType === 'final') { this.lastFinal = text; this.maybeUserStopped(true); }
@@ -324,15 +327,25 @@ export class DuplexSession {
     if (message.type === 'status-update' && message.status === 'ended') void this.stop('provider_ended');
   }
 
-  async pollSnapshot() {
+  async refreshSnapshot() {
     if (this.closed) return;
+    const sequence = ++this.snapshotReadSequence;
     try {
       const snapshot = await this.request('');
-      if (this.closed) return;
-      const blocked = snapshot.ended || snapshot.stage === 'confirmation' || snapshot.proposal || snapshot.pending_operations?.length;
-      this.coordinator?.setSensitive(Boolean(blocked) || sensitive(this.partial));
+      if (this.closed || sequence !== this.snapshotReadSequence) return;
+      const detailsProposal = Boolean(snapshot.proposal) && snapshot.stage === 'details';
+      this.snapshotHardBlocked = Boolean(snapshot.ended || snapshot.stage === 'confirmation'
+        || snapshot.pending_operations?.length || (snapshot.proposal && !detailsProposal));
+      this.coordinator?.setListeningBlocked(detailsProposal);
+      this.coordinator?.setSensitive(this.snapshotHardBlocked || sensitive(this.partial));
+      if (!this.callerSpeaking) this.coordinator?.wakeWaiting();
       this.callbacks.snapshot?.(snapshot);
     } catch { /* Read-only UI evidence cannot change a booking or interrupt audio. */ }
+  }
+
+  async pollSnapshot() {
+    if (this.closed) return;
+    await this.refreshSnapshot();
     if (!this.closed) this.pollTimer = this.runtime.setTimeout(() => this.pollSnapshot(), 1200);
   }
 

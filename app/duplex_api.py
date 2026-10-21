@@ -241,9 +241,14 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
 
     @app.post("/api/sessions/{sid}/duplex/cue")
     async def cue(sid: str, body: CueRequest, x_session_token: str = Header(default="")):
-        await control.authenticated(sid, x_session_token)
+        row = await control.authenticated(sid, x_session_token)
         session = await control.session(sid)
-        before = await run_in_threadpool(control.snapshot, sid, x_session_token)
+        # The private console uses one fresh authenticated-snapshot callback for
+        # both roles. Reuse that exact read only when callable identity proves
+        # the contract; a distinct authorize callback may return a session row
+        # without scheduler state and still requires its separate snapshot.
+        before = row if control.authorize is control.snapshot else await run_in_threadpool(
+            control.snapshot, sid, x_session_token)
         context = cue_context(before)
         previous = next((item.get("text", "") for item in reversed(before.get("transcript", []))
                          if item.get("role") == "assistant"), "")[-1600:]

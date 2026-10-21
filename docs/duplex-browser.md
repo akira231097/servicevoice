@@ -1,7 +1,8 @@
 # Hybrid duplex browser experiment
 
 This branch adds an isolated browser transport that can play a short cached
-listening cue while the caller is still speaking. Caller audio keeps streaming
+listening cue while the caller is still speaking and a neutral hold during the
+wait after a short reply. Caller audio keeps streaming
 to Vapi/Soniox, and Gemini continues to own the main conversation and guarded
 booking tools. This is separate from the earlier after-turn acknowledgment.
 
@@ -10,17 +11,26 @@ WebSocket call for the existing isolated assistant; its administration key never
 enters the browser or the AWS business container. The browser sends continuous
 20 ms, mono PCM16 frames at 16 kHz, including silence. One WebAudio clock owns
 both cached cues and received main audio. Neither path mutes microphone capture.
+The main target is the two-to-three-second answer gap after a caller finishes;
+listening cues remain occasional rather than filling every conversation pause.
 
 ## Cue decisions and speaker priority
 
 Partial transcripts are data for a bounded Jev content decision: ordinary
-vehicle/service conversation or silence. Code maps an accepted listening
+vehicle/service conversation or excluded content. Code maps an accepted listening
 decision to `Mm-hmm.` and an accepted waiting decision to `One moment.`. Jev
 classifies the content already present without predicting the next words or
 requiring the caller to finish a request. This binary question
 avoids splitting confidence between synonymous filler phrases. An independent
 language decision is required for these fixed English recordings. Other
 languages continue through the original model without fixed-language fillers.
+Listening requires three stable words. Waiting accepts one-word input for
+classification and can resolve a name against the server's preceding assistant
+question. An explicit name introduction can also qualify. Names never enter
+cached speech, and uncertain short replies still produce silence. Supplied
+contact/payment details and consent remain excluded. A pending intake proposal
+at the details stage blocks listening cues, while a neutral waiting hold can
+remain eligible if no confirmation or business operation is active.
 
 Jev runs alongside the conversation. The primary reasoner never waits for it.
 Selection is read-only and has no access to booking actions. Corrections,
@@ -28,9 +38,17 @@ negation, sensitive details, confirmation, urgency, prompt instructions,
 unverified state, incompatible language and missed deadlines remain silent.
 The server reads authoritative scheduler state before and after classification.
 
-One caller utterance has one cue allowance across both listening and waiting
-phases. There is also a 15-second cooldown, four-cue call cap and bounded
-classification attempts. Listening decisions use a complete-word transcript
+One caller utterance has separate listening and waiting allowances: at most one
+cue in each phase. Each phase has its own 15-second cooldown across utterances,
+with a shared four-cue call cap and bounded classification attempts. A waiting
+cue starts no earlier than 550 ms after confirmed caller yield and at least
+300 ms after the previous clip ends. Selection starts in parallel with this
+playback guard; an early result retains its original expiry while it waits.
+It is optional when the main reply is fast. A main announcement or actual main
+audio revokes in-flight and held selection, so a late result cannot add speech
+after the real answer begins. No additional selection is made simply because
+an accepted result expired before playback.
+Listening decisions use a complete-word transcript
 prefix, leaving the current unstable word out. Compatible transcript extensions
 preserve that pending decision; a rewrite inside its prefix cancels it. A
 350 ms request cadence coalesces rapid updates instead of exhausting the request
@@ -40,7 +58,14 @@ Normal transcript refinements and a caller yielding do not cut an
 already-started acknowledgment. Selection expiry is a deadline to start, not a
 timer that truncates a word. A separate duration guard bounds runaway playback.
 
-The first main audio cancels a cue before main samples enter the output graph.
+The main speech announcement cancels pending waiting work for that generation.
+The first voiced main audio cancels an active cue before main samples enter the
+output graph. Main playback never waits for a cue to finish; an acknowledgment
+already in progress may therefore be cut short. A late Jev result cannot
+resurrect it after the main answer is ready. Interrupted cues ramp down for at
+most 8 ms, with cue stop and main start scheduled at the same audio-clock
+boundary. This prevents simultaneous assistant output and softens the edge;
+it does not restore the end of a preempted word.
 Local microphone energy can provisionally pause owned main playback before the
 provider's interruption event arrives. Pending audio and the already-scheduled
 word suffix are preserved for up to 350 ms. A provider speech event or partial
@@ -91,6 +116,17 @@ of the original cases selected all 16 ordinary examples and stayed silent on all
 34 sensitive examples. These development samples are behavioral evidence, not a
 production accuracy estimate.
 
+Short waiting replies need a different content question from listening clauses.
+The retained initial short-turn probe selected none of eight ordinary examples;
+a comparison selected three of eight. The final waiting question uses disjoint
+ordinary/excluded semantic labels, omits the candidate clip from model state,
+and leaves the existing probability, margin and language gates unchanged. Its
+retained 16-request comparison selected eight of ten ordinary examples, including
+the exact short service question and name introduction used in the live test,
+and stayed silent on all 21 excluded examples (some excluded before a provider
+request). Two terse FAQ fragments remained below the content threshold. These
+are development cases, not evidence of perfect short-reply coverage.
+
 `scripts/duplex_browser_smoke.mjs --run` uses the real browser modules,
 AudioContext and AudioWorklet with a local provider replay. It tests concurrent
 microphone capture/cue playback, full clip geometry, main audio priority,
@@ -108,6 +144,19 @@ no old main audio, and the agent answered the new question. Both answer gaps
 were recorded independently from the cue. These are browser graph and provider
 integration results, with synthetic input; they do not establish room acoustics
 or human preference.
+
+The short-turn acceptance also covers both timing branches. A 2.20-second
+service question received main audio 751 ms after synthetic input ended, so its
+waiting selection was canceled and no cue played. The probe had explicitly
+required a waiting cue, so that raw result remains failed under its original
+expectation; a separate recorded-graph audit identifies it as a fast-answer
+control rather than rewriting the receipt. A 1.92-second name introduction
+received a complete cached `One moment.` starting 1.322 seconds after input
+ended. Its main audio was ready at 2.781 seconds, after the 1.050-second cue had
+finished, with no simultaneous assistant sources. The answer gap is still
+measured separately from the hold. Advisory review of the name recording heard
+clear, natural playback and complete endings; representative human microphone
+and telephone listening remain separate acceptance checks.
 
 The page exports content-free browser events and aggregate counters, including
 microphone frames sent during cues and during main output. Cue timing and main

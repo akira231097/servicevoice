@@ -142,6 +142,89 @@ test('a final-only transcript creates a bounded waiting turn and never plays a l
   assert.equal(f.cues()[0].body.epoch, 1); await f.session.stop();
 });
 
+test('a one-word name reply in details refreshes stale hard context and plays waiting before the next poll', async () => {
+  let reads = 0;
+  const f = fixture({ handler: request => {
+    if (request.url !== '/api/sessions/fixture-session') return null;
+    reads++;
+    return reply({ ended: false, stage: reads === 1 ? 'confirmation' : 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] });
+  } });
+  await f.session.start(); await flush(); assert.equal(f.session.coordinator.sensitive, true);
+  message(f.session, { type: 'transcript', role: 'assistant', transcript: 'What name should I put on the appointment?', transcriptType: 'final' });
+  speech(f.session, 'user', 'started'); transcript(f.session, 'Alex'); await f.time.advance(100);
+  assert.equal(f.cues().length, 0, 'A short name cannot play a listening cue');
+  transcript(f.session, 'Alex', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.ok(reads >= 2); assert.equal(f.session.coordinator.listeningBlocked, true);
+  assert.equal(f.session.coordinator.sensitive, false); assert.equal(f.cues().length, 1);
+  assert.equal(f.cues()[0].body.text, 'Alex'); assert.equal(f.cues()[0].body.phase, 'waiting');
+  assert.equal(Object.hasOwn(f.cues()[0].body, 'previous_assistant'), false, 'Trusted assistant context belongs to the server');
+  await f.time.advance(549); assert.equal(f.output.cues.length, 0);
+  await f.time.advance(1); assert.equal(f.output.cues.length, 1); assert.equal(f.output.cues[0].phrase, 'moment');
+  assert.ok(f.events.find(event => event.kind === 'cue_started').at_ms < 1200);
+  await f.session.stop();
+});
+
+for (const text of ['Hours?', 'Opening hours']) {
+  test(`short FAQ ${JSON.stringify(text)} can select waiting without a listening acknowledgment`, async () => {
+    const f = fixture(); await f.session.start();
+    message(f.session, { type: 'transcript', role: 'assistant', transcript: 'What would you like to know about our service department?', transcriptType: 'final' });
+    speech(f.session, 'user', 'started'); transcript(f.session, text); await f.time.advance(100);
+    assert.equal(f.cues().length, 0); transcript(f.session, text, true); speech(f.session, 'user', 'stopped');
+    await f.time.advance(710); assert.equal(f.cues().length, 1);
+    assert.equal(f.cues()[0].body.phase, 'waiting'); assert.equal(f.cues()[0].body.text, text);
+    assert.equal(f.output.cues.length, 1); assert.equal(f.output.cues[0].phrase, 'moment'); await f.session.stop();
+  });
+}
+
+test('details proposals suppress listening while retaining neutral waiting eligibility', async () => {
+  const f = fixture({ handler: request => request.url === '/api/sessions/fixture-session'
+    ? reply({ ended: false, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] }) : null });
+  await f.session.start(); await flush(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Please explain the available service options'); await f.time.advance(400);
+  assert.equal(f.session.coordinator.listeningBlocked, true); assert.equal(f.cues().length, 0);
+  transcript(f.session, 'Please explain the available service options', true); speech(f.session, 'user', 'stopped');
+  await f.time.advance(710); assert.equal(f.cues().length, 1); assert.equal(f.cues()[0].body.phase, 'waiting');
+  assert.equal(f.output.cues.length, 1); await f.session.stop();
+});
+
+test('an older snapshot response cannot reapply a hard block after the turn-yield refresh', async () => {
+  const old = deferred(); let reads = 0;
+  const f = fixture({ handler: request => {
+    if (request.url !== '/api/sessions/fixture-session') return null;
+    if (++reads === 1) return old.promise;
+    return reply({ ended: false, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] });
+  } });
+  await f.session.start(); transcript(f.session, 'Alex', true); await f.time.advance(0);
+  assert.equal(f.cues().length, 1); assert.equal(f.session.coordinator.sensitive, false);
+  old.resolve(reply({ ended: false, stage: 'confirmation', proposal: { id: 'fixture-proposal' }, pending_operations: [] }));
+  await flush(); assert.equal(f.session.coordinator.sensitive, false); assert.equal(f.cues()[0].options.signal.aborted, false);
+  await f.time.advance(550); assert.equal(f.output.cues.length, 1); await f.session.stop();
+});
+
+test('a raw one-word consent remains blocked even in otherwise eligible details context', async () => {
+  const f = fixture({ handler: request => request.url === '/api/sessions/fixture-session'
+    ? reply({ ended: false, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] }) : null });
+  await f.session.start(); await flush();
+  message(f.session, { type: 'transcript', role: 'assistant', transcript: 'Should I save those details?', transcriptType: 'final' });
+  transcript(f.session, 'Yes', true); await f.time.advance(1500);
+  assert.equal(f.session.coordinator.sensitive, true); assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0);
+  await f.session.stop();
+});
+
+for (const [name, snapshot] of [
+  ['confirmation', { stage: 'confirmation', proposal: { id: 'fixture-proposal' }, pending_operations: [] }],
+  ['active operation', { stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: ['fixture-operation'] }],
+  ['ended session', { ended: true, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] }],
+  ['proposal outside details', { stage: 'service', proposal: { id: 'fixture-proposal' }, pending_operations: [] }],
+]) {
+  test(`raw short transcript cannot clear the persisted ${name} safety gate`, async () => {
+    const f = fixture({ handler: request => request.url === '/api/sessions/fixture-session' ? reply({ ended: false, ...snapshot }) : null });
+    await f.session.start(); await flush(); transcript(f.session, 'Alex', true); await f.time.advance(1000);
+    assert.equal(f.session.coordinator.sensitive, true); assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0);
+    await f.session.stop();
+  });
+}
+
 test('provider announcement and quiet PCM preserve a playing cue until voiced main samples arrive', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
   transcript(f.session, 'Please explain your regular service options'); await f.time.advance(0);
@@ -191,12 +274,19 @@ test('stable utterance identity and monotonic request revision survive several p
   await f.session.stop();
 });
 
-test('a long caller turn receives one cue across changing partial epochs and the waiting phase', async () => {
+test('a long caller turn receives at most one cue per listening and waiting phase across revisions', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
   transcript(f.session, 'Please explain the service options'); await f.time.advance(0);
   await f.time.advance(16000); transcript(f.session, 'Please also tell me more about the same issue'); await f.time.advance(0);
+  assert.equal(f.cues().length, 1, 'Partial revisions cannot create a second listening cue');
   transcript(f.session, 'Please also tell me more about the same issue', true); speech(f.session, 'user', 'stopped'); await f.time.advance(710);
-  assert.equal(f.cues().length, 1); assert.equal(f.output.cues.length, 1); await f.session.stop();
+  assert.equal(f.cues().length, 2); assert.equal(f.output.cues.length, 2);
+  assert.deepEqual(f.cues().map(row => row.body.phase), ['listening', 'waiting']);
+  assert.deepEqual(f.cues().map(row => row.body.epoch), [1, 1]);
+  await f.time.advance(16000);
+  transcript(f.session, 'Please also tell me more about the same issue and timing', true); await f.time.advance(710);
+  assert.equal(f.cues().length, 2, 'A revised final cannot create a second waiting cue');
+  assert.equal(f.output.cues.length, 2); await f.session.stop();
 });
 
 test('stop during AudioContext resume never prompts for microphone or creates a session', async () => {
@@ -360,7 +450,8 @@ test('assistant stopped cancels a pending waiting cue even when its start or aud
   const f = fixture(); await f.session.start(); transcript(f.session, 'Please explain the available service options', true);
   await f.time.advance(0); assert.equal(f.session.coordinator.generating, true);
   speech(f.session, 'assistant', 'stopped'); await f.time.advance(1000);
-  assert.equal(f.session.coordinator.generating, false); assert.equal(f.cues().length, 0);
+  assert.equal(f.session.coordinator.generating, false); assert.equal(f.cues().length, 1);
+  assert.equal(f.cues()[0].options.signal.aborted, true, 'Stop revokes the overlapped waiting request before audio');
   assert.equal(f.output.cues.length, 0); await f.session.stop();
 });
 
