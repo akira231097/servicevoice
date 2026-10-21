@@ -32,6 +32,7 @@ The v18 baseline uses Gemini `gemini-3.8-flash` with low reasoning, Soniox speec
 - Separate private operator console and authenticated public provider endpoints.
 - Phone admission limits, an advisor request inbox and optional local MCP advisor integration.
 - Content-free runtime tracing, synthetic reference datasets, native LangSmith experiments and hallucination checks.
+- Optional [prerecorded waiting cues](docs/native-waiting-cues.md), selected by TypeSafe Jev and delivered through the existing Vapi speech stream.
 - Automatic post-call reviews with separate mechanical booking checks, advisory semantic grades, evidence coverage, response-generation lineage and measured latency. See [component observability](docs/component-observability.md).
 - Docker and single-instance Lightsail deployment packages, backup/restore tools and fault/load tests.
 

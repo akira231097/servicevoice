@@ -74,11 +74,11 @@ def test_candidate_cache_returns_exact_bytes_without_any_provider_request(bank, 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("kind", ["off", "rate", "model", "voice", "different_text"])
+@pytest.mark.parametrize("kind", ["off", "model", "voice", "different_text"])
 def test_opt_out_and_configuration_or_exact_text_mismatch_keep_live_google_contract(bank, kind):
     async def scenario():
         values, requests, rows = settings(bank), [], []
-        rate = 8000 if kind == "rate" else 16000
+        rate = 16000
         text = TEXT + " Another sentence." if kind == "different_text" else TEXT
         def provider(request):
             requests.append(request)

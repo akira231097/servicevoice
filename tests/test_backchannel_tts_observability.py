@@ -18,12 +18,15 @@ from deploy.tts_server import create_app as create_standalone_app
 
 
 @pytest.mark.parametrize("deployment", ["integrated", "standalone"])
-def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_path, monkeypatch, deployment):
+@pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 44100])
+def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_path, monkeypatch, deployment, rate):
     # This is synthetic PCM, not a recording or evidence of human listening.
     pcm = b"\x01\x00\xff\xff" * 2000
     cache = BackchannelAudioCache(tmp_path / "audio")
     asset = cache.store("moment", pcm)
     manifest = cache.write_manifest([asset])
+    cache.load_manifest(manifest)
+    expected_pcm = cache.lookup_pcm(PHRASES["moment"], rate)[0]
     values = {
         "GEMINI_API_KEY": "fictional-provider-key-123456",
         "GEMINI_TTS_BEARER_SECRET": "fictional-speech-secret-" + "x" * 40,
@@ -68,10 +71,10 @@ def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_pat
             reply = await client.post("/tts/vapi", headers={
                 "authorization": "Bearer " + values["GEMINI_TTS_BEARER_SECRET"]}, json={
                 "message": {"type": "voice-request", "text": PHRASES["moment"]+" ",
-                    "sampleRate": 16000, "call": {"id": call}},
+                    "sampleRate": rate, "call": {"id": call}},
                 "unrelated_private_text": "PRIVATE CUSTOMER 5125550142"})
             assert reply.status_code == 200
-            assert reply.content == pcm
+            assert reply.content == expected_pcm
             assert reply.headers["content-type"] == "application/octet-stream"
             assert reply.headers["cache-control"] == "no-store"
             assert not adapter.capacity.locked()
@@ -94,11 +97,13 @@ def test_real_cached_pcm_keeps_timing_and_lineage_in_both_public_ledgers(tmp_pat
                 "cache_hit": True, "cache_asset_id": asset["asset_id"],
                 "cache_request_sha256": asset["request_sha256"],
                 "cache_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-                "cached_sample_rate": 16000, "synthesis_source": "pregenerated_cache"}
+                "cached_sample_rate": rate, "synthesis_source": "pregenerated_cache"}
     complete = events["tts.completed"]["attributes"]
     assert complete["cache_text_normalized"] is True
-    assert complete["audio_bytes"] == len(pcm)
-    assert complete["audio_duration_ms"] == len(pcm) / (16000 * 2) * 1000
+    assert complete["audio_bytes"] == len(expected_pcm)
+    assert complete["audio_duration_ms"] == round(len(expected_pcm) / (rate * 2) * 1000, 3)
+    assert complete["upstream_sample_rate"] == 16000
+    assert complete["resampled"] is (rate != 16000)
     assert complete["observation_scope"] == "server_bytes_only_not_audible_playback"
     assert report["coverage"]["complete"] is False
     exported = json.dumps(report)

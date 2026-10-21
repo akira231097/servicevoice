@@ -1,8 +1,10 @@
 """Approved, exact acknowledgment text; these phrases assert no task outcome.
 
 The coordinator, not this catalog or a classifier, decides whether speech is
-permitted. ``checking`` requires an actual active read. Names and user supplied
-placeholders are deliberately unavailable to this static audio experiment.
+permitted. Check/look phrases express a prospective intention for an information
+request, never a completed lookup or outcome. ``working_on_it`` is unavailable
+to the native waiting policy without authoritative accepted-work provenance.
+Names and user supplied placeholders are unavailable to this static audio bank.
 """
 from types import MappingProxyType
 
@@ -12,4 +14,9 @@ PHRASES = MappingProxyType({
     "acknowledge": "I hear you.",
     "checking": "Let me check that.",
     "moment": "One moment.",
+    "one_sec": "One sec.",
+    "just_a_sec": "Just a sec.",
+    "let_me_see": "Let me see.",
+    "taking_a_look": "Let me take a look.",
+    "working_on_it": "Working on it.",
 })

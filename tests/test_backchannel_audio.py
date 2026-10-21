@@ -46,7 +46,7 @@ def test_warmed_exact_text_lookup_owns_no_disk_io_and_never_splices_names(tmp_pa
         assert cache.lookup_pcm(text, 16000) is None
     padded, padded_metadata = cache.lookup_pcm(" \tMm-hmm. \r\n",16000)
     assert padded == pcm and padded_metadata["cache_text_normalized"] is True
-    assert cache.lookup_pcm(PHRASES["neutral_ack"], 8000) is None
+    assert cache.lookup_pcm(PHRASES["neutral_ack"], 12345) is None
     assert cache.lookup_pcm(PHRASES["neutral_ack"], True) is None
     assert cache.lookup_pcm(PHRASES["neutral_ack"], 16000, voice="Zephyr") is None
     assert cache.lookup_pcm(PHRASES["neutral_ack"], 16000, model="different-model") is None
@@ -62,6 +62,47 @@ def test_cache_ids_bind_request_voice_rate_and_actual_audio_bytes(tmp_path):
     assert cache.read_pcm(asset) == pcm
     assert json.loads(target.read_bytes())["spec"] == asdict(cache.spec)
     assert set(path.suffix for path in tmp_path.iterdir()) == {".pcm", ".wav", ".json"}
+
+
+@pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 44100])
+def test_phone_and_browser_cache_rates_preserve_pitch_duration_and_no_request_work(tmp_path, monkeypatch, rate):
+    import numpy as np
+    cache, pcm, asset, target = seeded(tmp_path)
+    cache.load_manifest(target)
+    monkeypatch.setattr(cache, "_read", lambda *_: pytest.fail("request disk work"))
+    monkeypatch.setattr("app.backchannel_audio.PCMRateConverter",
+        lambda *_: pytest.fail("request conversion work"))
+    audio, evidence = cache.lookup_pcm(PHRASES["neutral_ack"], rate)
+    samples = np.frombuffer(audio, dtype="<i2").astype(float)
+    assert len(samples) == pytest.approx(rate * .25, abs=1)
+    spectrum = np.abs(np.fft.rfft(samples))
+    frequency = np.fft.rfftfreq(len(samples), 1 / rate)[int(np.argmax(spectrum))]
+    assert frequency == pytest.approx(440, abs=4)
+    assert np.sqrt(np.mean(samples ** 2)) == pytest.approx(4000 / math.sqrt(2), rel=.03)
+    assert evidence["cached_sample_rate"] == rate
+    assert evidence["upstream_sample_rate"] == 16000
+    assert evidence["resampled"] is (rate != 16000)
+    assert evidence["cache_asset_id"] == asset["asset_id"]
+    if rate == 16000:
+        assert audio == pcm
+
+
+def test_failed_rate_warmup_preserves_whole_previous_bank(tmp_path, monkeypatch):
+    from app import backchannel_audio
+    cache, _, _, target = seeded(tmp_path)
+    cache.load_manifest(target)
+    previous = {rate: cache.lookup_pcm(PHRASES["neutral_ack"], rate)
+                for rate in (8000, 16000, 22050, 24000, 44100)}
+    original = backchannel_audio.PCMRateConverter
+    def failing(source, target):
+        if target == 24000:
+            raise TTSError("tts_resampling_failed")
+        return original(source, target)
+    monkeypatch.setattr(backchannel_audio, "PCMRateConverter", failing)
+    with pytest.raises(AudioCacheError, match="cache_resampling_failed"):
+        cache.load_manifest(target)
+    assert all(cache.lookup_pcm(PHRASES["neutral_ack"], rate) == hit
+               for rate, hit in previous.items())
 
 
 def test_parallel_publication_is_complete_idempotent_and_cannot_clobber(tmp_path):

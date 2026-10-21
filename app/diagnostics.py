@@ -60,7 +60,8 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
 _ENUM_ATTRIBUTES = {
     "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),
-    "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment"}),
+    "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment","one_sec","just_a_sec","let_me_see","checking","taking_a_look"}),
+    "backchannel_content_kind": frozenset({"information_question","scheduling_request","ordinary_detail","factual_correction","other"}),
     "backchannel_reason": frozenset({"emitted","primary_ready","policy_not_ready","context_unavailable","turn_already_acknowledged","cooldown","call_budget","budget_capacity","not_eligible","sensitive_context","sensitive_utterance","sensitive_prior_turn","cached_language_unverified","short_or_ambiguous","urgent_or_safety","untrusted_control_content","classifier_timeout","classifier_unavailable","low_confidence","selected","silence","invalid_context","turn_not_allowed","invalid_messages","not_final_user_turn","input_bounds","prior_context_bounds","credential_missing","classification_capacity","provider_unavailable","invalid_response","response_bounds","model_mismatch","policy_closed","classification_deadline","classifier_silence","classification_uncertain","eligible_classification","classification_unavailable"}),
     "synthesis_source": frozenset({"pregenerated_cache","live_google"}),
     "error_code": frozenset({"none", "unknown", "invalid_arguments", "unauthorized", "authentication_rejected", "capacity_rejected", "invalid_history", "invalid_event", "deadline_exceeded", "timeout", "upstream_unavailable", "state_unavailable", "operation_pending", "operation_unknown", "operation_missing", "operation_failed", "idempotency_conflict", "harness_overloaded", "harness_closed", "session_ended", "slot_unavailable", "receipt_missing", "receipt_mismatch", "validation_error", "internal_error", "cancelled", "waiter_interrupted", "budget_exhausted", "missing_evidence", "export_failure", "quota_exhausted", "invalid_audio", "transport_error",
@@ -85,6 +86,7 @@ _ENUM_ATTRIBUTES = {
     "resampler": frozenset({"soxr_hq", "none"}),
     "tool_name": frozenset({"get_dealership_info", "begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "confirm_action", "dismiss_proposal", "get_appointment", "get_session_context", "get_operation", "prepare_reschedule", "prepare_cancellation", "request_handoff", "withdraw_handoff", "unknown_tool"}),
 }
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "private_detail", "private_prior_turn"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
@@ -123,7 +125,7 @@ def safe_attributes(attributes):
     if not isinstance(attributes, Mapping):
         return {}
     result = {}
-    for key in ("backchannel_probability","backchannel_confidence","backchannel_language_probability","backchannel_language_confidence"):
+    for key in ("backchannel_probability","backchannel_confidence","backchannel_language_probability","backchannel_language_confidence","backchannel_content_probability","backchannel_content_confidence"):
         value=attributes.get(key)
         if type(value) in (int,float) and math.isfinite(value) and 0<=value<=1:result[key]=value
     for key, choices in _ENUM_ATTRIBUTES.items():

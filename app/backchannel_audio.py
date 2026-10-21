@@ -16,7 +16,7 @@ import tempfile
 import wave
 
 from app.backchannel_catalog import CATALOG_VERSION, PHRASES
-from app.gemini_tts import DEFAULT_MODEL, MODELS, VOICES, request_body
+from app.gemini_tts import DEFAULT_MODEL, MODELS, VOICES, SAMPLE_RATES, PCMRateConverter, TTSError, request_body
 
 SCHEMA = "backchannel-audio-v1"
 PROMPT_VERSION = "gemini-exact-transcript-v1"
@@ -216,11 +216,26 @@ class BackchannelAudioCache:
         for asset in manifest["assets"]:
             pcm = self.read_pcm(asset)
             text = asset["text"]
-            if text in loaded:
+            if (text, self.spec.sample_rate) in loaded:
                 raise AudioCacheError("backchannel_duplicate_phrase")
-            loaded[text] = (pcm, {"cache_asset_id": asset["asset_id"],
-                "cache_request_sha256": asset["request_sha256"], "cache_hit": True,
-                "audio_duration_ms": asset["duration_ms"], "cached_sample_rate": self.spec.sample_rate})
+            # Warm every supported Vapi format before admitting callers. Phone
+            # requests can differ from browser PCM; never relabel 16 kHz bytes
+            # or incur synthesis/conversion latency in the request path.
+            for rate in sorted(SAMPLE_RATES):
+                try:
+                    audio = PCMRateConverter(self.spec.sample_rate, rate).convert(pcm, last=True)
+                except TTSError:
+                    raise AudioCacheError("backchannel_cache_resampling_failed") from None
+                expected_frames = len(pcm) // 2 * rate / self.spec.sample_rate
+                if (not audio or len(audio) % 2
+                    or abs(len(audio) // 2 - expected_frames) > 1):
+                    raise AudioCacheError("backchannel_cache_resampling_failed")
+                loaded[(text, rate)] = (audio, {"cache_asset_id": asset["asset_id"],
+                    "cache_request_sha256": asset["request_sha256"], "cache_hit": True,
+                    "audio_duration_ms": len(audio) / (rate * 2) * 1000,
+                    "cached_sample_rate": rate, "upstream_sample_rate": self.spec.sample_rate,
+                    "resampled": rate != self.spec.sample_rate,
+                    "resampler": "soxr_hq" if rate != self.spec.sample_rate else "none"})
         # Publish warmed entries only after every object validates. A failed
         # reload cannot partly replace an existing, verified in-memory bank.
         self._loaded = loaded
@@ -228,7 +243,7 @@ class BackchannelAudioCache:
         return manifest
 
     def lookup_pcm(self, text, sample_rate, *, model=None, voice=None):
-        if (type(sample_rate) is not int or sample_rate != self.spec.sample_rate
+        if (type(sample_rate) is not int or sample_rate not in SAMPLE_RATES
             or model is not None and model != self.spec.model
             or voice is not None and voice != self.spec.voice
             or not isinstance(text, str)):
@@ -237,7 +252,7 @@ class BackchannelAudioCache:
         # transport padding; case, punctuation, internal spacing, Unicode and
         # additional words remain exact. Never normalize arbitrary sentences.
         canonical_text = text.strip(" \t\r\n")
-        item = self._loaded.get(canonical_text)
+        item = self._loaded.get((canonical_text, sample_rate))
         if item is None:
             return None
         pcm, metadata = item

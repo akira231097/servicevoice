@@ -30,7 +30,7 @@ from .tool_observations import ObservationError, ToolObservationStore
 from .receipt_narration import BoundedSelector, NARRATOR_VERSION
 from .jev_faq import FAQ_VERSION, JevFaqRouter
 from .jev_classifier import JEV_MODEL
-from .backchannel_policy import BackchannelPolicy
+from .backchannel_policy import BackchannelPolicy, WAITING_PHRASE_IDS, waiting_phrase, waiting_state
 from .backchannel_catalog import PHRASES
 from .backchannel_budget import BackchannelBudget
 from .issuance_context import user_context
@@ -906,7 +906,7 @@ class GeminiGateway:
                     voice=config.get("GEMINI_TTS_VOICE", "Kore")))
                 cache.load_manifest(path)
                 return all(cache.lookup_pcm(PHRASES[p], 16000) is not None
-                           for p in ("neutral_ack", "acknowledge", "moment"))
+                           for p in ("neutral_ack", "acknowledge", *WAITING_PHRASE_IDS))
             self.backchannel_cache_ready = await run_in_threadpool(warm_cache)
             if not self.backchannel_cache_ready:raise RuntimeError("backchannel_cache_not_ready")
             await self.backchannel_policy.start()
@@ -1321,10 +1321,27 @@ class GeminiGateway:
             if not row or row["ended"] or row["provider_call_id"] != call_id:return {"allow_turn":False}
             state=json.loads(row["state"])
             pending=db.execute("SELECT 1 FROM tool_invocations WHERE session_id=? AND status IN ('queued','running','unknown') LIMIT 1",(sid,)).fetchone()
+            confirmation=False
+            if state.get("stage")=="confirmation" and state.get("proposal_id"):
+                confirmation=bool(db.execute("SELECT 1 FROM proposals WHERE id=? AND session_id=? AND kind='book' AND state='pending' AND expires>=?",
+                    (state["proposal_id"],sid,time.time())).fetchone())
+            elif state.get("stage")=="complete":
+                confirmation=bool(db.execute("SELECT 1 FROM appointments WHERE session_id=? AND status='confirmed' LIMIT 1",(sid,)).fetchone())
             return {"allow_turn":True,"stage":state.get("stage"),
                     "active_confirmation":state.get("stage")=="confirmation",
                     "has_pending_proposal":bool(state.get("proposal_id")),
-                    "has_pending_operation":bool(pending),"ended":False}
+                    "has_pending_operation":bool(pending),"ended":False,"booking_confirmation_context":confirmation}
+
+    def _backchannel_retired(self,call_ids):
+        # Bounded known-ledger scan only at capacity. Missing sessions or read
+        # failures never evict active budgets or refund an accepted cue.
+        if not call_ids:return ()
+        if len(call_ids)>256:raise ValueError("backchannel_budget_bounds")
+        with self.narration.store.read_connection(0.05) as db:
+            marks=",".join("?" for _ in call_ids)
+            return tuple(row[0] for row in db.execute(
+                f"SELECT provider_call_id FROM sessions WHERE provider_call_id IN ({marks}) AND (ended!=0 OR created<?)",
+                (*call_ids,time.time()-4*3600)))
 
     async def _backchannel_stream(self,request,config,key,upstream,sid,call_id,started,timing):
         """One bounded acknowledgment in the existing owned Vapi stream.
@@ -1333,6 +1350,33 @@ class GeminiGateway:
         speculative tool prose, dynamic name or booking authority is added.
         """
         streams=[]
+        selection_context = None
+        policy_messages=upstream["messages"]
+        if policy_messages and policy_messages[-1].get("role")=="tool":
+            # prepare_request already verified the signed tool group and its
+            # authoritative receipt. Reuse only the caller context; tool data
+            # and generated action prose never enter the optional classifier.
+            caller=next((index for index in range(len(policy_messages)-1,-1,-1)
+                         if policy_messages[index].get("role")=="user"),None)
+            policy_messages=policy_messages[:caller+1] if caller is not None else []
+        async def read_context():
+            # Shield only the physical read: timed-out thread work retains its
+            # slot until done, but neither classifier nor main waits for it.
+            async with asyncio.timeout(.06):
+                if len(self.backchannel_reads)>=self.limits.concurrency:raise TimeoutError()
+                candidates=tuple(self.backchannel_budget.calls) if len(self.backchannel_budget.calls)>=self.backchannel_budget.capacity else ()
+                def inspect():
+                    context=self._backchannel_context(sid,call_id)
+                    return context,self._backchannel_retired(candidates) if candidates else ()
+                read=asyncio.create_task(run_in_threadpool(inspect))
+                self.backchannel_reads.add(read)
+                def read_done(task):
+                    self.backchannel_reads.discard(task)
+                    if not task.cancelled():task.exception()
+                read.add_done_callback(read_done)
+                context,retired=await asyncio.shield(read)
+                self.backchannel_budget.retire_confirmed(retired)
+                return context
         async def prime_answer():
             self._phase(timing,True)
             stream=await self._generate_upstream(request,key,upstream,sid,call_id,started,timing)
@@ -1340,26 +1384,21 @@ class GeminiGateway:
             first=await anext(stream.body_iterator)
             return stream,first
         async def choose():
+            nonlocal selection_context
             from .backchannel_policy import BackchannelDecision
             try:
                 async with asyncio.timeout(.45):
-                    if len(self.backchannel_reads)>=self.limits.concurrency:
-                        return BackchannelDecision(reason="context_unavailable")
-                    read=asyncio.create_task(run_in_threadpool(self._backchannel_context,sid,call_id))
-                    self.backchannel_reads.add(read)
-                    def read_done(task):
-                        self.backchannel_reads.discard(task)
-                        if not task.cancelled():task.exception()
-                    read.add_done_callback(read_done)
-                    context=await asyncio.shield(read)
+                    selection_context=await read_context()
                     def requested():timing.row["backchannel"]["requests"]=1
-                    return await self.backchannel_policy.choose(upstream["messages"],config.get("TYPESAFE_API_KEY"),context=context,on_request=requested)
+                    return await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
+                        context=selection_context,on_request=requested,native_waiting=True)
             except Exception:
                 return BackchannelDecision(reason="context_unavailable")
         timing.row["backchannel"]={"phrase_id":"silence","reason":"pending","emitted_ms":None,
                                     "classification_ms":None,"probability":None,"confidence":None,"requests":0,
                                     "policy_elapsed_ms":None,"language_choice":None,"language_probability":None,
-                                    "language_confidence":None,"audible_playback":"unverified"}
+                                    "language_confidence":None,"content_kind":None,"content_probability":None,
+                                    "content_confidence":None,"audible_playback":"unverified"}
         timing.row["sse_response_id"]="chatcmpl-"+uuid4().hex
         primary=asyncio.create_task(prime_answer())
         policy=asyncio.create_task(choose())
@@ -1383,16 +1422,38 @@ class GeminiGateway:
                               classification_ms=decision.classification_ms,probability=decision.probability,
                               confidence=decision.confidence,policy_elapsed_ms=decision.elapsed_ms,
                               language_choice=decision.language_choice,language_probability=decision.language_probability,
-                              language_confidence=decision.language_confidence)
+                              language_confidence=decision.language_confidence,content_kind=decision.content_kind,
+                              content_probability=decision.content_probability,content_confidence=decision.content_confidence)
             if primary in done:
                 record["reason"]="primary_ready"
             elif decision is not None:
                 self._backchannel_observation(timing,"backchannel.selected",None)
-                if decision.phrase_id in {"neutral_ack","acknowledge","moment"}:
-                    context=user_context(upstream["messages"])
-                    allowed,reason=self.backchannel_budget.consume(call_id,context["user_count"] if context else 0)
-                    record["reason"]=reason
-                    if allowed and not primary.done():
+                if decision.phrase_id in WAITING_PHRASE_IDS and decision.reason=="eligible_classification":
+                    # Never wait for this optional fresh read ahead of a ready
+                    # main answer. A context change cannot grant new authority.
+                    fresh=asyncio.create_task(read_context())
+                    try:
+                        ready,_=await asyncio.wait((primary,fresh),return_when=asyncio.FIRST_COMPLETED)
+                        if primary in ready:
+                            primary.result(); record["reason"]="primary_ready"
+                            current=None
+                        else:current=fresh.result()
+                    except Exception:
+                        current=None; record["reason"]="context_unavailable"
+                    finally:
+                        if not fresh.done():fresh.cancel()
+                        await asyncio.gather(fresh,return_exceptions=True)
+                    state,reason=waiting_state(policy_messages,current) if current is not None else (None,record["reason"])
+                    if state is None:record["reason"]=reason
+                    elif selection_context is None or current!=selection_context:record["reason"]="scheduler_changed"
+                    elif not primary.done():
+                        phrase=waiting_phrase(decision,state["user_count"],self.backchannel_budget.previous_phrase(call_id),
+                            neutral_only=state["neutral_confirmation"])
+                        record["phrase_id"]=phrase
+                        allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase)
+                        record["reason"]=reason
+                    else:allowed=False; record["reason"]="primary_ready"
+                    if state is not None and current==selection_context and not primary.done() and allowed:
                         self._checkpoint(timing)
                         elapsed=round((time.monotonic()-started)*1000,3)
                         record["emitted_ms"]=elapsed
@@ -1400,7 +1461,7 @@ class GeminiGateway:
                         self._backchannel_observation(timing,"backchannel.emitted",elapsed)
                         yield sse({"id":timing.row["sse_response_id"],"object":"chat.completion.chunk",
                             "created":int(time.time()),"model":MODEL,"choices":[{"index":0,"delta":{
-                                "role":"assistant","content":PHRASES[decision.phrase_id]+" <flush /> "},"finish_reason":None}]})
+                                "role":"assistant","content":PHRASES[record["phrase_id"]]+" <flush /> "},"finish_reason":None}]})
             else:record["reason"]="policy_not_ready"
             if record["emitted_ms"] is None:self._backchannel_observation(timing,"backchannel.suppressed",None)
             stream,first=await asyncio.shield(primary)
@@ -1461,6 +1522,8 @@ class GeminiGateway:
                     "classifier_requests":record["requests"],"policy_elapsed_ms":record["policy_elapsed_ms"],
                     "backchannel_language":record["language_choice"],"backchannel_language_probability":record["language_probability"],
                     "backchannel_language_confidence":record["language_confidence"],
+                    "backchannel_content_kind":record.get("content_kind"),"backchannel_content_probability":record.get("content_probability"),
+                    "backchannel_content_confidence":record.get("content_confidence"),
                     "evidence_source":"server_observed","observation_scope":"server_bytes_only_not_audible_playback"})
         except Exception:pass
 

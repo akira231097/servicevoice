@@ -260,7 +260,7 @@ def test_budget_cooldown_and_same_turn_cannot_repeat_ack_but_primary_always_comp
                 result = super().consume(*args)
                 consumed.set()
                 return result
-        gateway.backchannel_budget = ObservedBudget(cooldown_seconds=15, per_call=2, clock=lambda: clock[0])
+        gateway.backchannel_budget = ObservedBudget(cooldown_seconds=15, per_call=2, window_seconds=1000, clock=lambda: clock[0])
         async def one(body):
             release.clear()
             consumed.clear()
