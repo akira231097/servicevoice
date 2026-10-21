@@ -240,6 +240,31 @@ class TelephonyIngress:
         return {"assistantId": self.config.assistant_id,
                 "assistantOverrides": {"variableValues": {"session_id": sid}}}
 
+    def require_phone_budget(self, db, now):
+        """One phone budget across ordinary ingress and opt-in media bridges.
+
+        Caller owns the existing short admission transaction/worker lane. An
+        unresolved bridge remains active until exact terminal reconciliation.
+        """
+        bridge = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_bridge_admissions'").fetchone()
+        total = db.execute("SELECT COUNT(*) FROM telephony_bindings").fetchone()[0]
+        active = db.execute("""SELECT COUNT(*) FROM telephony_bindings b JOIN sessions s ON s.id=b.session_id
+            WHERE b.tenant=? AND b.ended IS NULL AND s.ended=0 AND s.created>?""",
+            (TENANT, now-self.limits.session_ttl_seconds)).fetchone()[0]
+        recent = db.execute("SELECT COUNT(*) FROM telephony_bindings WHERE tenant=? AND created>?",
+                            (TENANT, now-self.limits.window_seconds)).fetchone()[0]
+        if bridge:
+            total += db.execute("SELECT COUNT(*) FROM phone_bridge_admissions").fetchone()[0]
+            active += db.execute("SELECT COUNT(*) FROM phone_bridge_admissions WHERE tenant=? AND closed IS NULL", (TENANT,)).fetchone()[0]
+            recent += db.execute("SELECT COUNT(*) FROM phone_bridge_admissions WHERE tenant=? AND created>?",
+                                 (TENANT, now-self.limits.window_seconds)).fetchone()[0]
+        if total >= self.limits.bindings_total:
+            raise IngressError("telephony_retention_capacity", 429)
+        if active >= self.limits.active_calls:
+            raise IngressError("telephony_active_capacity", 429)
+        if recent >= self.limits.admissions_per_window:
+            raise IngressError("telephony_admission_rate", 429)
+
     def admit(self, message, authorization, *, deadline=None, abandoned=None):
         self.authenticate(authorization)
         if not isinstance(message, dict) or message.get("type") != "assistant-request":
@@ -265,19 +290,16 @@ class TelephonyIngress:
                 return self._response(session["id"])
             if db.execute("SELECT 1 FROM sessions WHERE provider_call_id=?", (call_id,)).fetchone() or db.execute("SELECT 1 FROM provider_tool_policies WHERE provider_call_id=?", (call_id,)).fetchone():
                 raise IngressError("telephony_binding_conflict", 409)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_bridge_admissions'").fetchone() and db.execute(
+                    "SELECT 1 FROM phone_bridge_admissions WHERE outer_call_id=?", (call_id,)).fetchone():
+                # A bridged outer leg is control metadata, never another agent
+                # or booking session through the unchanged phone webhook.
+                raise IngressError("telephony_binding_conflict", 409)
             if self.live_admission is not None:
                 try:self.live_admission.require_room(db)
                 except CapacityError as exc:raise IngressError(exc.code,exc.status) from None
             now = self.clock()
-            if db.execute("SELECT COUNT(*) FROM telephony_bindings").fetchone()[0] >= self.limits.bindings_total:
-                raise IngressError("telephony_retention_capacity", 429)
-            active = db.execute("""SELECT COUNT(*) FROM telephony_bindings b JOIN sessions s ON s.id=b.session_id
-                WHERE b.tenant=? AND b.ended IS NULL AND s.ended=0 AND s.created>?""", (TENANT, now-self.limits.session_ttl_seconds)).fetchone()[0]
-            if active >= self.limits.active_calls:
-                raise IngressError("telephony_active_capacity", 429)
-            recent = db.execute("SELECT COUNT(*) FROM telephony_bindings WHERE tenant=? AND created>?", (TENANT, now-self.limits.window_seconds)).fetchone()[0]
-            if recent >= self.limits.admissions_per_window:
-                raise IngressError("telephony_admission_rate", 429)
+            self.require_phone_budget(db, now)
             sid = uid("sess")
             # A deliberately undisclosed random browser capability. Only its hash
             # survives; session_id alone never authorizes console/session routes.

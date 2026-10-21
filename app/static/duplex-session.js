@@ -65,6 +65,106 @@ export class DuplexSession {
     this.preparationTextChangedAt = -Infinity; this.preparationAttemptedTexts = new Set();
     this.waitingPreparationRequests = 0; this.lastWaitingPreparationAt = -Infinity;
     this.waitingPreparationReuses = 0;
+    this.transportDiagnosticCount = 0; this.transportDiagnosticDropped = 0;
+    this.transportDiagnosticKinds = {};
+    this.outputRejections = {}; this.lastOutputRejectionKey = null; this.lastOutputRejectionAt = -Infinity;
+    this.assistantOutputFinished = false; this.ordinaryTurnDrained = false;
+    this.earlyMainStart = null; this.earlyMainStartAttempted = false;
+    this.preStartPcm = null; this.preStartPcmAttempted = false;
+  }
+
+  playbackGateState() {
+    return { caller_speaking: this.callerSpeaking, local_speaking: this.localSpeaking,
+      provider_speaking: this.providerSpeaking, muted: this.muted, provisional: Boolean(this.provisional),
+      main_allowed: this.mainAllowed, main_speaking: this.mainSpeaking,
+      generation_present: this.generation !== null, generation_sequence: this.generationSequence,
+      coordinator_epoch: this.coordinator?.epoch ?? 0, utterance_id: this.coordinator?.utteranceId ?? 0 };
+  }
+
+  transportDiagnostic(kind, detail = {}) {
+    // Fixed field names, enum outcomes and local numeric epochs only. Never
+    // retain the provider body, transcript, call ID or arbitrary provider values.
+    const limit = { provider_assistant_speech_update: 256, provider_user_speech_update: 256,
+      local_speech_update: 128, main_pcm_rejected: 64, early_main_start: 64, pre_start_pcm: 64 }[kind] ?? 0;
+    if ((this.transportDiagnosticKinds[kind] ?? 0) >= limit) { this.transportDiagnosticDropped += 1; return; }
+    this.transportDiagnosticKinds[kind] = (this.transportDiagnosticKinds[kind] ?? 0) + 1;
+    this.transportDiagnosticCount += 1; this.emit(kind, { ...this.playbackGateState(), ...detail });
+  }
+
+  rejectOutput(reason, byteLength, voiced = null) {
+    this.discardedOutputBytes += byteLength;
+    const row = this.outputRejections[reason] ||= { packets: 0, bytes: 0 };
+    row.packets += 1; row.bytes += byteLength;
+    const state = this.playbackGateState(), now = this.runtime.now();
+    const key = `${reason}:${state.coordinator_epoch}:${state.generation_sequence}:${state.caller_speaking}:${state.main_allowed}`;
+    if (key !== this.lastOutputRejectionKey || now - this.lastOutputRejectionAt >= 250) {
+      this.lastOutputRejectionKey = key; this.lastOutputRejectionAt = now;
+      this.transportDiagnostic('main_pcm_rejected', { reason, packet_bytes: byteLength, voiced,
+        reason_packets: row.packets, reason_bytes: row.bytes });
+    }
+  }
+
+  earlyMainStartCurrent(state) {
+    return state && !this.closed && !this.muted && !this.provisional && this.ordinaryTurnDrained
+      && this.lastUserTranscriptFinal && state.revision === this.revision
+      && state.utteranceId === this.coordinator?.utteranceId && state.epoch === this.coordinator?.epoch
+      && this.runtime.now() < state.deadline;
+  }
+
+  cancelEarlyMainStart(reason) {
+    this.cancelPreStartPcm(reason);
+    const state = this.earlyMainStart; if (!state) return;
+    this.earlyMainStart = null; this.runtime.clearTimeout(state.timer);
+    if (state.bytes) this.rejectOutput('early_start_canceled', state.bytes);
+    this.transportDiagnostic('early_main_start', { disposition: 'canceled', reason,
+      held_ms: this.runtime.now() - state.startedAt, buffered_bytes: state.bytes });
+  }
+
+  holdEarlyMainStart() {
+    if (this.earlyMainStart) return this.earlyMainStartCurrent(this.earlyMainStart);
+    if (this.earlyMainStartAttempted || !this.ordinaryTurnDrained || !this.lastUserTranscriptFinal
+      || !this.callerSpeaking || this.userTurnClosed || this.muted || this.provisional
+      || this.mainSpeaking || this.playback?.main?.size !== 0) return false;
+    const state = { utteranceId: this.coordinator.utteranceId, revision: this.revision,
+      epoch: this.coordinator.epoch, startedAt: this.runtime.now(), deadline: this.runtime.now() + 350,
+      bytes: 0, buffer: [], timer: null };
+    this.earlyMainStartAttempted = true; this.earlyMainStart = state;
+    state.timer = this.runtime.setTimeout(() => this.cancelEarlyMainStart('deadline'), 350);
+    this.transportDiagnostic('early_main_start', { disposition: 'held', deadline_ms: 350 });
+    return true;
+  }
+
+  preStartPcmCurrent(state) {
+    return this.earlyMainStartCurrent(state) && !this.callerSpeaking && !this.localSpeaking
+      && !this.providerSpeaking && !this.userTurnClosed && !this.mainAllowed && !this.mainSpeaking
+      && !this.generationAnnouncedAfterUser && state.generation === this.generation
+      && this.generation !== null && this.playback?.main?.size === 0;
+  }
+
+  cancelPreStartPcm(reason) {
+    const state = this.preStartPcm; if (!state) return;
+    this.preStartPcm = null; this.runtime.clearTimeout(state.timer);
+    if (state.bytes) this.rejectOutput('pre_start_canceled', state.bytes);
+    this.transportDiagnostic('pre_start_pcm', { disposition: 'canceled', reason,
+      held_ms: this.runtime.now() - state.startedAt, buffered_bytes: state.bytes });
+  }
+
+  quarantinePreStartPcm(pcm) {
+    if (!this.preStartPcm) {
+      if (this.preStartPcmAttempted || this.earlyMainStart || !this.ordinaryTurnDrained) return false;
+      const state = { utteranceId: this.coordinator.utteranceId, revision: this.revision,
+        epoch: this.coordinator.epoch, generation: this.generation, startedAt: this.runtime.now(),
+        deadline: this.runtime.now() + 350, bytes: 0, buffer: [], timer: null };
+      if (!this.preStartPcmCurrent(state)) return false;
+      this.preStartPcmAttempted = true; this.preStartPcm = state;
+      state.timer = this.runtime.setTimeout(() => this.cancelPreStartPcm('deadline'), 350);
+      this.transportDiagnostic('pre_start_pcm', { disposition: 'quarantined', deadline_ms: 350 });
+    }
+    const state = this.preStartPcm;
+    if (!this.preStartPcmCurrent(state)) { this.cancelPreStartPcm('binding_changed'); return false; }
+    if (state.bytes + pcm.byteLength > 11200) { this.cancelPreStartPcm('buffer_limit'); return false; }
+    state.buffer.push(pcm.slice()); state.bytes += pcm.byteLength;
+    return true;
   }
 
   emit(kind, detail = {}) {
@@ -261,7 +361,11 @@ export class DuplexSession {
         now: this.runtime.now, setTimeout: this.runtime.setTimeout, clearTimeout: this.runtime.clearTimeout,
         decisionDeadlineMs: 850, // Includes loopback API + authoritative state reads; provider budget remains350ms.
         selectCue: decision => this.selectCue(decision),
-        onEvent: event => { const { kind, at_ms, ...detail } = event; this.emit(kind, detail); },
+        onEvent: event => {
+          if (this.earlyMainStart && event.epoch !== this.earlyMainStart.epoch) this.cancelEarlyMainStart('epoch_changed');
+          if (this.preStartPcm && event.epoch !== this.preStartPcm.epoch) this.cancelPreStartPcm('epoch_changed');
+          const { kind, at_ms, ...detail } = event; this.emit(kind, detail);
+        },
       });
       this.microphone = this.runtime.microphoneFactory({ audioContext: this.context,
         onFrame: frame => this.sendInput(frame), onSpeech: speaking => this.onLocalSpeech(speaking),
@@ -319,8 +423,12 @@ export class DuplexSession {
   }
 
   onLocalSpeech(speaking) {
+    if (speaking && !this.localSpeaking && (this.earlyMainStart || this.preStartPcm)) {
+      this.cancelEarlyMainStart('local_voice_resumed'); this.ordinaryTurnDrained = false;
+    }
     this.localSpeaking = speaking;
     if (!this.active || this.closed || this.muted) return;
+    this.transportDiagnostic('local_speech_update', { speaking: Boolean(speaking) });
     if (speaking) {
       if (!this.callerSpeaking) this.provisionalBargeIn();
     } else {
@@ -383,6 +491,7 @@ export class DuplexSession {
 
   userStarted(source) {
     this.runtime.clearTimeout(this.userStopTimer);
+    if (this.earlyMainStart || this.preStartPcm) { this.cancelEarlyMainStart('caller_resumed'); this.ordinaryTurnDrained = false; }
     if (this.callerSpeaking || this.closed) return;
     this.cancelWaitingPreparation('caller_started');
     const hadProvisionalOutput = Boolean(this.provisional?.wasMainSpeaking);
@@ -392,6 +501,9 @@ export class DuplexSession {
       && this.coordinator.hasWaitingAudioStarted();
     const resumed = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed && !interruptedWaiting
       && this.runtime.now() - this.lastUserStoppedAt < 15000;
+    const priorDrained = this.assistantOutputFinished && !this.mainSpeaking && !hadProvisionalOutput
+      && !this.provisional && this.playback?.main?.size === 0 && !resumed && !interruptedWaiting;
+    if (resumed || interruptedWaiting) this.ordinaryTurnDrained = false;
     this.callerSpeaking = true;
     if (!resumed) {
       // Speech after an actually voiced waiting cue owns a fresh turn, but an
@@ -403,6 +515,8 @@ export class DuplexSession {
       this.userTurnClosed = false; this.generationAnnouncedAfterUser = false;
       this.preparationAttemptedTexts.clear();
       this.lastWaitingPreparationAt = -Infinity;
+      this.ordinaryTurnDrained = priorDrained; this.earlyMainStartAttempted = false;
+      this.preStartPcmAttempted = false;
     }
     this.lastUserTranscriptFinal = false; this.falseEnergyCount = 0; this.energyCooldownUntil = -Infinity;
     const wasOutput = this.mainSpeaking || this.cuePlaying || hadProvisionalOutput;
@@ -441,6 +555,13 @@ export class DuplexSession {
 
   endUserTurn() {
     if (!this.callerSpeaking || this.closed) return;
+    let early = this.earlyMainStart;
+    if (early && (!this.earlyMainStartCurrent(early) || this.localSpeaking || this.providerSpeaking)) {
+      this.cancelEarlyMainStart('yield_not_current'); early = null;
+    }
+    // Detach before the expected yield/generation epoch transitions. An unrelated
+    // epoch or revision could never reach this promotion point.
+    if (early) { this.earlyMainStart = null; this.runtime.clearTimeout(early.timer); }
     // Keep an exact in-flight prediction available for the selector's bounded
     // join. There is still no permission to play before the fresh yield request.
     this.runtime.clearTimeout(this.waitingPreparationTimer); this.waitingPreparationTimer = null;
@@ -455,6 +576,13 @@ export class DuplexSession {
     // Refresh phase gates at turn yield; main output never awaits this read.
     void this.refreshSnapshot();
     this.callbacks.status?.('Preparing reply'); this.emit('caller_stopped');
+    if (early) {
+      this.mainAllowed = true; this.generationAnnouncedAfterUser = true; this.assistantOutputFinished = false;
+      this.emit('provider_main_announced', { source: 'ordinary_turn_early_start' });
+      this.transportDiagnostic('early_main_start', { disposition: 'promoted',
+        held_ms: this.runtime.now() - early.startedAt, buffered_bytes: early.bytes });
+      for (const pcm of early.buffer) this.receive(pcm.buffer, { replayed: true });
+    }
   }
 
   receive(data, { replayed = false } = {}) {
@@ -462,20 +590,34 @@ export class DuplexSession {
     if (typeof data !== 'string') {
       const pcm = bytes(data); if (!replayed) this.audioBytes += pcm.byteLength;
       if (!pcm.byteLength || pcm.byteLength % 2 || pcm.byteLength > 128000) { void this.stop('output_geometry'); return; }
+      if (this.earlyMainStart) {
+        const state = this.earlyMainStart;
+        if (!this.earlyMainStartCurrent(state)) this.cancelEarlyMainStart('binding_changed');
+        else if (state.bytes + pcm.byteLength <= 11200) {
+          state.buffer.push(pcm.slice()); state.bytes += pcm.byteLength; return;
+        } else this.cancelEarlyMainStart('buffer_limit');
+      }
+      if (this.preStartPcm && this.quarantinePreStartPcm(pcm)) return;
       if (this.provisional) {
         //350ms of16kHz mono PCM, independent of provider packet chunk size.
         if (this.provisional.bytes + pcm.byteLength <= 11200) {
           this.provisional.buffer.push(pcm.slice()); this.provisional.bytes += pcm.byteLength;
-        } else this.discardedOutputBytes += pcm.byteLength;
+        } else this.rejectOutput('provisional_buffer_full', pcm.byteLength, peak(pcm) > 64);
         return;
       }
       // Vapi also streams silence. It must not preempt a listening cue.
       if (peak(pcm) <= 64 && !this.mainSpeaking) return;
-      if (this.callerSpeaking || !this.generation) { this.discardedOutputBytes += pcm.byteLength; return; }
+      if (this.callerSpeaking || !this.generation) {
+        this.rejectOutput(this.callerSpeaking ? 'caller_speaking' : 'no_generation', pcm.byteLength, peak(pcm) > 64); return;
+      }
       if (!this.mainAllowed) {
+        // Ordinary completed turns can receive PCM just before their matching
+        // speech-start event. Keep it inaudible until that event; an interrupted
+        // generation never qualifies, and the fixed deadline cannot restart.
+        if (this.quarantinePreStartPcm(pcm)) return;
         // No provider packet generation IDs exist. Do not replay buffered old
         // audio after an interruption merely because a new speech event arrives.
-        this.discardedOutputBytes += pcm.byteLength;
+        this.rejectOutput('awaiting_fresh_speech_start', pcm.byteLength, peak(pcm) > 64);
         return;
       }
       if (!this.mainSpeaking && peak(pcm) > 64) {
@@ -484,7 +626,7 @@ export class DuplexSession {
         this.mainSpeaking = true; this.callbacks.status?.('Speaking'); this.emit('main_started');
       }
       if (this.gapAt !== null && peak(pcm) > 64) { this.answerGaps.push(this.runtime.now() - this.gapAt); this.gapAt = null; }
-      if (!this.coordinator.receiveMainPcm(this.generation, pcm, 16000)) this.discardedOutputBytes += pcm.byteLength;
+      if (!this.coordinator.receiveMainPcm(this.generation, pcm, 16000)) this.rejectOutput('coordinator_rejected', pcm.byteLength, peak(pcm) > 64);
       return;
     }
     if (data.length > 262144) return;
@@ -534,6 +676,7 @@ export class DuplexSession {
           return;
         }
         if (text !== this.partial) {
+          this.cancelEarlyMainStart('transcript_revised');
           this.cancelWaitingPreparation('partial_revised'); this.preparationTextChangedAt = this.runtime.now();
         }
         this.partial = text; this.revision += 1;
@@ -547,32 +690,56 @@ export class DuplexSession {
       if (message.role === 'assistant') this.cancelWaitingPreparation('assistant_context_changed');
     }
     if (message.type === 'speech-update' && message.role === 'user') {
+      const before = this.playbackGateState();
       this.providerSpeaking = message.status === 'started';
       if (this.providerSpeaking && !this.muted) this.userStarted('provider_speech_event');
       else { this.maybeUserStopped(); this.queueWaitingPreparation(); }
+      this.transportDiagnostic('provider_user_speech_update', { status: message.status, before });
     }
     if (message.type === 'speech-update' && message.role === 'assistant') {
+      const before = this.playbackGateState();
+      let disposition = 'unsupported_status';
       if (message.status === 'started' && this.callerSpeaking && !this.localSpeaking && !this.providerSpeaking) this.endUserTurn();
       if (message.status === 'started' && !this.callerSpeaking) {
+        let prefix = this.preStartPcm;
+        if (prefix && !this.preStartPcmCurrent(prefix)) { this.cancelPreStartPcm('start_not_current'); prefix = null; }
+        if (prefix) { this.preStartPcm = null; this.runtime.clearTimeout(prefix.timer); }
         if (!this.generation) { this.generation = `playback-${++this.generationSequence}`; this.coordinator.beginGeneration(this.generation); }
         // Provider speech-start can precede usable TTS audio by seconds. Only
         // actual voiced PCM revokes waiting work. A validated complete cue may
         // finish first, behind one fixed handoff of at most1100ms.
         this.mainAllowed = true; this.emit('provider_main_announced');
+        this.assistantOutputFinished = false;
+        disposition = 'accepted';
         if (this.haveUserUtterance) this.generationAnnouncedAfterUser = true;
         if (this.provisional) {
           this.provisional.mainAllowed = true; this.provisional.generation = this.generation;
         }
+        if (prefix) {
+          this.transportDiagnostic('pre_start_pcm', { disposition: 'promoted',
+            held_ms: this.runtime.now() - prefix.startedAt, buffered_bytes: prefix.bytes });
+          for (const pcm of prefix.buffer) this.receive(pcm.buffer, { replayed: true });
+        }
       } else if (message.status === 'stopped') {
+        this.cancelEarlyMainStart('assistant_stopped'); this.assistantOutputFinished = true;
+        disposition = 'stopped';
         this.cancelWaitingPreparation('generation_finished');
         if (this.generationAnnouncedAfterUser) this.userTurnClosed = true;
         this.mainSpeaking = false;
         if (this.generation) this.coordinator.finishGeneration(this.generation);
         this.callbacks.status?.(this.callerSpeaking ? 'Listening' : 'Ready'); this.emit('main_stopped');
+      } else if (message.status === 'started') {
+        disposition = this.holdEarlyMainStart() ? 'held_for_ordinary_yield' : 'caller_gate_active';
+        this.assistantOutputFinished = false;
       }
+      this.transportDiagnostic('provider_assistant_speech_update', {
+        status: ['started', 'stopped'].includes(message.status) ? message.status : 'other', before, disposition });
     }
     if (message.type === 'user-interrupted') {
       this.userStarted('provider_interruption_event');
+      // This event is authoritative even when a caller-start already arrived.
+      // Neither ordinary-turn exception may survive an explicit interruption.
+      this.cancelEarlyMainStart('provider_interrupted'); this.ordinaryTurnDrained = false;
       this.mainAllowed = false; this.mainSpeaking = false; this.generation = null;
       this.coordinator.stopCue('provider_interrupted'); this.playback.stopMain();
     }
@@ -613,6 +780,7 @@ export class DuplexSession {
   setMuted(muted) {
     this.muted = Boolean(muted); this.microphone?.setMuted(this.muted);
     if (this.muted) {
+      this.cancelEarlyMainStart('muted'); this.ordinaryTurnDrained = false;
       this.cancelWaitingPreparation('muted');
       if (this.provisional) this.recoverProvisional('microphone_muted');
       this.coordinator?.invalidate('muted'); this.providerSpeaking = false; this.localSpeaking = false;
@@ -627,6 +795,8 @@ export class DuplexSession {
     return { input_frames: this.inputFrames, input_bytes: this.inputBytes,
       input_frames_during_cue: this.inputFramesDuringCue, input_frames_during_main: this.inputFramesDuringMain,
       received_output_bytes: this.audioBytes, discarded_output_bytes: this.discardedOutputBytes,
+      output_rejections: Object.fromEntries(Object.entries(this.outputRejections).map(([key, value]) => [key, { ...value }])),
+      transport_diagnostic_events: this.transportDiagnosticCount, transport_diagnostic_events_dropped: this.transportDiagnosticDropped,
       provisional_interruption: Boolean(this.provisional),
       local_energy_onsets_ignored_without_output: this.ignoredEnergyOnsets.no_output,
       local_energy_onsets_ignored_during_cached_cue: this.ignoredEnergyOnsets.cue_only,
@@ -687,6 +857,7 @@ export class DuplexSession {
     if (this.stopping) return this.stopping;
     if (this.closed) return;
     this.closed = true; this.active = false; this.runtime.clearTimeout(this.watchdog);
+    this.cancelEarlyMainStart('closed');
     this.cancelWaitingPreparation('closed');
     this.runtime.clearTimeout(this.pollTimer); this.runtime.clearTimeout(this.userStopTimer);
     if (this.provisional) {

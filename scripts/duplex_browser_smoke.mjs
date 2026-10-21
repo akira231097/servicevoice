@@ -498,6 +498,7 @@ try {
       await input.resume(); await window.duplexSession.start();
     }, { caller: pcm.toString('base64'), interruption: interruptPcm?.toString('base64') || null });
     report.calls_started = 1; report.external_requests = 'provider_requests_from_operator_backend';
+    report.timeline_origin_browser_ms = await page.evaluate(() => window.duplexSession.startAt);
     await until(async () => (await greetingState()).ready, 'greeting_not_completed', 15000);
     report.greeting = { ...(await greetingState()), quiet_guard_ms: 200, missing_stop_idle_fallback_ms: 1000 };
     report.caller_input = await page.evaluate(() => {
@@ -506,6 +507,8 @@ try {
       return { started_at_ms: caller.started_at_ms, input_end_ms: caller.started_at_ms + caller.seconds * 1000,
         duration_ms: caller.seconds * 1000 };
     });
+    report.conversation_turn_inputs = [{ id: 'initial', ...report.caller_input,
+      expected_waiting_when_slow: requireWaiting }];
     await delay(pcm.length / 32 + 500);
     if (interruptPcm) {
       await until(async () => (await replyState(report.caller_input, false)).ready,
@@ -578,6 +581,9 @@ try {
           const started = performance.now() - session.startAt; source.start();
           return { started_at_ms: started, input_end_ms: started + samples.length / 16, duration_ms: samples.length / 16 };
         }, turn.audio.toString('base64'));
+        // Keep the launched source timing even when its reply never arrives.
+        report.conversation_turn_inputs.push({ id: turn.id, ...input,
+          expected_waiting_when_slow: turn.expect_waiting });
         await delay(turn.audio.length / 32 + 400);
         await until(async () => (await replyState(input)).ready, 'conversation_reply_not_completed_' + turn.id, 35000);
         report.conversation_turns.push(await summarizeTurn(turn.id, input, turn.expect_waiting));
@@ -1603,9 +1609,13 @@ try {
     elapsed_ms: entry.finished_at_ms === undefined ? null : entry.finished_at_ms - entry.started_at_ms }));
   if (page) { try {
     const evidence = await page.evaluate(() => ({ events: window.duplexSession?.events || [],
-      metrics: window.duplexSession?.metrics(), graph: window.duplexGraphEvidence }));
+      metrics: window.duplexSession?.metrics(), graph: window.duplexGraphEvidence,
+      timeline_origin_browser_ms: window.duplexSession?.startAt }));
     report.events_at_failure = evidence.events;
-    if (live) { report.metrics = evidence.metrics; report.audio_graph = evidence.graph; }
+    if (live) {
+      report.metrics = evidence.metrics; report.audio_graph = evidence.graph;
+      if (Number.isFinite(evidence.timeline_origin_browser_ms)) report.timeline_origin_browser_ms = evidence.timeline_origin_browser_ms;
+    }
   } catch {} }
   await captureBackendCueEvidence();
   try { await saveLiveRecordings(); } catch { report.recording_failure = true; }

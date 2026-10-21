@@ -1,7 +1,7 @@
 # Hybrid Jev cue experiment
 
 This branch adds listening acknowledgments and short waiting holds to the existing
-STT → reasoner → TTS assistant. The isolated browser owns both cached cues and
+STT -> reasoner -> TTS assistant. The isolated browser owns both cached cues and
 main-response PCM on one output clock while caller audio keeps streaming. Jev
 classifies bounded transcript snapshots alongside the reasoner; it cannot book,
 confirm, change records, produce arbitrary speech or authorize an outcome.
@@ -25,9 +25,9 @@ not compete as semantic labels or split the eligibility probability.
 
 [TypeSafe confidence](https://docs.typesafe.ai/confidence) publishes the Choice
 normalization `(p_max - 1/n) / (1 - 1/n)`. It is derived from the probability,
-not independent corroboration. Main cue eligibility retains probability ≥0.98,
-margin ≥0.96, language probability ≥0.99 and the 350 ms provider deadline.
-Optional style selection requires both probability and reported confidence ≥0.90;
+not independent corroboration. Main cue eligibility retains probability >=0.98,
+margin >=0.96, language probability >=0.99 and the 350 ms provider deadline.
+Optional style selection requires both probability and reported confidence >=0.90;
 uncertain style falls back to a neutral phrase. These thresholds are unchanged.
 
 | ID | Exact cached text | Permitted meaning |
@@ -41,7 +41,8 @@ uncertain style falls back to a neutral phrase. These thresholds are unchanged.
 | `taking_a_look` | Let me take a look. | Prospective intent for a confidently classified information or scheduling question |
 | `working_on_it` | Working on it. | Only fresh, scoped, nonempty accepted work whose pending rows are all queued/running |
 
-The last two prospective phrases claim no completed lookup, booking or result.
+`Let me check that.` and `Let me take a look.` express intent; they claim no
+completed lookup, booking or result.
 Present-tense progress is never inferred from the classifier. Unknown work,
 ended/handoff state, active confirmation and protected readbacks remain silent.
 The public `accepted_work_pending` flag is only a scheduling hint; the cue API
@@ -70,7 +71,7 @@ The first waiting cue cannot play before 550 ms after confirmed yield or within
 classification and fresh authoritative state, chooses a different phrase and
 cannot play before 1,250 ms of post-cue silence. It starts selection after the
 first cue has completed and the phase cooldown/request cadence permit. It has no
-third attempt or preparation reuse. A fast main reply cancels future cue work.
+third waiting cue or preparation reuse. A fast main reply cancels future cue work.
 
 At most two nonplaying preparations per utterance can classify a stable exact
 waiting snapshot. Preparation returns silence and reserves no audio slot. Only a
@@ -133,8 +134,12 @@ API/session tests but was not selected in this bounded model sample. Simulated
 pending work does not prove that a remote operation actually ran. These are
 retained development outcomes, not calibrated production accuracy.
 
-The reviewed local audio bank contains eight approved duplex clips, all at most
-1,080 ms. Format/hash checks and a separate model listening advisory found complete,
+The reviewed bank contains eight approved duplex clips, all at most
+1,080 ms. The server manifest also retains the unchanged legacy `I hear you.`
+asset required by gateway startup: nine cached assets, eight advertised duplex
+choices. A cache-only eight-asset load can pass while gateway startup fails;
+acceptance must exercise actual gateway startup against the deployment bank.
+Format/hash checks and a separate model listening advisory found complete,
 clear phrases. This does not replace human listening or new end-to-end playback.
 421 focused Python checks passed for the policy/API/gateway/lifecycle/console and
 unchanged legacy policy before later integration checks. Exact final commit,
@@ -151,7 +156,7 @@ post-hoc fast-answer criterion.
 New acceptance must bind exact source, manifest, raw receipt and recorded PCM.
 Measure caller source end, confirmed yield, cue voice start/end, packet readiness,
 actual useful main voice and post-cue silence separately. Verify complete cue
-endings or explicit caller cancellation, the fixed ≤1,100 ms main handoff, no
+endings or explicit caller cancellation, the fixed <=1,100 ms main handoff, no
 assistant overlap, bounded follow-up frequency and no booking mutation in safe
 FAQ/intake tests. A short sound is not a useful answer. Repeated tests must include
 ordinary corrections, short turns, long speech, language changes and fast-main races.
@@ -164,8 +169,16 @@ owned duplex session. It prewarms one inner isolated call, binds it to the verif
 outer call and owns one paced output queue. This implementation does not change a
 saved number or assistant. See [phone bridge scope and runbook](../integrations/phone-bridge/README.md).
 
-Local HTTP/TCP/media tests and a network-isolated lab can validate code paths and
-digital geometry. They do not establish that the managed carrier forwards to the
+The fifth network-isolated phone lab passed with the actual Node admission,
+AudioSocket and PCM classes, Asterisk and a synthetic injected AI session. It
+preserved all 48,000 caller PCM bytes and the complete 670 ms cue followed by
+1,000 ms of main output against the exact G.711 reference. With no zero RTP
+packets after carrier speech, its owned input clock still released local speech
+about 259 ms after the final carrier packet and advanced the encoder tail. Both
+owned synthetic legs drained, and existing containers remained unchanged.
+
+This network-none digital test made no provider or human calls. It does not
+establish that the managed carrier forwards to the
 chosen endpoint, negotiates the required TLS/SRTP, preserves real caller audio or
 stops downstream phone audio within the local cancellation bound. Live phone
 validation, both-leg ended readback, representative acoustic listening and

@@ -54,8 +54,7 @@ has a one-second cooldown across utterances,
 with at most four reservations and 64 classification attempts in a rolling
 15-second window, plus eight classification attempts per caller utterance.
 Accepted reservations are not refunded after uncertain delivery or cancellation.
-A waiting
-cue starts no earlier than 550 ms after confirmed caller yield and at least
+A waiting cue starts no earlier than 550 ms after confirmed caller yield and at least
 300 ms after the previous clip ends. After any active listening clip finishes,
 selection starts in parallel with the remaining playback guard; an early result
 retains its original expiry while it waits. Selection does not consume that
@@ -132,6 +131,9 @@ assistant. Other assistants and calls keep the existing behavior.
 The existing candidate console must be reachable through its loopback SSH
 forward at `http://127.0.0.1:8775`. Use the existing private credential file and
 reviewed immutable local audio manifest; never paste credentials into a command.
+The shared server bank includes the legacy gateway startup asset `I hear you.`
+beside the eight duplex clips. The duplex config advertises eight choices and
+excludes that compatibility clip.
 
 ```powershell
 python scripts/serve_duplex.py --env-file PRIVATE_ENV_FILE --candidate-id ISOLATED_ASSISTANT_ID --audio-manifest PRIVATE_MANIFEST_PATH
@@ -237,7 +239,7 @@ threshold. This does not establish reliable cue coverage in real conversations.
 
 The first six-turn synthetic recovery call retained a failed coverage verdict:
 three waiting and three listening clips played in full, but three ordinary
-turns had no waiting clip despite 2.67â€“6.49-second source-end-to-main gaps.
+turns had no waiting clip despite 2.67-6.49-second source-end-to-main gaps.
 The recorded PCM matched all six approved cached clips and showed zero
 cue/main overlap. Exact new dispositions identified a canceled listening
 request reaching backend pacing late, a waiting decision expiring behind a
@@ -256,8 +258,12 @@ This implementation is a browser candidate. The main telephone route has not
 been switched. An opt-in owned phone media bridge is now implemented under
 `integrations/phone-bridge`, with private AudioSocket transport and exact owned
 call admission/cleanup. It still needs live carrier, encryption, interruption
-and telephone acoustic acceptance; the browser results do not provide that evidence. Promotion requires representative audio
-comparison, not just a fast first sound or a green unit test.
+and telephone acoustic acceptance. The fifth network-none phone lab passed
+exact caller PCM, complete cue/main codec output, DTX speech release and owned
+cleanup with an injected synthetic AI session. It made no provider calls.
+Browser and loopback results do not establish managed-carrier behavior.
+Promotion requires representative audio comparison and the existing production
+admission, capacity and booking boundaries.
 
 ### Partial waiting preparation
 
@@ -278,8 +284,8 @@ maximum of 4.95 seconds. One listening and one waiting cue were recorded. The
 waiting cue began 0.56 seconds after final browser yield; another 2.41 seconds
 elapsed between its end event and main audio. These browser events establish
 remaining coverage and continuity problems, not sample-level acoustic quality.
-The classifier itself took 108â€“227 ms, while whole selection requests took
-287â€“586 ms. Silence, uncertain content and language decisions caused most misses;
+The classifier itself took 108-227 ms, while whole selection requests took
+287-586 ms. Silence, uncertain content and language decisions caused most misses;
 no main-arrival cancellation or cooldown rejection was recorded in that call.
 
 A frozen 24-case synthetic comparison tested a narrow clarification that an

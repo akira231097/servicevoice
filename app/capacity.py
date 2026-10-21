@@ -74,6 +74,13 @@ class LiveAdmission:
 
     def count(self,db):
         moment=self.clock()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_bridge_admissions'").fetchone():
+            # A paid allocation whose outcome is unknown cannot age out as an
+            # ordinary unbound browser reservation, even after local closure.
+            return db.execute("""SELECT COUNT(*) FROM sessions s WHERE s.tenant=? AND s.mode='live' AND (
+                (s.ended=0 AND s.created>? AND (s.provider_call_id IS NOT NULL OR s.created>?)) OR
+                EXISTS (SELECT 1 FROM phone_bridge_admissions b WHERE b.session_id=s.id AND b.tenant=s.tenant AND b.closed IS NULL))""",
+                (TENANT,moment-self.config.session_ttl_seconds,moment-self.config.unbound_session_seconds)).fetchone()[0]
         return db.execute("""SELECT COUNT(*) FROM sessions WHERE tenant=? AND mode='live' AND ended=0
             AND created>? AND (provider_call_id IS NOT NULL OR created>?)""",
             (TENANT,moment-self.config.session_ttl_seconds,moment-self.config.unbound_session_seconds)).fetchone()[0]

@@ -86,6 +86,213 @@ function message(session, body) { session.receive(JSON.stringify(body)); }
 function speech(session, role, status) { message(session, { type: 'speech-update', role, status }); }
 function transcript(session, text, final = false) { message(session, { type: 'transcript', role: 'user', transcript: text, transcriptType: final ? 'final' : 'partial' }); }
 
+async function ordinaryCompletedGreeting(f) {
+  await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm(900).buffer);
+  speech(f.session, 'assistant', 'stopped');
+  // Production playback uses an active-node Set. This fixture keeps a history
+  // array for assertions and explicitly supplies the observed drained count.
+  f.output.main.size = 0;
+  speech(f.session, 'user', 'started'); transcript(f.session, 'What services are available?', true);
+  assert.equal(f.session.ordinaryTurnDrained, true);
+}
+
+async function ordinaryYieldedTurn(f) {
+  await ordinaryCompletedGreeting(f); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(f.session.callerSpeaking, false); assert.equal(f.session.mainAllowed, false);
+}
+
+test('ordinary voiced1600-byte packet0.1ms before speech-start is copied and delivered exactly once', async () => {
+  const f = fixture(); await ordinaryYieldedTurn(f);
+  const first = new Uint8Array(1600); const view = new DataView(first.buffer);
+  for (let i = 0; i < 800; i++) view.setInt16(i * 2, 1800 + i, true);
+  const expected = first.slice(); f.session.receive(first.buffer); first.fill(0);
+  assert.equal(f.output.main.length, 1); assert.equal(f.session.mainAllowed, false);
+  await f.time.advance(.1); speech(f.session, 'assistant', 'started');
+  assert.equal(f.session.preStartPcm, null); assert.equal(f.output.main.length, 2);
+  assert.deepEqual(f.output.main[1].pcm, expected);
+  speech(f.session, 'assistant', 'started'); assert.equal(f.output.main.length, 2);
+  f.session.receive(pcm(2400).buffer); assert.equal(f.output.main.length, 3);
+  assert.equal(f.session.metrics().received_output_bytes, 2880); assert.equal(f.session.metrics().discarded_output_bytes, 0);
+  const proof = f.events.find(row => row.kind === 'pre_start_pcm' && row.disposition === 'promoted');
+  assert.ok(Math.abs(proof.held_ms - .1) < .0001); assert.equal(proof.buffered_bytes, 1600); await f.session.stop();
+});
+
+for (const scenario of ['deadline', 'revision', 'new_local_voice', 'new_provider_voice', 'sensitive_epoch', 'muted', 'closed', 'assistant_stopped', 'buffer_limit']) {
+  test(`pre-start PCM quarantine is revoked by ${scenario} without replaying its prefix`, async () => {
+    const f = fixture(); await ordinaryYieldedTurn(f); f.session.receive(pcm(2200).buffer);
+    assert.ok(f.session.preStartPcm);
+    if (scenario === 'deadline') await f.time.advance(350);
+    else if (scenario === 'revision') transcript(f.session, 'What tire services are available?', true);
+    else if (scenario === 'new_local_voice') f.session.onLocalSpeech(true);
+    else if (scenario === 'new_provider_voice') speech(f.session, 'user', 'started');
+    else if (scenario === 'sensitive_epoch') f.session.coordinator.setSensitive(true);
+    else if (scenario === 'muted') f.session.setMuted(true);
+    else if (scenario === 'closed') await f.session.stop();
+    else if (scenario === 'assistant_stopped') speech(f.session, 'assistant', 'stopped');
+    else { for (let count = 0; count < 17; count++) f.session.receive(pcm(2200).buffer); }
+    assert.equal(f.session.preStartPcm, null); assert.equal(f.output.main.length, 1);
+    speech(f.session, 'assistant', 'started'); assert.equal(f.output.main.length, 1);
+    assert.ok(f.session.metrics().discarded_output_bytes >= 640); await f.session.stop();
+  });
+}
+
+test('additional quarantined packets cannot extend the first packet deadline or reopen it after expiry', async () => {
+  const f = fixture(); await ordinaryYieldedTurn(f); f.session.receive(pcm(2200).buffer);
+  const state = f.session.preStartPcm; await f.time.advance(300); f.session.receive(pcm(2300).buffer);
+  assert.equal(f.session.preStartPcm, state); await f.time.advance(50); assert.equal(f.session.preStartPcm, null);
+  f.session.receive(pcm(2400).buffer); assert.equal(f.session.preStartPcm, null);
+  speech(f.session, 'assistant', 'started'); assert.equal(f.output.main.length, 1); await f.session.stop();
+});
+
+test('post-barge-in PCM stays discarded even when a fresh assistant start arrives0.1ms later', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm(900).buffer);
+  f.output.main.size = 1; speech(f.session, 'user', 'started'); transcript(f.session, 'Actually a tire rotation instead', true);
+  speech(f.session, 'assistant', 'stopped'); f.output.main.size = 0;
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); f.session.receive(pcm(2200).buffer);
+  assert.equal(f.session.preStartPcm, null); await f.time.advance(.1); speech(f.session, 'assistant', 'started');
+  assert.equal(f.output.main.length, 1); f.session.receive(pcm(2300).buffer); assert.equal(f.output.main.length, 2);
+  assert.equal(f.session.metrics().discarded_output_bytes, 640); await f.session.stop();
+});
+
+test('delayed explicit interruption revokes ordinary eligibility even after caller-start was already handled', async () => {
+  const f = fixture(); await ordinaryCompletedGreeting(f);
+  assert.equal(f.session.callerSpeaking, true); assert.equal(f.session.ordinaryTurnDrained, true);
+  message(f.session, { type: 'user-interrupted' });
+  assert.equal(f.session.ordinaryTurnDrained, false);
+  speech(f.session, 'assistant', 'started'); f.session.receive(pcm(2200).buffer);
+  assert.equal(f.session.earlyMainStart, null);
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); f.session.receive(pcm(2300).buffer);
+  assert.equal(f.session.preStartPcm, null); assert.equal(f.output.main.length, 1);
+  speech(f.session, 'assistant', 'started'); assert.equal(f.output.main.length, 1);
+  f.session.receive(pcm(2400).buffer); assert.equal(f.output.main.length, 2); await f.session.stop();
+});
+
+test('no final or undrained prior reply can quarantine otherwise unannounced main audio', async () => {
+  for (const scenario of ['no_final', 'undrained']) {
+    const f = fixture(); await ordinaryYieldedTurn(f);
+    if (scenario === 'no_final') f.session.lastUserTranscriptFinal = false;
+    else f.output.main.size = 1;
+    f.session.receive(pcm(2200).buffer); assert.equal(f.session.preStartPcm, null);
+    speech(f.session, 'assistant', 'started'); assert.equal(f.output.main.length, 1); await f.session.stop();
+  }
+});
+
+test('ordinary FAQ start12ms before provider stop preserves every early PCM sample after safe yield', async () => {
+  const f = fixture(); await ordinaryCompletedGreeting(f);
+  speech(f.session, 'assistant', 'started'); await f.time.advance(5);
+  const early = pcm(2200); f.session.receive(early.buffer);
+  assert.equal(f.output.main.length, 1, 'New answer cannot sound while caller gate is active');
+  await f.time.advance(7); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(f.session.earlyMainStart, null); assert.equal(f.session.mainAllowed, true);
+  assert.equal(f.output.main.length, 2); assert.deepEqual(f.output.main[1].pcm, early);
+  assert.equal(f.session.metrics().received_output_bytes, 1280); assert.equal(f.session.metrics().discarded_output_bytes, 0);
+  const promoted = f.events.find(row => row.kind === 'early_main_start' && row.disposition === 'promoted');
+  assert.equal(promoted.held_ms, 172); assert.equal(promoted.buffered_bytes, 640);
+  await f.session.stop();
+});
+
+test('ordinary early announcement without early PCM enables only future audio after both gates yield', async () => {
+  const f = fixture(); await ordinaryCompletedGreeting(f); f.session.onLocalSpeech(true);
+  speech(f.session, 'assistant', 'started'); speech(f.session, 'user', 'stopped'); await f.time.advance(20);
+  assert.equal(f.session.callerSpeaking, true); assert.equal(f.session.mainAllowed, false);
+  f.session.onLocalSpeech(false); await f.time.advance(160); f.session.receive(pcm(2200).buffer);
+  assert.equal(f.output.main.length, 2); assert.equal(f.session.metrics().discarded_output_bytes, 0); await f.session.stop();
+});
+
+for (const scenario of ['deadline', 'revision', 'new_local_voice', 'new_provider_voice', 'sensitive_epoch', 'muted', 'closed', 'assistant_stopped', 'buffer_limit']) {
+  test(`ordinary early-start hold is revoked by ${scenario} and cannot replay its prefix`, async () => {
+    const f = fixture(); await ordinaryCompletedGreeting(f); speech(f.session, 'assistant', 'started');
+    f.session.receive(pcm(2200).buffer);
+    if (scenario === 'deadline') await f.time.advance(350);
+    else if (scenario === 'revision') transcript(f.session, 'What tire services are available?', true);
+    else if (scenario === 'new_local_voice') f.session.onLocalSpeech(true);
+    else if (scenario === 'new_provider_voice') speech(f.session, 'user', 'started');
+    else if (scenario === 'sensitive_epoch') f.session.coordinator.setSensitive(true);
+    else if (scenario === 'muted') f.session.setMuted(true);
+    else if (scenario === 'closed') await f.session.stop();
+    else if (scenario === 'assistant_stopped') speech(f.session, 'assistant', 'stopped');
+    else { for (let count = 0; count < 17; count++) f.session.receive(pcm(2200).buffer); }
+    assert.equal(f.session.earlyMainStart, null); assert.equal(f.output.main.length, 1);
+    if (!f.session.closed && !f.session.muted) {
+      speech(f.session, 'user', 'stopped'); f.session.onLocalSpeech(false); await f.time.advance(160);
+      f.session.receive(pcm(2300).buffer); assert.equal(f.output.main.length, 1);
+    }
+    assert.ok(f.session.metrics().discarded_output_bytes >= 640); await f.session.stop();
+  });
+}
+
+test('duplicate early announcements cannot extend the original350ms ownership deadline', async () => {
+  const f = fixture(); await ordinaryCompletedGreeting(f); speech(f.session, 'assistant', 'started');
+  const state = f.session.earlyMainStart; await f.time.advance(300); speech(f.session, 'assistant', 'started');
+  assert.equal(f.session.earlyMainStart, state); await f.time.advance(50); assert.equal(f.session.earlyMainStart, null);
+  speech(f.session, 'assistant', 'started'); assert.equal(f.session.earlyMainStart, null); await f.session.stop();
+});
+
+test('a barge-in keeps the fresh-start fence and cannot latch a stale interrupted announcement', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started');
+  f.session.receive(pcm(900).buffer); f.output.main.size = 1;
+  speech(f.session, 'user', 'started'); transcript(f.session, 'Actually change the service', true);
+  speech(f.session, 'assistant', 'stopped'); f.output.main.size = 0;
+  speech(f.session, 'assistant', 'started'); f.session.receive(pcm(2200).buffer);
+  assert.equal(f.session.ordinaryTurnDrained, false); assert.equal(f.session.earlyMainStart, null);
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); f.session.receive(pcm(2300).buffer);
+  assert.equal(f.output.main.length, 1); assert.equal(f.session.mainAllowed, false); await f.session.stop();
+});
+
+test('a caller continuation after yield cannot inherit ordinary-turn early-start eligibility', async () => {
+  const f = fixture(); await ordinaryCompletedGreeting(f);
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); speech(f.session, 'user', 'started');
+  transcript(f.session, 'And what are your opening hours?', true); speech(f.session, 'assistant', 'started');
+  assert.equal(f.session.ordinaryTurnDrained, false); assert.equal(f.session.earlyMainStart, null); await f.session.stop();
+});
+
+test('diagnostics expose assistant start before caller release without authorizing unbound PCM', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  f.session.onLocalSpeech(true); transcript(f.session, 'What services are available?', true);
+  speech(f.session, 'assistant', 'started');
+  const announced = f.events.findLast(row => row.kind === 'provider_assistant_speech_update');
+  assert.equal(announced.disposition, 'caller_gate_active');
+  assert.equal(announced.before.caller_speaking, true); assert.equal(announced.before.local_speaking, true);
+  assert.equal(announced.before.provider_speaking, true); assert.equal(f.session.mainAllowed, false);
+  speech(f.session, 'user', 'stopped'); f.session.onLocalSpeech(false); await f.time.advance(160);
+  f.session.receive(pcm(2000).buffer);
+  assert.equal(f.output.main.length, 0, 'Diagnostics must not loosen the missing fresh-announcement guard');
+  const rejected = f.events.findLast(row => row.kind === 'main_pcm_rejected');
+  assert.equal(rejected.reason, 'awaiting_fresh_speech_start'); assert.equal(rejected.voiced, true);
+  assert.equal(rejected.caller_speaking, false); assert.equal(rejected.main_allowed, false);
+  assert.ok(rejected.generation_sequence > announced.generation_sequence);
+  assert.equal(f.session.metrics().output_rejections.awaiting_fresh_speech_start.bytes, 640);
+  await f.session.stop();
+});
+
+test('diagnostics retain successful announcement ordering and never include raw provider content', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  message(f.session, { type: 'speech-update', role: 'assistant', status: 'started', transcript: 'PRIVATE_PROVIDER_FIXTURE',
+    callId: 'PRIVATE_CALL_FIXTURE', metadata: { token: 'PRIVATE_TOKEN_FIXTURE' } });
+  f.session.receive(pcm(2000).buffer);
+  const row = f.events.findLast(event => event.kind === 'provider_assistant_speech_update');
+  assert.equal(row.disposition, 'accepted'); assert.equal(row.before.caller_speaking, false);
+  assert.equal(row.main_allowed, true); assert.equal(f.output.main.length, 1);
+  assert.equal(JSON.stringify(f.events).includes('PRIVATE_'), false);
+  await f.session.stop();
+});
+
+test('speech telemetry and PCM rejection records are bounded while aggregate byte counts remain exact', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  for (let index = 0; index < 500; index++) {
+    message(f.session, { type: 'speech-update', role: 'assistant', status: 'PRIVATE_UNSUPPORTED_STATUS' });
+    f.session.receive(pcm(2000).buffer);
+  }
+  assert.equal(f.events.filter(row => row.kind === 'provider_assistant_speech_update').length, 256);
+  assert.ok(f.events.filter(row => row.kind === 'main_pcm_rejected').length <= 64);
+  assert.equal(f.session.metrics().output_rejections.caller_speaking.packets, 500);
+  assert.equal(f.session.metrics().output_rejections.caller_speaking.bytes, 500 * 640);
+  assert.ok(f.session.metrics().transport_diagnostic_events_dropped > 0);
+  assert.equal(JSON.stringify(f.events).includes('PRIVATE_'), false);
+  await f.session.stop();
+});
+
 test('exact full short partial is prepared without audio and activated only after fresh confirmed yield', async () => {
   const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
   transcript(f.session, 'Alex Morgan'); await f.time.advance(249);
