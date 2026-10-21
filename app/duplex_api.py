@@ -24,9 +24,11 @@ from starlette.concurrency import run_in_threadpool
 
 from .backchannel_audio import BackchannelAudioCache
 from .backchannel_catalog import PHRASES
-from .duplex_cues import PREPARATION_MAX_AGE_MS, DuplexCueDecision, DuplexCuePolicy, DuplexCueSession, cue_state
+from .duplex_cues import (PREPARATION_MAX_AGE_MS, WAITING_PHRASE_IDS, DuplexCueDecision,
+    DuplexCuePolicy, DuplexCueSession, cue_state)
 
 REQUEST_MAX_AGE_MS = 800
+MAX_DUPLEX_CUE_MS = 1100
 DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "invalid_phase",
     "unverified_or_sensitive_context", "main_speaking", "conditional_utterance", "sensitive_utterance",
     "private_contact_detail", "invalid_context", "turn_not_allowed", "sensitive_context", "invalid_messages",
@@ -38,12 +40,15 @@ DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "in
     "invalid_revision", "stale_revision", "phase_already_acknowledged", "call_budget", "cooldown",
     "cue_spacing", "classification_budget", "utterance_classification_budget", "classification_throttled",
     "superseded", "phase_mismatch", "decision_expired", "scheduler_changed", "request_expired",
-    "waiting_prepared", "request_disconnected", "utterance_preparation_budget"})
-EVENT_REASONS = DECISION_REASONS | frozenset({"classifier_deadline", "classifier_unavailable",
+    "waiting_prepared", "request_disconnected", "utterance_preparation_budget", "followup_without_initial", "no_fresh_phrase"})
+OUTPUT_FAILURE_REASONS = frozenset({"output_queue_bound", "output_geometry", "output_context_unavailable",
+    "output_handoff_bound", "output_playback_failed"})
+EVENT_REASONS = DECISION_REASONS | OUTPUT_FAILURE_REASONS | frozenset({"classifier_deadline", "classifier_unavailable",
     "selection_phase_mismatch", "selection_confidence", "selection_language", "selection_expired_on_arrival",
     "selection_expired_before_playback", "clip_unavailable", "caller_resumed", "caller_started", "partial_revised",
     "final_revised", "caller_stopped", "generation_started", "generation_finished", "sensitive_state_changed",
-    "main_audio_ready", "main_announced", "call_ended", "provisional_barge_in", "muted", "sensitive_state", "listening_context"})
+    "main_audio_ready", "main_announced", "call_ended", "provisional_barge_in", "muted", "sensitive_state", "listening_context",
+    "selection_repeated_phrase", "follow_up_budget_deadline"})
 
 
 class CueRequest(BaseModel):
@@ -54,6 +59,7 @@ class CueRequest(BaseModel):
     phase: str = Field(pattern="^(listening|waiting)$")
     prepare_only: bool = Field(default=False, strict=True)
     prepared_revision: int | None = Field(default=None, ge=1, le=100000, strict=True)
+    follow_up: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def waiting_preparation_only(self):
@@ -61,6 +67,8 @@ class CueRequest(BaseModel):
             raise ValueError("Only a waiting cue supports nonplaying preparation.")
         if self.prepare_only and self.prepared_revision is not None:
             raise ValueError("A preparation receipt can only activate a completed preparation.")
+        if self.follow_up and (self.phase != "waiting" or self.prepare_only or self.prepared_revision is not None):
+            raise ValueError("A follow-up requires a fresh waiting activation, never a preparation receipt.")
         return self
 
 
@@ -69,7 +77,7 @@ class PlaybackEvent(BaseModel):
     event: str = Field(pattern="^[a-z_]{1,60}$")
     epoch: int = Field(ge=0, le=10000, strict=True)
     at_ms: float = Field(ge=0, le=360000, allow_inf_nan=False)
-    phrase_id: str | None = Field(default=None, pattern="^(neutral_ack|moment|silence)$")
+    phrase_id: str | None = Field(default=None, pattern="^(?:neutral_ack|silence|" + "|".join(WAITING_PHRASE_IDS) + ")$")
     phase: str | None = Field(default=None, pattern="^(listening|waiting)$")
     reason: str | None = Field(default=None, pattern="^(?:" + "|".join(sorted(EVENT_REASONS)) + ")$")
     blocked: bool | None = Field(default=None, strict=True)
@@ -77,6 +85,9 @@ class PlaybackEvent(BaseModel):
 
     @model_validator(mode="after")
     def bounded_pacing_retry(self):
+        if self.event == "playback_failed" or self.reason in OUTPUT_FAILURE_REASONS:
+            if self.event != "playback_failed" or self.reason not in OUTPUT_FAILURE_REASONS:
+                raise ValueError("Only a fixed output-failure code may describe playback failure.")
         if self.event == "cue_retry_scheduled" or self.retry_after_ms is not None:
             if (self.event != "cue_retry_scheduled" or self.phase != "waiting"
                     or self.reason not in ("classification_throttled", "cue_spacing")
@@ -87,11 +98,15 @@ class PlaybackEvent(BaseModel):
 
 def cue_context(snapshot):
     """Authoritative scheduler flags; partial words cannot authorize an action."""
+    pending = snapshot.get("pending_operations")
+    accepted_work = (isinstance(pending, list) and bool(pending)
+                     and all(isinstance(row, dict) and row.get("status") in {"queued", "running"} for row in pending))
     return {
         "stage": snapshot.get("stage"),
         "active_confirmation": snapshot.get("stage") == "confirmation",
         "has_pending_proposal": bool(snapshot.get("proposal")),
         "has_pending_operation": bool(snapshot.get("pending_operations")),
+        "accepted_work_pending": accepted_work,
         "ended": snapshot.get("ended") is not False,
     }
 
@@ -144,9 +159,12 @@ class DuplexControl:
             if sid not in self.sessions:
                 if len(self.sessions) >= 64:
                     raise HTTPException(429, "Duplex session capacity reached.")
-                self.sessions[sid] = DuplexCueSession(self.policy, clock=self.clock)
+                waiting = tuple(phrase for phrase in WAITING_PHRASE_IDS if self.audio is not None and phrase in self.audio) or ("moment",)
+                self.sessions[sid] = DuplexCueSession(self.policy, clock=self.clock, waiting_phrase_ids=waiting)
                 self.events[sid] = []
                 self.decisions[sid] = deque(maxlen=256)
+            if self.audio is not None:
+                self.sessions[sid].waiting_phrase_ids = tuple(phrase for phrase in WAITING_PHRASE_IDS if phrase in self.audio)
             return self.sessions[sid]
 
     def reserve_call(self, sid):
@@ -172,8 +190,10 @@ class DuplexControl:
             try:
                 data = cache.load_manifest(manifest)
                 assets = {asset["phrase_id"]: (cache.read_pcm(asset), asset) for asset in data["assets"]
-                          if asset["phrase_id"] in ("neutral_ack", "moment")}
-                if set(assets) != {"neutral_ack", "moment"}:
+                          if asset["phrase_id"] in ("neutral_ack", *WAITING_PHRASE_IDS)
+                          and type(asset.get("duration_ms")) in (int, float)
+                          and 0 < asset["duration_ms"] <= MAX_DUPLEX_CUE_MS}
+                if not {"neutral_ack", "moment"}.issubset(assets):
                     raise ValueError("incomplete_bank")
             except (OSError, ValueError):
                 raise HTTPException(503, "The approved cue audio bank failed validation.") from None
@@ -198,9 +218,11 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
     @app.get("/api/sessions/{sid}/duplex/audio/{phrase}")
     async def audio(sid: str, phrase: str, x_session_token: str = Header(default="")):
         await control.authenticated(sid, x_session_token)
-        if phrase not in ("neutral_ack", "moment"):
+        if phrase not in ("neutral_ack", *WAITING_PHRASE_IDS):
             raise HTTPException(404)
         assets = await run_in_threadpool(control.assets)
+        if phrase not in assets:
+            raise HTTPException(404)
         return Response(assets[phrase][0], media_type="application/octet-stream",
                         headers={"Cache-Control": "no-store", "X-Audio-Sample-Rate": "16000"})
 
@@ -290,6 +312,8 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
     async def cue(sid: str, body: CueRequest, request: Request, x_session_token: str = Header(default="")):
         received_at = control.clock()
         row = await control.authenticated(sid, x_session_token)
+        if control.audio is None:
+            await run_in_threadpool(control.assets)
         session = await control.session(sid)
         # The private console uses one fresh authenticated-snapshot callback for
         # both roles. Reuse that exact read only when callable identity proves
@@ -309,7 +333,7 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
                 decision = await session.choose(epoch=body.epoch, revision=body.revision, text=body.text,
                     phase=body.phase, key=control.config().get("TYPESAFE_API_KEY"), context=context,
                     previous_assistant=previous, prepare_only=body.prepare_only,
-                    prepared_revision=body.prepared_revision)
+                    prepared_revision=body.prepared_revision, follow_up=body.follow_up)
             selected_version = session.version
             selected_at = control.clock()
             after = await run_in_threadpool(control.snapshot, sid, x_session_token)
@@ -392,6 +416,10 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
             "expires_in_ms": result["expires_in_ms"], "max_request_age_ms": REQUEST_MAX_AGE_MS,
             "retry_after_ms": result.get("retry_after_ms"),
             "prepare_only": body.prepare_only, "prepared": result["prepared"],
+            "follow_up": body.follow_up,
+            "content_kind": result.get("content_kind"),
+            "content_kind_probability": statistic(result.get("content_kind_probability")),
+            "content_kind_confidence": statistic(result.get("content_kind_confidence")),
             "prepared_reused": result["prepared_reused"],
             "prepared_expires_in_ms": result["prepared_expires_in_ms"],
             "prepared_age_ms": result["prepared_age_ms"],
@@ -403,7 +431,7 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
     async def event(sid: str, body: PlaybackEvent, x_session_token: str = Header(default="")):
         await control.authenticated(sid, x_session_token)
         session = await control.session(sid)
-        if body.event in ("barge_in", "main_started", "ended", "muted"):
+        if body.event in ("barge_in", "main_started", "ended", "muted", "playback_failed"):
             session.invalidate(reason=body.event)
         rows = control.events[sid]
         if len(rows) >= 1000:

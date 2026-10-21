@@ -1,15 +1,26 @@
 // Isolated browser transport: continuous caller PCM, one owned output clock.
-import { DuplexCoordinator, PcmPlayback } from './duplex-coordinator.js';
+import { CUE_PHRASES, DuplexCoordinator, PcmPlayback } from './duplex-coordinator.js';
 import { DuplexMicrophone } from './duplex-microphone.js';
 
 const routineService = /\boil\s+changes?\b|\bchange\s+(?:(?:the|my|engine)\s+)?oil\b|\bwait(?:ing)?\s+times?\b/gi;
 const symptomNegation = /\bno\s+(?:power|heat|cooling)\b|\b(?:car|vehicle|engine|motor|starter|truck|van|suv)\s+(?:(?:is|has|gets)\s+(?:no|not)\s+(?:power|heat|cooling|starting|working)|(?:do(?:es)?\s+not|don['’]?t|doesn['’]?t|cannot|can['’]?t|won['’]?t|will\s+not)\s+(?:start|run|work|turn\s+over))\b/gi;
 const vehicleContext = /\b(?:car|vehicle|model|year|engine|truck|van|suv|sedan|hatchback|coupe|toyota|honda|ford|chevrolet|chevy|nissan|hyundai|kia|bmw|audi|tesla|subaru|mazda|mercedes|volkswagen|volvo|lexus|jeep|gmc|dodge|ram|buick|cadillac|acura|infiniti|mitsubishi|porsche|mini)\b/i;
-const sensitive = text => {
+const listeningSensitive = text => {
   const gate = text.replace(routineService, 'routine service').replace(symptomNegation, 'vehicle symptom');
   const numbers = vehicleContext.test(text) ? text.replace(/\b(?:19|20)\d{2}\b/g, 'vehicle year') : text;
   return /\b(?:stop|wait|actually|instead|correct|change|cancel|confirm|yes|no|not|never|unless|only\s+if|do\s+not|don['’]t|can['’]t|cannot|won['’]t|goodbye|bye|emergency|urgent|ignore|instructions?|password|passcode|pin|card|social security)\b/i.test(gate)
     || /\d{4,}/.test(numbers) || /@|(?:\d[\s().+-]*){7,}|[^\x00-\x7f]/.test(text)
+    || /\b(?:speak|reply|respond|answer|talk)\b.{0,35}\b(?:in|using)\s+[a-z]+/i.test(text);
+};
+const correction = text => /\b(?:actually|instead|correct|change|no|not)\b/i.test(text.replace(routineService, 'routine service').replace(symptomNegation, 'vehicle symptom'));
+const sensitive = text => {
+  const gate = text.replace(routineService, 'routine service').replace(symptomNegation, 'vehicle symptom');
+  const numbers = vehicleContext.test(text) ? text.replace(/\b(?:19|20)\d{2}\b/g, 'vehicle year') : text;
+  return /^(?:yes|yep|yeah|no|nope|not yet|ok(?:ay)?|sure|go ahead|sounds good|that['’]?s fine|fine|right|absolutely)[.!?\s]*$/i.test(text.trim())
+    || /\b(?:yes|yep|yeah|approve|approved|confirm|confirmation|cancel|stop|wait|goodbye|bye|hang up|hangup|disconnect|finished|that['’]?s all|don['’]?t|do not|never|unless|only\s+if|can['’]t|cannot|won['’]t|emergency|urgent|ignore|instructions?|password|passcode|pin|card|social security)\b/i.test(gate)
+    || /\d{4,}/.test(numbers) || /@|(?:\d[\s().+-]*){7,}|[^\x00-\x7f]/.test(text)
+    || /\b(?:my (?:phone|mobile|email|e-mail|address)|account number)\b/i.test(text)
+    || /\b\d+\s+[a-z]+(?:\s+[a-z]+){0,3}\s+(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|boulevard|blvd)\b/i.test(text)
     || /\b(?:speak|reply|respond|answer|talk)\b.{0,35}\b(?:in|using)\s+[a-z]+/i.test(text);
 };
 const bytes = value => new Uint8Array(value);
@@ -42,7 +53,7 @@ export class DuplexSession {
     this.answerGaps = []; this.inputBytes = 0; this.evidenceRequests = new Set();
     this.endedSession = false; this.providerStop = null; this.stopping = null; this.handshakeCancel = null;
     this.lastProviderUserTurn = null;
-    this.snapshotHardBlocked = false; this.snapshotReadSequence = 0;
+    this.snapshotHardBlocked = false; this.snapshotListeningBlocked = false; this.snapshotReadSequence = 0;
     this.provisional = null;
     this.lastUserStoppedAt = -Infinity; this.lastUserTranscriptFinal = false;
     this.falseEnergyCount = 0; this.energyCooldownUntil = -Infinity;
@@ -64,9 +75,9 @@ export class DuplexSession {
     if (['cue_ended', 'cue_stopped', 'ended'].includes(kind)) this.cuePlaying = false;
     if (['cue_started', 'cue_ended', 'cue_suppressed'].includes(kind)) this.queueWaitingPreparation();
     if (this.session && ['cue_started', 'cue_stopped', 'cue_ended', 'cue_canceled', 'cue_suppressed', 'cue_gate_changed', 'cue_retry_scheduled',
-      'barge_in', 'main_started', 'ended', 'muted'].includes(kind)) {
+      'barge_in', 'main_started', 'ended', 'muted', 'playback_failed'].includes(kind)) {
       const body = { event: kind, at_ms: Math.min(event.at_ms, 360000), epoch: this.coordinator?.epoch ?? 0 };
-      if (['neutral_ack', 'moment', 'silence'].includes(event.phrase_id)) body.phrase_id = event.phrase_id;
+      if ([...CUE_PHRASES, 'silence'].includes(event.phrase_id)) body.phrase_id = event.phrase_id;
       if (['listening', 'waiting'].includes(event.phase)) body.phase = event.phase;
       if (/^[a-z_]{1,60}$/.test(event.reason ?? '')) body.reason = event.reason;
       if (typeof event.blocked === 'boolean') body.blocked = event.blocked;
@@ -99,7 +110,7 @@ export class DuplexSession {
   async selectCue(decision) {
     const pending = this.waitingPreparation, joinBegan = this.runtime.now();
     let joinMs = 0;
-    const join = decision.phase === 'waiting' && pending && pending.text === decision.text
+    const join = decision.phase === 'waiting' && !decision.followUp && pending && pending.text === decision.text
       && pending.utteranceId === decision.utteranceId && !pending.controller.signal.aborted;
     if (join) {
       // This promise belongs to the coordinator's ORIGINAL850ms selection
@@ -115,7 +126,7 @@ export class DuplexSession {
     }
     if (decision.signal.aborted || this.closed) throw new Error('selection_canceled');
     const prepared = this.waitingPrepared;
-    const canReuse = decision.phase === 'waiting' && prepared
+    const canReuse = decision.phase === 'waiting' && !decision.followUp && prepared
       && prepared.utteranceId === decision.utteranceId && prepared.text === decision.text
       && this.runtime.now() < prepared.expiresAt;
     // Only a completed, successful receipt binds reuse. A different-text or
@@ -123,7 +134,8 @@ export class DuplexSession {
     this.cancelWaitingPreparation('selection_started');
     const result = await this.request('/duplex/cue', { method: 'POST', signal: decision.signal,
       body: JSON.stringify({ text: decision.text, phase: decision.phase, epoch: decision.utteranceId,
-        revision: ++this.cueRevision, ...(canReuse ? { prepared_revision: prepared.revision } : {}) }) });
+        revision: ++this.cueRevision, ...(decision.followUp ? { follow_up: true } : {}),
+        ...(canReuse ? { prepared_revision: prepared.revision } : {}) }) });
     if (!decision.signal.aborted && result?.prepared_reused === true && canReuse) {
       this.waitingPreparationReuses += 1;
       this.emit('waiting_preparation_reused', { join_ms: joinMs });
@@ -225,14 +237,14 @@ export class DuplexSession {
       if (!config.enabled || config.sample_rate !== 16000) throw new Error('duplex_configuration');
       const cueAssets = {};
       for (const item of config.phrases) {
-        if (!['neutral_ack', 'moment'].includes(item.phrase_id) || item.sample_rate !== 16000) throw new Error('cue_manifest');
+        if (!CUE_PHRASES.includes(item.phrase_id) || item.sample_rate !== 16000) throw new Error('cue_manifest');
         const response = await this.runtime.fetch(`/api/sessions/${this.session.id}/duplex/audio/${item.phrase_id}`, {
           headers: { 'x-session-token': this.session.token },
         });
         if (!response.ok) throw new Error('cue_audio_unavailable');
         const pcm = await response.arrayBuffer();
         if (this.closed) return;
-        if (pcm.byteLength !== item.pcm_bytes || pcm.byteLength > 80000 || pcm.byteLength % 2) throw new Error('cue_audio_geometry');
+        if (pcm.byteLength !== item.pcm_bytes || !pcm.byteLength || pcm.byteLength > 35200 || pcm.byteLength % 2) throw new Error('cue_audio_geometry');
         const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', pcm))].map(x => x.toString(16).padStart(2, '0')).join('');
         if (this.closed) return;
         if (hash !== item.sha256) throw new Error('cue_audio_integrity');
@@ -240,7 +252,11 @@ export class DuplexSession {
       }
       if (!cueAssets.neutral_ack || !cueAssets.moment) throw new Error('cue_bank_incomplete');
       if (this.closed) return;
-      this.playback = this.runtime.playbackFactory({ context: this.context, cueAssets, maxQueuedSeconds: 3 });
+      this.playback = this.runtime.playbackFactory({ context: this.context, cueAssets, maxQueuedSeconds: 3,
+        onFailure: reason => {
+          this.emit('playback_failed', { reason });
+          try { this.callbacks.error?.(reason); } finally { void this.stop(reason); }
+        } });
       this.coordinator = new DuplexCoordinator({ playback: this.playback, listeningDelayMs: 0,
         now: this.runtime.now, setTimeout: this.runtime.setTimeout, clearTimeout: this.runtime.clearTimeout,
         decisionDeadlineMs: 850, // Includes loopback API + authoritative state reads; provider budget remains350ms.
@@ -371,11 +387,18 @@ export class DuplexSession {
     this.cancelWaitingPreparation('caller_started');
     const hadProvisionalOutput = Boolean(this.provisional?.wasMainSpeaking);
     this.confirmProvisional(source);
-    const resumed = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed
+    const interruptedWaiting = this.haveUserUtterance && !this.userTurnClosed
+      && (this.coordinator.cue?.phase === 'waiting' || !this.userTurnHasMainAudio)
+      && this.coordinator.hasWaitingAudioStarted();
+    const resumed = this.haveUserUtterance && !this.userTurnHasMainAudio && !this.userTurnClosed && !interruptedWaiting
       && this.runtime.now() - this.lastUserStoppedAt < 15000;
     this.callerSpeaking = true;
     if (!resumed) {
-      this.partial = ''; this.revision = 0; this.finalSegments = [];
+      // Speech after an actually voiced waiting cue owns a fresh turn, but an
+      // interrupted caller's already supplied facts remain in the local context.
+      if (!interruptedWaiting) { this.partial = ''; this.finalSegments = []; }
+      else if (!this.finalSegments.length && this.partial) this.finalSegments = [this.partial];
+      this.revision = 0;
       this.haveUserUtterance = true; this.userTurnHasMainAudio = false;
       this.userTurnClosed = false; this.generationAnnouncedAfterUser = false;
       this.preparationAttemptedTexts.clear();
@@ -387,6 +410,7 @@ export class DuplexSession {
     if (resumed) this.coordinator.resumeUserSpeech();
     else this.coordinator.userSpeechStarted();
     this.coordinator.setSensitive(this.snapshotHardBlocked || sensitive(this.partial));
+    this.coordinator.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(this.partial));
     this.callbacks.status?.('Listening');
     this.emit(wasOutput ? 'barge_in' : resumed ? 'caller_resumed' : 'caller_started', { source });
   }
@@ -496,8 +520,14 @@ export class DuplexSession {
         if (!this.callerSpeaking && !trailing) this.userStarted('user_transcript');
         const assembled = this.assembleTranscript(rawText, final), text = assembled.text;
         // Raw and accumulated safety checks run even for repeated ASR values.
+        // A correction revokes any old snapshot/audio before fresh neutral-only
+        // waiting classification. It can never affirm the earlier statement.
+        if (text !== this.partial && correction(rawText)) {
+          this.cancelWaitingPreparation('partial_revised'); this.coordinator.invalidate('partial_revised');
+        }
         if (this.snapshotHardBlocked || sensitive(rawText) || sensitive(text)) this.cancelWaitingPreparation('sensitive_state_changed');
         this.coordinator.setSensitive(this.snapshotHardBlocked || sensitive(rawText) || sensitive(text));
+        this.coordinator.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(rawText) || listeningSensitive(text));
         if (assembled.duplicate || (sameText && (!final || this.lastUserTranscriptFinal))) {
           this.emit('transcript_refinement_ignored', { transcript_type: final ? 'final' : 'partial', reason: 'same_words' });
           if (final) { this.lastUserTranscriptFinal = true; this.queueWaitingPreparation(); this.maybeUserStopped(true); }
@@ -526,8 +556,8 @@ export class DuplexSession {
       if (message.status === 'started' && !this.callerSpeaking) {
         if (!this.generation) { this.generation = `playback-${++this.generationSequence}`; this.coordinator.beginGeneration(this.generation); }
         // Provider speech-start can precede usable TTS audio by seconds. Only
-        // actual voiced PCM revokes waiting work; its graph handoff remains
-        // synchronous and bounded by the existing 8ms cue fade.
+        // actual voiced PCM revokes waiting work. A validated complete cue may
+        // finish first, behind one fixed handoff of at most1100ms.
         this.mainAllowed = true; this.emit('provider_main_announced');
         if (this.haveUserUtterance) this.generationAnnouncedAfterUser = true;
         if (this.provisional) {
@@ -556,11 +586,16 @@ export class DuplexSession {
       const snapshot = await this.request('');
       if (this.closed || sequence !== this.snapshotReadSequence) return;
       const detailsProposal = Boolean(snapshot.proposal) && snapshot.stage === 'details';
+      const pending = Boolean(snapshot.pending_operations?.length);
+      // This derived server flag covers only scoped queued/running work. It
+      // allows a neutral waiting selection, never listening or booking consent.
+      const acceptedWork = pending && Array.isArray(snapshot.pending_operations) && snapshot.accepted_work_pending === true;
       const previouslyBlocked = this.snapshotHardBlocked;
       this.snapshotHardBlocked = Boolean(snapshot.ended || snapshot.stage === 'confirmation'
-        || snapshot.pending_operations?.length || (snapshot.proposal && !detailsProposal));
+        || (pending && !acceptedWork) || (snapshot.proposal && !detailsProposal));
       if (this.snapshotHardBlocked) this.cancelWaitingPreparation('sensitive_state_changed');
-      this.coordinator?.setListeningBlocked(detailsProposal);
+      this.snapshotListeningBlocked = detailsProposal || pending;
+      this.coordinator?.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(this.partial));
       this.coordinator?.setSensitive(this.snapshotHardBlocked || sensitive(this.partial));
       if (previouslyBlocked && !this.snapshotHardBlocked) this.coordinator?.recoverWaitingContext();
       if (!this.callerSpeaking) this.coordinator?.wakeWaiting();
@@ -582,7 +617,8 @@ export class DuplexSession {
       if (this.provisional) this.recoverProvisional('microphone_muted');
       this.coordinator?.invalidate('muted'); this.providerSpeaking = false; this.localSpeaking = false;
       this.callerSpeaking = false;
-      if (this.coordinator) this.coordinator.userSpeaking = false;
+      this.playback?.stopMain(); this.mainAllowed = false; this.mainSpeaking = false; this.generation = null;
+      if (this.coordinator) { this.coordinator.userSpeaking = false; this.coordinator.generationId = null; this.coordinator.generating = false; }
       this.emit('muted');
     }
   }
@@ -600,7 +636,10 @@ export class DuplexSession {
       waiting_preparation_reuses: this.waitingPreparationReuses,
       // This clock begins when both local/provider turn gates release; it does
       // not identify the source's last sample or the caller's last voiced word.
+      // The legacy field is PCM readiness, before any complete-cue handoff.
       first_voiced_main_after_turn_release_ms: [...this.answerGaps],
+      main_pcm_ready_after_turn_release_ms: [...this.answerGaps],
+      main_handoff_hold_ms: this.events.filter(row => row.kind === 'main_handoff').map(row => row.hold_ms),
       scope: 'browser_transport_and_scheduled_audio_not_human_listening_or_provider_generation_proof' };
   }
 

@@ -13,8 +13,8 @@ import pytest
 from app.backchannel_audio import BackchannelAudioCache
 from app.backchannel_policy import BackchannelDecision
 from app.domain import DomainError, Store
-from app.duplex_api import install_duplex_api
-from app.duplex_cues import DuplexCuePolicy
+from app.duplex_api import cue_context, install_duplex_api
+from app.duplex_cues import WAITING_PHRASE_IDS, DuplexCuePolicy
 
 ASSISTANT = "isolated-assistant-fixture"
 VAPI_KEY = "synthetic-provider-credential"
@@ -595,7 +595,10 @@ def test_decision_evidence_is_bounded_content_free_and_owner_scoped(tmp_path):
     asyncio.run(run())
 
 
-def test_barge_in_event_cancels_an_inflight_selection_without_waiting_for_the_classifier(tmp_path):
+@pytest.mark.parametrize("body", [{"event": "barge_in"}, *[
+    {"event": "playback_failed", "reason": reason} for reason in (
+        "output_queue_bound", "output_geometry", "output_context_unavailable", "output_handoff_bound", "output_playback_failed")]])
+def test_interrupting_event_cancels_an_inflight_selection_without_waiting_for_the_classifier(tmp_path, body):
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()
         async def blocked(*_):
@@ -604,11 +607,30 @@ def test_barge_in_event_cancels_an_inflight_selection_without_waiting_for_the_cl
             task = asyncio.create_task(h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue()))
             await entered.wait()
             event = await h.client.post(path(h.first, "event"), headers=headers(h.first), json={
-                "event": "barge_in", "epoch": 2, "at_ms": 100})
+                **body, "epoch": 2, "at_ms": 100})
             assert event.status_code == 200
             response = await asyncio.wait_for(task, 1)
             assert response.status_code == 200 and response.json()["phrase_id"] == "silence"
             assert response.json()["reason"] == "superseded"
+            evidence = await h.client.get(path(h.first, "evidence"), headers=headers(h.first))
+            assert evidence.status_code == 200 and evidence.json()["events"][-1] == {**body,
+                "epoch": 2, "at_ms": 100.0, "phrase_id": None, "phase": None,
+                "blocked": None, "retry_after_ms": None, **({"reason": None} if "reason" not in body else {})}
+            assert not h.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("body", [{"event": "playback_failed"},
+    {"event": "playback_failed", "reason": "main_audio_ready"},
+    {"event": "playback_failed", "reason": "upstream private error text"},
+    {"event": "cue_started", "reason": "output_queue_bound"}])
+def test_output_failure_telemetry_accepts_only_its_fixed_failure_reason_set(tmp_path, body):
+    async def run():
+        async with harness(tmp_path) as h:
+            response = await h.client.post(path(h.first, "event"), headers=headers(h.first),
+                json={**body, "epoch": 1, "at_ms": 10})
+            assert response.status_code == 422
+            assert h.control.events == {} and not h.policy.calls and not h.calls
     asyncio.run(run())
 
 
@@ -894,4 +916,115 @@ def test_post_read_invalidation_with_unchanged_revision_cannot_return_playable_c
             assert value["phrase_id"]=="silence" and value["reason"]=="superseded" and value["expires_in_ms"]==0
             assert not value["prepared_reused"] and session.prepared is None
             assert session.count==1 and len(h.policy.calls)==1
+    asyncio.run(run())
+
+
+def add_pending(store, sid, statuses):
+    with store.transaction() as db:
+        for index, status in enumerate(statuses):
+            db.execute("INSERT INTO tool_invocations VALUES (?,?,?,?,?,?,?,?,?)",
+                (f"op_fixture_{index}", sid, f"fixture-{index}", "fixture-fingerprint", "fixture-owner", status, 1, 1, None))
+
+
+@pytest.mark.parametrize("statuses,expected", [([], False), (["queued"], True), (["running"], True),
+    (["queued", "running"], True), (["unknown"], False), (["queued", "unknown"], False), (["completed"], False)])
+def test_scoped_store_snapshot_exposes_only_positive_accepted_work_from_unresolved_rows(tmp_path, statuses, expected):
+    store = Store(tmp_path / "accepted-work.sqlite3")
+    first, second = store.create_session(), store.create_session()
+    add_pending(store, first["id"], statuses)
+    snapshot = store.snapshot(first["id"])
+    assert snapshot["accepted_work_pending"] is expected
+    assert cue_context(snapshot)["accepted_work_pending"] is expected
+    assert store.snapshot(second["id"])["accepted_work_pending"] is False
+    if statuses:
+        with store.transaction() as db:
+            for index, _ in enumerate(statuses):
+                db.execute("INSERT INTO tool_results VALUES (?,?,?,?)",
+                    (first["id"], f"fixture-{index}", "fixture-fingerprint", '{"ok":true}'))
+        assert store.snapshot(first["id"])["accepted_work_pending"] is False
+
+
+def test_approved_variety_bank_is_advertised_and_cached_but_unapproved_id_cannot_be_served(tmp_path):
+    async def run():
+        phrases = ("neutral_ack", *WAITING_PHRASE_IDS)
+        async with harness(tmp_path, phrases=phrases) as h:
+            config = (await h.client.get("/api/duplex/config")).json()
+            assert {row["phrase_id"] for row in config["phrases"]} == set(phrases)
+            for phrase in phrases:
+                response = await h.client.get(path(h.first, "audio/" + phrase), headers=headers(h.first))
+                assert response.status_code == 200 and response.content == h.pcm
+            assert (await h.client.get(path(h.first, "audio/booked"), headers=headers(h.first))).status_code == 404
+            assert h.calls == []
+    asyncio.run(run())
+
+
+def test_an_oversized_optional_clip_is_neither_advertised_nor_available_for_selection(tmp_path):
+    async def run():
+        async with harness(tmp_path) as h:
+            cache = BackchannelAudioCache(h.manifest.parent)
+            long = cache.store("taking_a_look", b"\x01\x00" * 19200)
+            h.settings["SERVICEVOICE_BACKCHANNEL_AUDIO_MANIFEST"] = str(cache.write_manifest([*h.assets, long]))
+            config = (await h.client.get("/api/duplex/config")).json()
+            assert {row["phrase_id"] for row in config["phrases"]} == {"neutral_ack", "moment"}
+            response = await h.client.get(path(h.first, "audio/taking_a_look"), headers=headers(h.first))
+            assert response.status_code == 404
+    asyncio.run(run())
+
+
+def test_fresh_pending_work_can_select_working_but_unknown_or_changed_work_cannot(tmp_path):
+    async def run():
+        async with harness(tmp_path, phrases=("neutral_ack", *WAITING_PHRASE_IDS)) as h:
+            add_pending(h.store, h.first["id"], ["running"])
+            first = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting"))
+            assert first.json()["phrase_id"] == "working_on_it"
+            with h.store.transaction() as db:
+                db.execute("UPDATE tool_invocations SET status='unknown' WHERE session_id=?", (h.first["id"],))
+            denied = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", epoch=2))
+            assert denied.json()["phrase_id"] == "silence"
+            assert denied.json()["reason"] == "unverified_or_sensitive_context"
+            assert len(h.policy.calls) == 1
+    asyncio.run(run())
+
+
+def test_work_that_becomes_unknown_during_classification_rejects_the_still_reserved_phrase(tmp_path):
+    async def run():
+        async with harness(tmp_path, phrases=("neutral_ack", *WAITING_PHRASE_IDS)) as h:
+            add_pending(h.store, h.first["id"], ["queued"])
+            def became_unknown(text, key, options):
+                with h.store.transaction() as db:
+                    db.execute("UPDATE tool_invocations SET status='unknown' WHERE session_id=?", (h.first["id"],))
+            h.policy.callback = became_unknown
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting"))
+            assert response.json()["phrase_id"] == "silence" and response.json()["reason"] == "scheduler_changed"
+            assert h.control.sessions[h.first["id"]].count == 1 and len(h.policy.calls) == 1
+    asyncio.run(run())
+
+
+def test_http_followup_requires_a_first_reservation_is_fresh_distinct_and_never_repeated(tmp_path):
+    from test_duplex_cues import Clock
+    async def run():
+        async with harness(tmp_path, phrases=("neutral_ack", *WAITING_PHRASE_IDS)) as h:
+            clock = Clock(); h.control.clock = clock
+            before = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", follow_up=True))
+            assert before.json()["reason"] == "followup_without_initial" and h.policy.calls == []
+            clock.now = .31
+            first = (await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", revision=2))).json()
+            clock.now = 1.31
+            follow = (await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", revision=3, follow_up=True))).json()
+            assert follow["follow_up"] and follow["phrase_id"] != "silence" and follow["phrase_id"] != first["phrase_id"]
+            assert follow["requests"] == 1 and not follow["prepared_reused"]
+            clock.now = 2.5
+            repeat = (await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", revision=4, follow_up=True))).json()
+            assert repeat["reason"] == "phase_already_acknowledged" and len(h.policy.calls) == 2
+            assert h.control.sessions[h.first["id"]].count == 2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changes", [{"follow_up": "true"}, {"phase": "listening", "follow_up": True},
+    {"follow_up": True, "prepare_only": True}, {"follow_up": True, "prepared_revision": 1}])
+def test_followup_http_schema_cannot_activate_preparation_or_other_phase(tmp_path, changes):
+    async def run():
+        async with harness(tmp_path) as h:
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(**{"phase": "waiting", **changes}))
+            assert response.status_code == 422 and h.policy.calls == [] and h.calls == []
     asyncio.run(run())

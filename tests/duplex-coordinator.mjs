@@ -279,13 +279,13 @@ test('caller stop invalidates a listening decision even if the selector ignores 
   assert.equal(output.handles.length, 0); coordinator.close();
 });
 
-test('main audio wins a pending selection and stops an audible cue before scheduling its first sample', async () => {
+test('main audio revokes future decisions while the output owner finishes the current cue', async () => {
   const { coordinator, time, output } = setup();
   waiting(coordinator); await time.advance(550);
   assert.equal(output.handles[0].stopped, false);
   assert.equal(coordinator.receiveMainPcm('main-1', new Uint8Array([0, 0]), 16000), true);
-  assert.equal(output.handles[0].stopped, true);
-  assert.deepEqual(output.calls.slice(-2), [['cue-stop', 'moment'], ['main', 'main-1']]);
+  assert.equal(output.handles[0].stopped, false);
+  assert.deepEqual(output.calls.at(-1), ['main', 'main-1']);
   await time.advance(20000);
   assert.equal(output.handles.length, 1); coordinator.close();
 });
@@ -399,7 +399,8 @@ test('slow main permits a waiting cue after a full listening clip and a quiet ga
   assert.deepEqual(output.calls.filter(call => call[0] === 'cue'), [['cue', 'neutral_ack'], ['cue', 'moment']]);
   assert.deepEqual(events.filter(event => event.kind === 'cue_started').map(event => event.at_ms), [300, 1270]);
   assert.equal(coordinator.receiveMainPcm('main-1', pcm(), 16000), true);
-  assert.deepEqual(output.calls.slice(-2), [['cue-stop', 'moment'], ['main', 'main-1']]);
+  assert.deepEqual(output.calls.at(-1), ['main', 'main-1']);
+  assert.equal(output.handles.at(-1).stopped, false);
   coordinator.close();
 });
 
@@ -616,7 +617,7 @@ test('main PCM reentered during clip creation stops the uncommitted node and lea
   await time.advance(3000); assert.equal(output.handles.length, 1); coordinator.close();
 });
 
-test('phase pairing cannot repeat a waiting cue while a later utterance recovers its window budget', async () => {
+test('a full cue window rejects a late follow-up while later utterances recover the window', async () => {
   const { coordinator, time, output, requests } = setup({ maxCues: 2 });
   caller(coordinator); await time.advance(300);
   output.handles[0].finish(); await flush();
@@ -662,7 +663,7 @@ test('normal ASR revisions and a caller yielding do not cut an already-started l
   coordinator.userSpeechStopped(); coordinator.beginGeneration('main-1');
   assert.equal(output.handles[0].stopped, false);
   coordinator.receiveMainPcm('main-1', new Uint8Array([0, 0]), 16000);
-  assert.equal(output.handles[0].stopped, true, 'Actual main audio still preempts immediately');
+  assert.equal(output.handles[0].stopped, false, 'Main queues behind the complete current cue');
   coordinator.close();
 });
 
@@ -724,46 +725,47 @@ test('PCM playback decodes actual little-endian PCM geometry, including nonzero 
   assert.equal(context.sources[0].startedAt, 10); output.close();
 });
 
-test('local main PCM preempts a cached cue at its 8 ms fade barrier and later chunks share that playback clock', () => {
+test('local main PCM waits for the complete cue and later chunks share its fixed playback clock', () => {
   const context = audioContext(), output = new PcmPlayback({ context, cueAssets: { neutral_ack: { pcm: pcm(2400).buffer, sampleRate: 24000 } } });
-  const cue = output.playCue('neutral_ack'); assert.ok(cue); assert.equal(context.buffers[0].sampleRate, 24000);
+  const cue = output.playCue('neutral_ack'); assert.ok(cue);
   assert.equal(output.enqueueMain({ pcm: pcm(), sampleRate: 16000 }), true);
-  assert.equal(context.sources[0].stopped, true); assert.equal(context.sources[0].stopAt, 10.008);
-  assert.equal(context.sources[1].startedAt, 10.008);
+  assert.equal(context.sources[0].stopped, false); assert.equal(context.sources[1].startedAt, 10.1);
   assert.equal(output.enqueueMain({ pcm: pcm(), sampleRate: 16000 }), true);
-  assert.ok(Math.abs(context.sources[2].startedAt - 10.108) < 1e-12); assert.equal(output.playCue('neutral_ack'), null);
+  assert.ok(Math.abs(context.sources[2].startedAt - 10.2) < 1e-12); assert.equal(output.playCue('neutral_ack'), null);
+  assert.ok(Math.abs(output.takeHandoffTelemetry().hold_ms - 100) < 1e-8);
+  assert.equal(output.takeHandoffTelemetry(), null, 'First packet is the only handoff record');
   output.close(); context.advanceTo(10.008);
   assert.equal(context.sources.every(source => source.stopped && source.disconnected), true);
-  assert.equal(context.gains[0].disconnected, true);
 });
 
-test('same-frame main priority revokes the cue immediately and schedules one real gain ramp before main samples', async () => {
-  const time = clock(), context = audioContext();
-  const output = new PcmPlayback({ context, cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } } });
-  const coordinator = new DuplexCoordinator({ playback: output, selectCue: async request => decision(request.phase),
-    now: time.now, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout });
-  waiting(coordinator); await time.advance(550);
-  const cue = context.sources[0], gain = context.gains[0];
-  assert.equal(cue.connectedTo, gain); assert.equal(gain.connectedTo, context.destination);
-  assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), true);
-  assert.equal(coordinator.cue, null, 'Logical ownership is revoked synchronously');
-  assert.deepEqual(gain.calls, [['set', 1, 10], ['cancel', 10], ['set', 1, 10], ['ramp', 0, 10.008]]);
-  assert.equal(cue.stopAt, 10.008); assert.equal(context.sources[1].startedAt, cue.stopAt);
-  assert.equal(cue.disconnected, false, 'The gain stays connected for its actual fade');
-  assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), true);
-  assert.ok(Math.abs(context.sources[2].startedAt - 10.028) < 1e-12);
-  assert.equal(gain.calls.filter(call => call[0] === 'ramp').length, 1, 'Repeated same-frame main packets do not extend the fade');
-  context.advanceTo(10.008); assert.equal(cue.disconnected, true); assert.equal(gain.disconnected, true);
-  coordinator.close();
-});
+for (const elapsedMs of [0, 696, 888]) {
+  test(`main arriving ${elapsedMs}ms into a1050ms cue preserves every sample with no gain ramp or overlap`, async () => {
+    const time = clock(), context = audioContext(), events = [];
+    const output = new PcmPlayback({ context, cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } } });
+    const coordinator = new DuplexCoordinator({ playback: output, selectCue: async request => decision(request.phase),
+      now: time.now, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout, onEvent: event => events.push(event) });
+    waiting(coordinator); await time.advance(550);
+    context.currentTime = 10 + elapsedMs / 1000;
+    assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), true);
+    assert.ok(coordinator.cue); assert.equal(context.sources[0].stopped, false);
+    assert.deepEqual(context.gains[0].calls, [['set', 1, 10]]);
+    assert.equal(context.sources[1].startedAt, 11.05);
+    assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), true);
+    assert.ok(Math.abs(context.sources[2].startedAt - 11.07) < 1e-10);
+    assert.equal(events.filter(row => row.kind === 'main_handoff').length, 1);
+    assert.ok(Math.abs(events.find(row => row.kind === 'main_handoff').hold_ms - (1050 - elapsedMs)) < 1e-8);
+    context.advanceTo(11.05); await flush(); assert.equal(coordinator.cue, null);
+    assert.equal(context.gains[0].disconnected, true); coordinator.close();
+  });
+}
 
-test('a cue with less than 8 ms remaining uses its natural end as the main handoff barrier', () => {
+test('a cue with less than8ms remaining finishes naturally without an artificial fade', () => {
   const context = audioContext(), output = new PcmPlayback({ context,
     cueAssets: { moment: { pcm: pcm(1600), sampleRate: 16000 } } });
   output.playCue('moment'); context.currentTime = 10.097;
   assert.equal(output.enqueueMain({ pcm: pcm(320), sampleRate: 16000 }), true);
-  assert.equal(context.sources[0].stopAt, 10.1); assert.equal(context.sources[1].startedAt, 10.1);
-  assert.deepEqual(context.gains[0].calls.slice(-1), [['ramp', 0, 10.1]]);
+  assert.equal(context.sources[0].stopped, false); assert.equal(context.sources[1].startedAt, 10.1);
+  assert.deepEqual(context.gains[0].calls, [['set', 1, 10]]);
   context.advanceTo(10.1); output.close();
 });
 
@@ -929,4 +931,161 @@ test('ordinary ASR trailing-word rewrites retain the classified stable prefix in
   pending.resolve(decision('listening')); await flush();
   assert.equal(output.handles.length, 1); assert.equal(coordinator.userSpeaking, true);
   coordinator.close();
+});
+
+
+for (const size of [17600, 17601]) {
+  test(`whole-clip admission enforces1100ms before a source is audible: ${size} samples`, () => {
+    const context = audioContext(), output = new PcmPlayback({ context,
+      cueAssets: { moment: { pcm: pcm(size), sampleRate: 16000 } } });
+    const cue = output.playCue('moment'); assert.equal(Boolean(cue), size === 17600);
+    assert.equal(context.sources.length, size === 17600 ? 1 : 0);
+    output.enqueueMain({ pcm: pcm(320), sampleRate: 16000 });
+    assert.ok(context.sources.at(-1).startedAt <= 11.1);
+    assert.ok(output.takeHandoffTelemetry().hold_ms <= 1100 + 1e-8); output.close();
+  });
+}
+
+test('confirmed caller interrupts both an active cue and all main queued behind its handoff', async () => {
+  const context = audioContext(), time = clock(), output = new PcmPlayback({ context,
+    cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } } });
+  const coordinator = new DuplexCoordinator({ playback: output, selectCue: async request => decision(request.phase),
+    now: time.now, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout });
+  waiting(coordinator); await time.advance(550); coordinator.receiveMainPcm('main-1', pcm(1600), 16000);
+  coordinator.receiveMainPcm('main-1', pcm(1600), 16000); context.currentTime = 10.2;
+  coordinator.userSpeechStarted();
+  assert.ok(Math.abs(context.sources[0].stopAt - 10.208) < 1e-10);
+  assert.equal(context.sources.slice(1).every(source => source.stopped && source.stopAt === 10.2), true);
+  assert.equal(output.main.size, 0); assert.equal(output.mainHandoffBarrier, null);
+  assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), false);
+  context.advanceTo(10.208); await flush(); assert.equal(coordinator.cue, null); coordinator.close();
+});
+
+test('replacement generation cancels old cue and future main without accepting old generation packets', async () => {
+  const { coordinator, time, output } = setup(); waiting(coordinator); await time.advance(550);
+  coordinator.receiveMainPcm('main-1', pcm(320), 16000); coordinator.beginGeneration('main-2');
+  assert.equal(output.handles[0].stopped, true); assert.equal(coordinator.receiveMainPcm('main-1', pcm(320), 16000), false);
+  assert.equal(coordinator.receiveMainPcm('main-2', pcm(320), 16000), true); coordinator.close();
+});
+
+test('provisional noise pause/resume keeps the original cue-end barrier and every unsounded main sample', () => {
+  const context = audioContext(), output = new PcmPlayback({ context,
+    cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } } });
+  output.playCue('moment'); output.enqueueMain({ pcm: pcm(1600), sampleRate: 16000 });
+  context.currentTime = 10.2; output.pauseMain();
+  assert.equal(context.sources[0].stopped, false); assert.equal(output.pausedMain[0].offset, 0);
+  context.currentTime = 10.55; assert.equal(output.resumeMain(), true);
+  assert.equal(context.sources.at(-1).startedAt, 11.05); assert.equal(context.sources.at(-1).offset, 0);
+  assert.equal(output.mainHandoffBarrier, 11.05); assert.equal(context.sources[0].stopped, false); output.close();
+});
+
+test('handoff delay counts against the total3s queue limit and cannot extend the barrier on overflow', () => {
+  const context = audioContext(), output = new PcmPlayback({ context,
+    cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } } });
+  output.playCue('moment'); assert.equal(output.enqueueMain({ pcm: pcm(30000), sampleRate: 16000 }), true);
+  const barrier = output.mainHandoffBarrier;
+  assert.equal(output.enqueueMain({ pcm: pcm(1600), sampleRate: 16000 }), false);
+  assert.equal(output.mainHandoffBarrier, barrier); assert.equal(context.sources.length, 2);
+  assert.equal(context.sources[0].stopped, false); output.close();
+});
+
+test('one fresh different follow-up fills a long wait only after the first complete cue and1250ms silence', async () => {
+  const selected = [], { coordinator, time, output, events } = setup({ selectCue: async row => {
+    selected.push(row); return decision('waiting', { phrase_id: row.followUp ? 'one_sec' : 'moment', max_request_age_ms: 800 });
+  } });
+  waiting(coordinator); await time.advance(550); assert.equal(output.handles.length, 1);
+  await time.advance(1050); output.handles[0].finish(); await flush();
+  await time.advance(599); assert.equal(selected.length, 1);
+  await time.advance(1); assert.equal(selected.length, 2); assert.equal(selected[1].followUp, true);
+  assert.equal(selected[1].utteranceId, selected[0].utteranceId);
+  await time.advance(649); assert.equal(output.handles.length, 1);
+  await time.advance(1); assert.equal(output.handles[1].stopped, false); assert.equal(coordinator.waitingCueCount, 2);
+  assert.deepEqual(events.filter(row => row.kind === 'cue_started').map(row => [row.at_ms, row.phrase_id]), [[550, 'moment'], [2850, 'one_sec']]);
+  output.handles[1].finish(); await flush(); await time.advance(30000);
+  assert.equal(selected.length, 2); assert.equal(output.handles.length, 2); coordinator.close();
+});
+
+for (const state of ['main', 'caller', 'closed', 'sensitive']) {
+  test(`a pending fresh follow-up is revoked by ${state} without adding speech`, async () => {
+    const held = deferred(); let followup;
+    const { coordinator, time, output } = setup({ selectCue: async row => {
+      if (!row.followUp) return decision('waiting'); followup = row; return held.promise;
+    } });
+    waiting(coordinator); await time.advance(1600); output.handles[0].finish(); await flush(); await time.advance(600);
+    assert.ok(followup);
+    if (state === 'main') coordinator.receiveMainPcm('main-1', pcm(), 16000);
+    if (state === 'caller') coordinator.resumeUserSpeech();
+    if (state === 'closed') coordinator.close();
+    if (state === 'sensitive') coordinator.setSensitive(true);
+    assert.equal(followup.signal.aborted, true); held.resolve(decision('waiting', { phrase_id: 'one_sec' }));
+    await time.advance(5000); assert.equal(output.handles.length, 1); coordinator.close();
+  });
+}
+
+for (const fail of ['repeated', 'expired', 'uncertain']) {
+  test(`a ${fail} follow-up is visible silence with no retry or third cue`, async () => {
+    let calls = 0; const { coordinator, time, output, events } = setup({ selectCue: async row => {
+      calls++; if (!row.followUp) return decision('waiting');
+      return decision('waiting', fail === 'repeated' ? {} : fail === 'expired'
+        ? { phrase_id: 'one_sec', max_request_age_ms: 500 } : { phrase_id: 'silence', reason: 'classification_uncertain' });
+    } });
+    waiting(coordinator); await time.advance(1600); output.handles[0].finish(); await flush(); await time.advance(5000);
+    assert.equal(output.handles.length, 1); assert.equal(calls, 2);
+    assert.ok(events.some(row => row.kind === 'cue_suppressed')); coordinator.close();
+  });
+}
+
+test('an800ms exhausted follow-up deadline cannot play a late classifier response or hide its failed tail', async () => {
+  const held = deferred(); const { coordinator, time, output, events } = setup({ selectCue: row => row.followUp ? held.promise : Promise.resolve(decision('waiting')) });
+  waiting(coordinator); await time.advance(1600); output.handles[0].finish(); await flush(); await time.advance(1401);
+  held.resolve(decision('waiting', { phrase_id: 'one_sec', max_request_age_ms: 800 })); await flush();
+  assert.equal(output.handles.length, 1);
+  assert.ok(events.some(row => row.reason === 'selection_expired_on_arrival'));
+  await time.advance(5000); assert.equal(output.handles.length, 1); coordinator.close();
+});
+
+
+test('direct cue replacement cannot overlap two cues, even inside caller-cancel fade', () => {
+  const context = audioContext(), output = new PcmPlayback({ context,
+    cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 }, one_sec: { pcm: pcm(8000), sampleRate: 16000 } } });
+  const cue = output.playCue('moment'); assert.equal(output.playCue('one_sec'), null);
+  cue.stop(); assert.equal(output.playCue('one_sec'), null); assert.equal(context.sources.length, 1);
+  context.advanceTo(10.008); assert.ok(output.playCue('one_sec')); output.close();
+});
+
+for (const currentTime of [NaN, Infinity, -1]) {
+  test(`invalid audio clock ${currentTime} fails silent without allocating output`, () => {
+    const context = audioContext(), output = new PcmPlayback({ context,
+      cueAssets: { moment: { pcm: pcm(1600), sampleRate: 16000 } } }); context.currentTime = currentTime;
+    assert.equal(output.playCue('moment'), null); assert.equal(output.enqueueMain({ pcm: pcm(), sampleRate: 16000 }), false);
+    assert.equal(context.sources.length, 0); context.currentTime = 10; output.close();
+  });
+}
+
+
+test('voiced cue-start proof follows the sample clock rather than node scheduling or leading silence', () => {
+  const context = audioContext(), padded = pcm(8000), view = new DataView(padded.buffer);
+  for (let index = 1600; index < 8000; index++) view.setInt16(index * 2, 2000, true);
+  const output = new PcmPlayback({ context, cueAssets: { moment: { pcm: padded, sampleRate: 16000 } } });
+  const cue = output.playCue('moment'); assert.equal(cue.hasAudiblyStarted(), false);
+  context.currentTime = 10.099; assert.equal(cue.hasAudiblyStarted(), false);
+  context.currentTime = 10.101; assert.equal(cue.hasAudiblyStarted(), true); output.close();
+});
+
+test('a cue canceled during padding cannot later gain voiced-start proof from a later clock', () => {
+  const context = audioContext(), padded = pcm(8000), view = new DataView(padded.buffer); view.setInt16(1600 * 2, 2000, true);
+  const output = new PcmPlayback({ context, cueAssets: { moment: { pcm: padded, sampleRate: 16000 } } });
+  const cue = output.playCue('moment'); cue.stop(); context.advanceTo(10.4);
+  assert.equal(cue.hasAudiblyStarted(), false); output.close();
+});
+
+
+test('current main queue overflow emits an explicit failure while an obsolete/paused enqueue is merely rejected', () => {
+  const failures = [], context = audioContext(), output = new PcmPlayback({ context,
+    cueAssets: { moment: { pcm: pcm(16800), sampleRate: 16000 } }, onFailure: reason => failures.push(reason) });
+  output.playCue('moment'); output.enqueueMain({ pcm: pcm(30000), sampleRate: 16000 });
+  assert.equal(output.enqueueMain({ pcm: pcm(1600), sampleRate: 16000 }), false);
+  assert.deepEqual(failures, ['output_queue_bound']); output.pauseMain();
+  assert.equal(output.enqueueMain({ pcm: pcm(320), sampleRate: 16000 }), false);
+  assert.deepEqual(failures, ['output_queue_bound']); output.close();
 });

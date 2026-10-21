@@ -1,217 +1,194 @@
-# Jev acknowledgment experiment
+# Hybrid Jev cue experiment
 
-This experiment reduces the silence before an answer by selecting one short,
-approved acknowledgment while the existing reasoner continues. It does not make
-a four-second substantive answer instantaneous. Measure the first acknowledgment
-and the first useful answer separately, and reject a candidate that makes the
-useful answer slower or degrades corrections and explicit confirmation.
+This branch adds listening acknowledgments and short waiting holds to the existing
+STT → reasoner → TTS assistant. The isolated browser owns both cached cues and
+main-response PCM on one output clock while caller audio keeps streaming. Jev
+classifies bounded transcript snapshots alongside the reasoner; it cannot book,
+confirm, change records, produce arbitrary speech or authorize an outcome.
 
-The accepted assistant and its phone number stay on their existing configuration.
-The experiment uses a separate assistant, gateway, speech endpoint and booking
-state. Its feature flag belongs in the isolated backend's environment, not in the
-reasoning prompt. A branch or passing text test is not evidence that a caller
-heard the right audio.
+The main assistant and number retain their existing configuration. This is an
+experiment in an isolated assistant, database and private operator console.
+Earlier live calls exposed missing waiting cues and long answer gaps. Those
+failures remain evidence; the new offline results do not establish that the
+revised conversation is production ready.
 
-## Why one coordinated voice path
+## Meaning and phrase selection
 
-[Vapi's live control API](https://docs.vapi.ai/calls/call-features) can play a short
-WAV or MP3 from a public HTTPS URL. It caches files by URL, downloads the entire
-file before playback, and does not add the file's words to conversation artifacts.
-A successful control response does not establish successful download or playback.
-Its normal `say` behavior can queue behind current speech; enabling assistant
-interruption can instead discard an answer. The documented controls do not offer
-a selective generation-ID cancellation contract for queued filler files.
+[TypeSafe Choice](https://docs.typesafe.ai/primitives/choice) and
+[structured state](https://docs.typesafe.ai/concepts/state) support separate,
+atomic questions against the same bounded state. The selector asks independently
+whether existing content is eligible, whether the fixed English cache matches its
+language, and, for waiting only, which content kind is present. Content kinds are
+correction, information request, intake detail and other, with explicit precedence.
+Code maps the result to available approved audio. Synonymous filler phrases do
+not compete as semantic labels or split the eligibility probability.
 
-The candidate therefore keeps acknowledgments in the existing assistant's output
-stream. A coordinator may emit one allowlisted phrase, followed by `<flush />`,
-before the validated answer or tool command. The independent classifier cannot
-write arbitrary speech or modify the booking. All model-generated prose keeps
-the existing validation and pre-tool speech gate.
+[TypeSafe confidence](https://docs.typesafe.ai/confidence) publishes the Choice
+normalization `(p_max - 1/n) / (1 - 1/n)`. It is derived from the probability,
+not independent corroboration. Main cue eligibility retains probability ≥0.98,
+margin ≥0.96, language probability ≥0.99 and the 350 ms provider deadline.
+Optional style selection requires both probability and reported confidence ≥0.90;
+uncertain style falls back to a neutral phrase. These thresholds are unchanged.
 
-[Vapi's flush documentation](https://docs.vapi.ai/assistants/flush-syntax) requires
-`voice.chunkPlan.enabled: true`. With chunking disabled, flush tags can reach
-speech output. Flush should occur at a complete phrase boundary and should be
-used sparingly; excessive use can fragment speech. Exact-match cached PCM at the
-custom voice endpoint avoids a live synthesis request for approved phrases.
+| ID | Exact cached text | Permitted meaning |
+| --- | --- | --- |
+| `neutral_ack` | Mm-hmm. | Occasional listening signal for ordinary content |
+| `moment` | One moment. | Neutral waiting hold |
+| `one_sec` | One sec. | Neutral waiting hold |
+| `just_a_sec` | Just a sec. | Neutral waiting hold |
+| `let_me_see` | Let me see. | Neutral waiting hold, including a clear ordinary correction |
+| `checking` | Let me check that. | Prospective intent for a confidently classified information or scheduling question |
+| `taking_a_look` | Let me take a look. | Prospective intent for a confidently classified information or scheduling question |
+| `working_on_it` | Working on it. | Only fresh, scoped, nonempty accepted work whose pending rows are all queued/running |
 
-Do not add the obsolete `fillerInjectionEnabled` setting: Vapi's
-[November 24 change notice](https://docs.vapi.ai/whats-new/2024/11/24) removed it.
-`stopSpeakingPlan.acknowledgementPhrases` concerns caller acknowledgments that
-should not interrupt the assistant; it is not the assistant's filler dictionary.
+The last two prospective phrases claim no completed lookup, booking or result.
+Present-tense progress is never inferred from the classifier. Unknown work,
+ended/handoff state, active confirmation and protected readbacks remain silent.
+The public `accepted_work_pending` flag is only a scheduling hint; the cue API
+independently derives it from authoritative pending rows before and after selection.
+A client-supplied flag grants no authority.
 
-## Jev's bounded responsibility
+Listening remains conservative about corrections, names and consent. Waiting can
+follow a clear factual correction without affirming it: the raw correction first
+invalidates the old selection, then a fresh neutral-content decision is required.
+Bare approval/rejection, stop/cancel commands, action consent, conditional approval,
+final booking readbacks, supplied contact/payment/credential details, urgency,
+instructions and unsupported language remain excluded. Routine vehicle negation,
+model years, oil changes and waiting-time questions are not control commands.
+Names never enter a cached phrase. No audio splicing is used.
 
-[TypeSafe's quickstart](https://docs.typesafe.ai/introduction/quickstart) describes
-typed decisions. Jev chooses a label and confidence; it does not generate a name
-or arbitrary sentence. The application maps an accepted label to approved text.
-Low confidence, classifier failure, unsupported context or a missed deadline
-means silence. The classifier runs alongside reasoning, never in front of it.
+## Timing, preparation and speaker ownership
 
-The initial candidate should use short neutral acknowledgments. Phrases that
-claim a booking, a successful update, an advisor contact or a completed check are
-excluded. "Checking availability" is appropriate only when an authoritative
-availability read is actually underway, not merely because a classifier guesses
-that one might be needed. Repeated "um" and "uh" are not a latency strategy.
+Each caller utterance permits at most one listening cue and two waiting cues.
+Listening cooldown is 15 seconds; waiting cooldown is one second. The combined
+budget stays at four accepted reservations and 64 classifications per rolling
+15 seconds, with eight attempts per utterance. Accepted reservations are never
+refunded after cancellation or uncertain delivery.
 
-Names remain in the existing verified conversation and booking readbacks.
-Personalizing an acknowledgment needs a verified name plus synthesis of the
-complete phrase. Splicing a prerecorded name onto another recording can create
-awkward prosody and costs additional latency; it is excluded from the first
-cached-audio experiment.
+The first waiting cue cannot play before 550 ms after confirmed yield or within
+300 ms of another cue ending. One optional long-wait follow-up uses a fresh
+classification and fresh authoritative state, chooses a different phrase and
+cannot play before 1,250 ms of post-cue silence. It starts selection after the
+first cue has completed and the phase cooldown/request cadence permit. It has no
+third attempt or preparation reuse. A fast main reply cancels future cue work.
 
-The coordinator must suppress an acknowledgment when an answer wins the race,
-a generation becomes obsolete, the call ends, a correction or
-confirmation is being handled, a tool continuation is pending, or the cooldown
-has not elapsed. At most one acknowledgment is allowed for an eligible turn.
-An unverified or unsupported context should remain silent.
-Vapi owns caller-speech detection and barge-in; the gateway can reject stale
-work when it observes a replacement request or cancellation. This is not a
-guarantee that every speech restart reaches the gateway before a cue is emitted.
+At most two nonplaying preparations per utterance can classify a stable exact
+waiting snapshot. Preparation returns silence and reserves no audio slot. Only a
+completed receipt for the exact text, epoch, prior assistant context and safe state
+can be reused within two seconds. Activation reads authoritative state again and
+creates a new decision with the unchanged 800 ms total request-age limit. An
+in-flight preparation may be joined only within the original bounded selector
+budget; main speech, caller resumption, changed text or sensitive state cancels it.
+Preparation shares the request budget and retains an actual-waiting allowance.
 
-## Configuration and rollback review
+Approved duplex clips must be at most 1,100 ms. When actual voiced main PCM arrives,
+in-flight and held cue selections are canceled. If a validated cue has already
+started, its complete remaining bytes may finish before the main response. The
+first packet fixes that audio-clock barrier; later packets cannot extend it.
+Thus main audio may wait up to 1,100 ms for word completion. It is incorrect to
+claim zero handoff delay or instantaneous useful answers.
 
-`scripts/prepare_backchannel_assistant.py` is a pure offline preparation helper.
-It accepts a private saved assistant snapshot and candidate endpoint URLs. It
-does not read environment keys, make requests, create calls or change number
-mapping. The default output directory is ignored by Git.
+Confirmed caller speech immediately revokes cached and main output; the browser
+uses a bounded 8 ms fade. Unconfirmed local energy can preserve/pause the current
+main suffix for up to 350 ms while waiting for provider/transcript confirmation.
+Caller capture continues throughout. This is an acoustic heuristic, so echo,
+quiet speech, packet delay and room/telephone interruption still need real tests.
+Output overflow fails the isolated session explicitly rather than silently dropping
+valid main PCM. One owned output queue prevents cue/main overlap.
 
-```powershell
-python scripts/prepare_backchannel_assistant.py --source PRIVATE_ASSISTANT_SNAPSHOT.json --gateway-url https://candidate.example/ack/llm --tts-url https://candidate.example/ack/tts/vapi --webhook-url https://candidate.example/ack/webhooks/vapi/inbound
-```
+For the exact isolated assistant, the authenticated
+`servicevoice_duplex_playback=browser-owned-v1` marker suppresses the earlier
+server-emitted after-turn filler. Other calls retain their existing behavior.
+The earlier `<flush />` path is historical context, not a second speaker in the
+owned browser transport. See [browser run instructions](duplex-browser.md).
 
-The three resulting files are the original rollback snapshot, a candidate create
-plan and a content-free change audit. Do not commit private snapshots or plans.
-The create DTO uses the verified official
-[Vapi SDK schema snapshot](https://github.com/VapiAI/server-sdk-typescript/blob/ce0b348412130447f18e77363de7a97ca12f244b/src/api/types/CreateAssistantDto.ts).
-Unknown fields require review instead of being silently dropped. Inline secrets
-are rejected; existing saved credential references remain unchanged.
+## Main-response prompt scope
 
-Only the candidate name, three endpoint URLs, chunking enable flag and additive
-experiment metadata tag may differ. The reasoner, prompt, Soniox configuration,
-tools, credential references, interruption settings, recording settings and
-native end-call safeguards are preserved exactly. A separately authenticated
-candidate deployment may need distinct credential references; that extra change
-requires its own explicit audit before remote creation.
+The versioned reasoner prompt distinguishes a caller volunteering an intake fact
+from asking to schedule. A standalone vehicle detail should not trigger an
+unsolicited availability lookup. Genuine booking offers retain explicit
+presentation metadata so the existing verified receipt renderer can be used when
+eligible. No booking tool schema, confirmation requirement, operation authority,
+production timeout or receipt validation is weakened by cue selection.
 
-After creating a separate assistant, fetch it and run `verify_saved` against the
-plan. Additional provider defaults or any changed protected field require review.
-Rollback means retaining the accepted assistant and unchanged number route;
-reverting only the prompt is insufficient if endpoints or audio change.
+Bounded synthetic prompt comparisons supported this clarification, but an offer
+or invitation can still occur. The live continuity tests must measure actual
+useful-answer latency and tool behavior; adding filler does not make model
+inference or synthesis faster.
 
-## Evidence and acceptance gates
+## Current evidence and remaining acceptance
 
-For each attempted acknowledgment, record the decision outcome and confidence,
-phrase ID, generation ID, decision time, suppression reason, first emitted text,
-cache hit/miss, audio byte count and declared sample rate. Track candidate version
-and voice/model hashes. Retain a distinction between selection, backend bytes,
-provider speech events and actual heard speech.
+The new frozen 64-case synthetic policy development sample used 30 Jev requests,
+zero retries and no voice calls. Waiting selected 19 of 21 ordinary examples and
+stayed silent on all 31 excluded examples. Listening selected three of six ordinary
+examples and stayed silent on all six correction examples. The first three
+ordinary listening requests exceeded the unchanged 350 ms deadline. Across both
+phases, 22 of 27 ordinary examples selected a cue and all 37 excluded examples
+remained silent.
 
-[Vapi's server event reference](https://docs.vapi.ai/server-url/events) documents
-`speech-update`, `assistant.speechStarted` and `user-interrupted`. Raw PCM custom
-voices provide text-only playback events rather than word-level alignment.
-Optional provider `turnId` values can be joined only where an explicit shared ID
-exists; matching timestamps are not proof of identity or late-packet discard.
+The two waiting misses were a service-replacement correction and a requested name
+in a simulated accepted-work context; their content probabilities remained below
+0.98. Seven approved phrase IDs appeared. `working_on_it` was reachable in scoped
+API/session tests but was not selected in this bounded model sample. Simulated
+pending work does not prove that a remote operation actually ran. These are
+retained development outcomes, not calibrated production accuracy.
 
-Automated checks must include silence/timeout fallback, fast-answer races,
-classifier cancellation, stale generations, correction and confirmation turns,
-interleaved callers, exact cached text, corrupt/missing cache entries, full audio
-durations and correct sample rates. A response labeled 16 kHz must contain audio
-converted to 16 kHz; relabeling 24 kHz audio reproduces slow playback.
+The reviewed local audio bank contains eight approved duplex clips, all at most
+1,080 ms. Format/hash checks and a separate model listening advisory found complete,
+clear phrases. This does not replace human listening or new end-to-end playback.
+421 focused Python checks passed for the policy/API/gateway/lifecycle/console and
+unchanged legacy policy before later integration checks. Exact final commit,
+complete suite/CI results and new live captures must be recorded separately.
 
-Listening checks must assess natural pace, sentence endings, interruption,
-acknowledgment frequency, duplicate speech, name/reference pronunciation,
-corrected complete readbacks, explicit confirmation and the full farewell before
-hang-up. Compare baseline and candidate using representative calls. Promotion is
-an independent decision after those results, not an automatic consequence of
-lower time to first sound.
+Earlier browser captures proved continuous caller input, owned cue playback and
+interruption in some scenarios, but also preserved failed waiting coverage and
+long gaps after a cue. One six-turn capture covered every waiting turn while the
+main reply still took up to about 8.5 seconds; that result is not smoothness proof.
+Subsequent preparation captures also retained continuity failures. Do not rename
+failed receipts as passes or replace their original acceptance rules with a
+post-hoc fast-answer criterion.
 
-## Current branch behavior and measured sample
+New acceptance must bind exact source, manifest, raw receipt and recorded PCM.
+Measure caller source end, confirmed yield, cue voice start/end, packet readiness,
+actual useful main voice and post-cue silence separately. Verify complete cue
+endings or explicit caller cancellation, the fixed ≤1,100 ms main handoff, no
+assistant overlap, bounded follow-up frequency and no booking mutation in safe
+FAQ/intake tests. A short sound is not a useful answer. Repeated tests must include
+ordinary corrections, short turns, long speech, language changes and fast-main races.
 
-The implemented candidate waits 550 ms before considering a cue. Its Jev request
-has a 350 ms deadline and runs alongside the unchanged primary request. Completed
-primary output wins the race. Only the exact phrase `One moment.` can currently
-be selected; the other catalog clips are preview assets. There is a 15-second
-cooldown and a maximum of four cues per call. Classification errors, uncertainty,
-unverified cached-language compatibility and sensitive turns remain silent.
+## Phone bridge boundary
 
-The live synthetic benchmark in `docs/backchannel-policy-benchmark.json` used
-16 cases and seven provider requests with zero retries. It selected four of six
-ordinary requests and kept all ten sensitive cases silent. The median request
-elapsed time was 157.619 ms, with a maximum of 241.301 ms. This is a small
-classification sample, not a calibrated accuracy claim or end-to-end voice
-latency measurement. Earlier overlapping phrase labels split probability among
-synonyms; a binary acknowledge/silence decision avoids that unnecessary choice.
+The branch now includes an opt-in phone media bridge: authenticated Vapi inbound
+admission, a one-use SIP destination, private Asterisk AudioSocket PCM and the same
+owned duplex session. It prewarms one inner isolated call, binds it to the verified
+outer call and owns one paced output queue. This implementation does not change a
+saved number or assistant. See [phone bridge scope and runbook](../integrations/phone-bridge/README.md).
 
-The main reasoning prompt has no new filler or language rules. Cached clip
-selection has its own compatibility gate because a fixed audio recording cannot
-change language. Dynamic names and claims that an action has started are excluded.
+Local HTTP/TCP/media tests and a network-isolated lab can validate code paths and
+digital geometry. They do not establish that the managed carrier forwards to the
+chosen endpoint, negotiates the required TLS/SRTP, preserves real caller audio or
+stops downstream phone audio within the local cancellation bound. Live phone
+validation, both-leg ended readback, representative acoustic listening and
+continuity evidence are still required before main phone routing or promotion.
+
+## Configuration, evidence and rollback
 
 `SERVICEVOICE_BACKCHANNELS` defaults off. The gateway additionally requires the
-exact isolated `VAPI_BACKCHANNEL_ASSISTANT_ID` and a validated, warmed immutable
-`SERVICEVOICE_BACKCHANNEL_AUDIO_MANIFEST`. The custom speech service uses the same
-model, voice and manifest. It returns a cache hit only for exact text, voice,
-model and sample geometry; normal sentences retain the existing synthesis path.
-Vapi may append ASCII edge whitespace to a flushed phrase. The lookup removes
-only outer ASCII spaces, tabs and line endings, and records
-`cache_text_normalized`; it does not change case, punctuation, internal spacing,
-Unicode characters or additional words. Input hashes still describe the actual
-provider request, while asset hashes describe the immutable approved recording.
-Keep generated audio, provider snapshots and runtime settings outside Git.
+exact isolated `VAPI_BACKCHANNEL_ASSISTANT_ID`; the audio cache validates its
+immutable manifest, exact text/model/voice/sample geometry and every PCM/WAV hash.
+Only harmless outer ASCII whitespace can be normalized for a cache lookup. Other
+sentences continue through ordinary synthesis.
 
-## Reading the candidate's evaluation
+Generated audio, API keys, snapshots, caller transcripts and private deployment
+settings stay outside Git. Content-free cue telemetry records fixed IDs/reasons,
+confidence, phase, bounded timing, preparation reuse and suppression. Join provider,
+model and TTS evidence only through explicit shared IDs, never time proximity.
+Model text readiness, returned PCM and graph playback have different meanings.
 
-The candidate's reviewer uses a separate LangSmith project and assistant
-allowlist. Inspect `voice.gateway.generation` children for the optional
-`backchannel` object: decision and suppression reason, classifier timing and
-requests, confidence, cached-language evidence and server emission time.
-This typed projection survives database persistence and repeated export without
-adding caller words or credentials. Older generations without this evidence
-remain absent rather than being assigned an inferred silent decision.
-
-`latency_server_first_ack_p95_ms` measures gateway cue emission.
-`latency_server_substantive_text_p95_ms` measures validated main-response text readiness;
-the original per-generation `milestones_ms.first_text` keeps this meaning.
-Neither measures heard sound or semantic usefulness. A `tts.cache_hit` event
-and PCM hashes establish returned bytes, not playback. A call or generation join
-requires an explicit shared provider ID; timestamp proximity is insufficient.
-When any explicit call-scoped cue emission is
-observed, general Vapi response-latency checks become uncertain because the
-provider number may include the acknowledgment. A missing timing row cannot
-erase a separately captured component event or turn a filler into an answer.
-
-The candidate is not promoted automatically. Compare actual listening and useful
-answer latency with the accepted assistant, including whether a queued short
-clip makes an otherwise-ready answer arrive later. Keep provider playback,
-audible interruption and late carrier packet discard as unverified until an
-appropriate audio test establishes them.
-
-## Full-duplex boundary
-
-The current candidate is an after-turn acknowledgment experiment. Vapi continues
-listening during speech and supports barge-in, but this selector runs when Vapi
-requests the next model response. It does not yet select or play listening cues
-while the caller is still talking.
-
-[Partial transcript and speech events](https://docs.vapi.ai/server-url/events)
-can support speculative Jev decisions during caller speech. Such a selector
-should choose a fixed phrase ID or silence from the current context, rather than
-generate or guess arbitrary next words. Every partial revision needs an epoch;
-late decisions must become obsolete, and partial text must never authorize a
-booking or confirmation.
-
-Audible overlap needs stronger coordination. Vapi's documented live `say`
-controls lack cue-specific cancellation, expiry and an atomic speaker-state
-check. Disabling interruption can ignore caller speech; enabling assistant
-interruption can discard the main response. Neither global mute nor clearing a
-local queue proves that an accepted remote cue is cancelled.
-
-An owned browser playback coordinator around
-[Vapi WebSocket transport](https://docs.vapi.ai/calls/websocket-transport) is a
-possible next prototype: keep forwarding caller PCM to Soniox, receive the
-existing main PCM, and schedule cached listening cues with cancellable local
-epochs. This changes the transport/playback path and needs its own audio,
-interruption and timing evaluation. Phone support would additionally need a
-media bridge. It is not implemented or approved by the current candidate's tests.
-Vapi's [GPT-Live](https://docs.vapi.ai/gpt-live/overview) takes a different path
-that replaces separate transcription/speech and does not retain this exact
-custom-audio stack, so it is not used here.
+Candidate deployment must bind the tested worktree and exact manifest. An additive
+bank upgrade preserves all old audio bytes, changes only the candidate business
+and speech manifest setting, and restores exact old settings before old-image
+startup on rollback. Main/provider/edge configuration and data mounts stay outside
+that transaction. End active calls and automatic evaluations before rollout;
+unknown outcomes require reconciliation. Passing offline checks alone does not
+permit a claim that the candidate is ready for production.

@@ -594,5 +594,6 @@ class Store:
             percentile=lambda p: values[min(len(values)-1,max(0,__import__('math').ceil(len(values)*p)-1))] if values else None
             return {"id":sid,"mode":session["mode"],"ended":bool(session["ended"]),**state,"transcript":transcripts,
                     "events":events,"proposal":proposal,"appointment":self.appointment(db,sid),"pending_operations":pending,
+                    "accepted_work_pending":bool(pending) and all(row["status"] in {"queued","running"} for row in pending),
                     "handoff":handoff,
                     "metrics":{"tool_count":len(events),"tool_p50_ms":percentile(.5),"tool_p95_ms":percentile(.95)}}

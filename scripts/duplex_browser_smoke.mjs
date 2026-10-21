@@ -32,12 +32,15 @@ const plan = { kind: 'duplex_browser_audio_graph', mode: run ? live ? 'live_isol
 if (!run) { console.log(JSON.stringify(plan, null, 2)); process.exit(0); }
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-const report = { ...plan, started_at: new Date().toISOString(), checks: {}, limitations: [
+const report = { ...plan, protocol_version: 'whole_clip_handoff_v4', max_main_handoff_ms: 1100, started_at: new Date().toISOString(), checks: {}, limitations: [
   'The energy gate is a cancellation heuristic, not speech recognition.',
   live ? 'Live verification uses synthetic caller audio; acoustic echo and human conversational quality remain unverified.'
     : 'Provider replay uses deterministic classifier decisions and synthetic cue PCM.',
   'Browser playback nodes and received PCM do not establish human listening quality.',
   'Provider audio has no documented per-frame generation IDs; local epochs are not upstream lineage.' ] };
+report.source_sha256 = Object.fromEntries(await Promise.all(['app/static/duplex-coordinator.js', 'app/static/duplex-session.js',
+  'app/static/duplex-microphone.js', 'scripts/duplex_browser_smoke.mjs'].map(async name =>
+  [name, createHash('sha256').update(await fs.readFile(path.join(root, name))).digest('hex')])));
 let browser, context, page, server, provider, base;
 const sockets = [], uplink = [], requests = [], errors = [];
 let sessions = 0;
@@ -58,7 +61,9 @@ function inputRmsNear(pcm, atMs) {
   for (let index = first; index < last; index++) energy += (pcm.readInt16LE(index * 2) / 32768) ** 2;
   return Math.sqrt(energy / (last - first));
 }
-const cueAudio = { neutral_ack: pcmTone(220, 0.67), moment: pcmTone(250, 1.05) };
+const cueAudio = { neutral_ack: pcmTone(220, .67), moment: pcmTone(250, 1.05),
+  one_sec: pcmTone(290, .5), just_a_sec: pcmTone(310, .6), let_me_see: pcmTone(330, .8),
+  checking: pcmTone(350, .9), taking_a_look: pcmTone(370, .95), working_on_it: pcmTone(390, .7) };
 const phrases = Object.entries(cueAudio).map(([phrase_id, pcm]) => ({ phrase_id, sample_rate: 16000,
   pcm_bytes: pcm.length, sha256: createHash('sha256').update(pcm).digest('hex') }));
 const sendJson = (socket, message) => socket.send(JSON.stringify(message));
@@ -126,6 +131,20 @@ async function verifyRecordedFade(source, fade) {
   return { post_gain_recording_checked: true, transition_samples: expected.length,
     faded_transition_mse: minimum / expected.length, unfaded_transition_mse: abruptError / expected.length };
 }
+async function verifyRecordedCompleteTransition(source) {
+  const recorded = await page.evaluate(() => window.duplexSession.context.recordBlocks.flatMap(block => [...block]));
+  const tail = 128, head = 128, cue = cueAudio.moment, main = pcmTone(730, head / 16000);
+  const expected = [...Array(tail)].map((_, index) => cue.readInt16LE(cue.length - (tail - index) * 2) / 32768)
+    .concat([...Array(head)].map((_, index) => main.readInt16LE(index * 2) / 32768));
+  let minimum = Infinity;
+  for (let start = 0; start + expected.length <= recorded.length; start++) {
+    let error = 0;
+    for (let index = 0; index < expected.length; index++) error += (recorded[start + index] - expected[index]) ** 2;
+    minimum = Math.min(minimum, error / expected.length);
+  }
+  return { post_gain_recording_checked: true, full_cue_natural_end_verified: Boolean(source.ended_ms && !source.stopped),
+    transition_samples: expected.length, mse: minimum };
+}
 async function until(predicate, code, maximum = 6000) {
   const began = performance.now();
   while (performance.now() - began < maximum) { if (await predicate()) return; await delay(20); }
@@ -142,7 +161,7 @@ async function setMic(level) { await page.evaluate(volume => { window.duplexFixt
 async function newFixtureSession({ snapshot = null, previousAssistant = '', shortReplies = [],
   decisionDelayMs = null, maxRequestAgeMs = null, firstWaitingReason = null,
   serverReadDelayMs = null, serverAfterReadDelayMs = null, enforceServerPacing = false,
-  preparationDecision = 'prepare', preparationDelayMs = null,
+  preparationDecision = 'prepare', preparationDelayMs = null, waitingPhrase = 'moment', followUpPhrase = 'one_sec', followUpDelayMs = null,
   predictionEnabled = true, predictionControlReason = null } = {}) {
   if (!predictionEnabled) {
     report.legacy_prediction_controls ||= [];
@@ -151,7 +170,7 @@ async function newFixtureSession({ snapshot = null, previousAssistant = '', shor
   }
   fixtureContexts.set(sessions + 1, { previousAssistant, shortReplies,
     decisionDelayMs, maxRequestAgeMs, firstWaitingReason,
-    serverReadDelayMs, serverAfterReadDelayMs, enforceServerPacing, preparationDecision, preparationDelayMs, prepared: null,
+    serverReadDelayMs, serverAfterReadDelayMs, enforceServerPacing, preparationDecision, preparationDelayMs, waitingPhrase, followUpPhrase, followUpDelayMs, prepared: null,
     serverLastClassifiedAt: -Infinity, serverLastCueAt: -Infinity, serverRevision: 0,
     snapshot: { mode: 'live', stage: 'service', ended: false, proposal: null, pending_operations: [], transcript: [], events: [], ...snapshot } });
   await page.evaluate(async predictionEnabled => {
@@ -213,7 +232,7 @@ async function captureBackendCueEvidence() {
         scope: evidence.cue_decision_scope === 'bounded_server_selection_results_not_proof_of_browser_playback'
           ? evidence.cue_decision_scope : 'unknown',
         cue_decisions: rows.map(row => ({ phase: ['listening', 'waiting'].includes(row.phase) ? row.phase : null,
-          phrase_id: ['neutral_ack', 'moment', 'silence'].includes(row.phrase_id) ? row.phrase_id : null,
+          phrase_id: ['neutral_ack', 'moment', 'one_sec', 'just_a_sec', 'let_me_see', 'checking', 'taking_a_look', 'working_on_it', 'silence'].includes(row.phrase_id) ? row.phrase_id : null,
           reason: /^[a-z_]{1,60}$/.test(row.reason || '') ? row.reason : 'unclassified_result',
           ...Object.fromEntries(numbers.map(key => [key, Number.isFinite(row[key]) ? row[key] : null])),
           budget: Object.fromEntries(budgetKeys.map(key => [key, Number.isFinite(row.budget?.[key]) ? row.budget[key] : null])) })),
@@ -249,8 +268,9 @@ async function saveLiveRecordings() {
     header.writeUInt32LE(recorded.sample_rate, 24); header.writeUInt32LE(recorded.sample_rate * 2, 28);
     header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34); header.write('data', 36); header.writeUInt32LE(raw.length, 40);
     const output = path.resolve(value('--output')).replace(/\.json$/i, '') + '-' + kind + '.wav';
-    await fs.writeFile(output, Buffer.concat([header, raw]));
-    report[kind + '_recording'] = { path: output,
+    const wav = Buffer.concat([header, raw]);
+    await fs.writeFile(output, wav);
+    report[kind + '_recording'] = { path: output, sha256: createHash('sha256').update(wav).digest('hex'), wav_bytes: wav.length,
       scope: kind === 'playback' ? 'actual_browser_mixed_assistant_output_cached_cues_and_main_PCM' : 'synthetic_caller_plus_actual_assistant_browser_graph_at_half_gain_each',
       caller_audio_included: kind === 'conversation', sample_rate: recorded.sample_rate,
       recording_start_browser_ms: recorded.start_ms, pcm_bytes: raw.length, seconds: raw.length / (recorded.sample_rate * 2) };
@@ -419,7 +439,7 @@ try {
       try {
         const input = request.postDataJSON();
         cueRequests.push({ request, phase: input.phase, epoch: input.epoch, revision: input.revision,
-          prepare_only: input.prepare_only === true, prepared_revision: input.prepared_revision ?? null,
+          prepare_only: input.prepare_only === true, prepared_revision: input.prepared_revision ?? null, follow_up: input.follow_up === true,
           started_at_ms: performance.now(), text_characters: typeof input.text === 'string' ? input.text.length : 0 });
       } catch { /* Request diagnostics never retain caller transcript content. */ }
     });
@@ -430,7 +450,7 @@ try {
     page.on('response', async response => {
       if (response.url().endsWith('/api/duplex/config')) {
         try { const config = await response.json(); report.cue_assets = config.phrases.map(row => ({
-          phrase_id: row.phrase_id, pcm_bytes: row.pcm_bytes, sample_rate: row.sample_rate })); } catch {}
+          phrase_id: row.phrase_id, pcm_bytes: row.pcm_bytes, sample_rate: row.sample_rate, sha256: row.sha256 })); } catch {}
       }
       if (response.url().endsWith('/duplex/call') && response.status() >= 200 && response.status() < 300) {
         // Allocation can succeed before browser start subsequently fails. Count
@@ -453,7 +473,7 @@ try {
         const data = await response.json();
         report.cue_decisions.push(Object.fromEntries(['phrase_id', 'phase', 'reason', 'probability', 'confidence', 'classification_ms',
           'language_choice', 'language_probability', 'language_confidence', 'epoch', 'revision',
-          'prepared', 'prepared_reused', 'prepared_expires_in_ms', 'requests']
+          'prepared', 'prepared_reused', 'prepared_expires_in_ms', 'requests', 'follow_up', 'content_kind', 'content_kind_probability', 'content_kind_confidence']
           .filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])));
       } catch { report.cue_decisions.push({ status: response.status() }); }
     });
@@ -604,10 +624,10 @@ try {
         && evidence.events.some(release => release.kind === 'caller_stopped' && release.at_ms >= evidence.input_start_ms && release.at_ms < row.at_ms));
       const waiting = evidence.events.find(row => row.kind === 'cue_started' && row.phase === 'waiting'
         && row.at_ms >= evidence.input_end_ms && (!main || row.at_ms < main.at_ms));
-      const moment = report.cue_assets?.find(row => row.phrase_id === 'moment');
+      const moment = report.cue_assets?.find(row => row.phrase_id === waiting?.phrase_id);
       const source = waiting && evidence.graph.starts.find(row => row.samples * 2 === moment?.pcm_bytes
         && Math.abs(row.started_ms - evidence.start_at_ms - waiting.at_ms) < 10);
-      const mainSource = main && evidence.graph.starts.find(row => Math.abs(row.started_ms - evidence.start_at_ms - main.at_ms) < 10);
+      const mainSource = main && evidence.graph.starts.find(row => !row.gain_id && Math.abs(row.started_ms - evidence.start_at_ms - main.at_ms) < 10);
       const cueEnd = source && (source.stopped_context_s ?? source.scheduled_at_s + source.seconds);
       const fade = cueFade(evidence.graph, source);
       report.waiting_cue = { required: true, started_at_ms: waiting?.at_ms ?? null,
@@ -617,12 +637,15 @@ try {
         played_clip_ms: source ? Math.max(0, Math.min(source.seconds, cueEnd - source.scheduled_at_s)) * 1000 : null,
         end_reason: source?.stopped ? 'intentionally_stopped' : source?.ended_ms ? 'natural' : 'unknown',
         fade: fade,
-        main_handoff_delay_ms: fade && mainSource ? (mainSource.scheduled_at_s - fade.start_context_s) * 1000 : 0, checks: {
+        main_handoff_delay_ms: mainSource ? Math.max(0, mainSource.scheduled_at_s - mainSource.context_time_at_start_s) * 1000 : null, checks: {
           ...(waitingOnly ? { waiting_after_input: Boolean(waiting) }
             : { same_input_received_listening_and_waiting: Boolean(waiting && report.checks.listening_cue_during_input) }),
           waiting_was_audible_before_main: Boolean(waiting && main && evidence.graph.samples.some(row => row.cue && row.rms > .01
             && row.at_ms - evidence.start_at_ms >= waiting.at_ms && row.at_ms - evidence.start_at_ms < main.at_ms)),
           assistant_sources_did_not_play_simultaneously: Boolean(source && mainSource && cueEnd <= mainSource.scheduled_at_s + .000001),
+          cue_completed_without_main_truncation: Boolean(source?.ended_ms && !source.stopped),
+          main_handoff_bounded_1100ms: Boolean(mainSource && Number.isFinite(mainSource.context_time_at_start_s)
+            && mainSource.scheduled_at_s - mainSource.context_time_at_start_s <= 1.100001),
         } };
       report.waiting_cue.passed = Object.values(report.waiting_cue.checks).every(Boolean);
     }
@@ -652,7 +675,7 @@ try {
       const reply = object => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(object)); };
       if (pathname === '/api/duplex/config') { reply({ enabled: true, sample_rate: 16000, phrases, scope: 'isolated_browser_owned_playback', phone_enabled: false }); return; }
       if (pathname === '/api/sessions' && request.method === 'POST') { sessions++; reply({ id: 'fixture-session-' + sessions, token: 'fixture-token' }); return; }
-      if (/\/duplex\/audio\/(neutral_ack|moment)$/.test(pathname)) {
+      if (pathname.includes('/duplex/audio/') && Object.hasOwn(cueAudio, pathname.split('/').at(-1))) {
         const pcm = cueAudio[pathname.split('/').at(-1)]; response.writeHead(200, { 'Content-Type': 'application/octet-stream', 'X-Audio-Sample-Rate': '16000' }); response.end(pcm); return;
       }
       if (pathname.endsWith('/duplex/call')) { reply({ call_id: 'fixture-call-' + sessions, websocket_url: 'wss://duplex-fixture.vapi.ai/fixture-call-' + sessions + '/transport', sample_rate: 16000 }); return; }
@@ -673,11 +696,11 @@ try {
         const firstWaitingReason = !prepareOnly && input.phase === 'waiting' && trusted?.firstWaitingReason
           && !selections(sessionNumber).some(row => row.phase === 'waiting') ? trusted.firstWaitingReason : null;
         let silence = hardBlocked || listeningBlocked || firstWaitingReason
-          || /actually|stop|correct|confirm|goodbye/i.test(input.text) || (short && !trustedShort);
+          || /stop|confirm|goodbye/i.test(input.text) || (input.phase === 'listening' && /actually|correct/i.test(input.text)) || (short && !trustedShort);
         // First session reproduces a provider stream whose partials arrive far
         // faster than a classifier response. A stable-only fixture missed this.
         const entry = { session: sessionNumber, phase: input.phase, epoch: input.epoch,
-          revision: input.revision, prepare_only: prepareOnly, prepared_revision: input.prepared_revision ?? null,
+          revision: input.revision, prepare_only: prepareOnly, prepared_revision: input.prepared_revision ?? null, follow_up: input.follow_up === true,
           at_ms: performance.now() };
         cueRequests.push(entry);
         response.on('close', () => { entry.transport_closed_at_ms = performance.now(); });
@@ -686,7 +709,7 @@ try {
         if (readDelay) await delay(readDelay);
         entry.after_initial_read_ms = performance.now();
         const cached = trusted.prepared;
-        const reused = !prepareOnly && !silence && cached && cached.text === input.text && cached.epoch === input.epoch
+        const reused = !prepareOnly && !input.follow_up && !silence && cached && cached.text === input.text && cached.epoch === input.epoch
           && cached.revision === input.prepared_revision && cached.previousAssistant === trusted.previousAssistant
           && cached.context === JSON.stringify(trusted.snapshot) && performance.now() - cached.began < 2000;
         const preparationDeclined = prepareOnly && trusted.preparationDecision === 'decline';
@@ -699,7 +722,8 @@ try {
           else if (!reused && !preparationDeclined && requestRemaining > 0) { pacingReason = 'classification_throttled'; retryAfter = Math.ceil(requestRemaining); }
         }
         const configuredDelay = trusted?.decisionDelayMs;
-        const decisionDelay = prepareOnly && trusted.preparationDelayMs !== null ? trusted.preparationDelayMs
+        const decisionDelay = input.follow_up && trusted.followUpDelayMs !== null ? trusted.followUpDelayMs
+          : prepareOnly && trusted.preparationDelayMs !== null ? trusted.preparationDelayMs
           : (configuredDelay !== null && typeof configuredDelay === 'object' ? configuredDelay[input.phase] : configuredDelay)
           ?? (sessionNumber === 7 && input.phase === 'waiting' ? 700
           : [10, 11].includes(sessionNumber) && input.phase === 'waiting' ? 150 : [1, 5].includes(sessionNumber) ? 220 : 35);
@@ -736,7 +760,7 @@ try {
         }
         entry.prepared = prepared; entry.prepared_reused = Boolean(reused && !silence);
         if (prepareOnly) entry.expires_in_ms = 0;
-        reply({ phrase_id: prepareOnly || silence ? 'silence' : input.phase === 'listening' ? 'neutral_ack' : 'moment',
+        reply({ phrase_id: prepareOnly || silence ? 'silence' : input.phase === 'listening' ? 'neutral_ack' : input.follow_up ? trusted.followUpPhrase : trusted.waitingPhrase,
           reason: entry.reason, requests: entry.server_classified ? 1 : 0,
           ...(pacingReason ? { retry_after_ms: entry.retry_after_ms } : {}), confidence: 1,
           probability: 1, language_choice: 'cache_compatible', expires_in_ms: prepareOnly || silence ? 0 : entry.expires_in_ms,
@@ -851,8 +875,9 @@ try {
     report.checks.provider_announcement_and_silence_preserved_cue = true;
     const count = uplink.length;
     const main = streamMain(provider, 1.2);
-    await until(async () => (await page.evaluate(() => window.duplexSession.events)).some(event => event.kind === 'cue_stopped' && ['main_audio_ready', 'main_started'].includes(event.reason)), 'main_did_not_preempt_cue');
-    report.checks.main_audio_preempted_cue = true;
+    await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 16800 && row.ended_ms && !row.stopped)), 'main_did_not_preserve_complete_cue');
+    await until(() => page.evaluate(() => window.duplexGraphEvidence.samples.some(row => !row.cue && row.rms > .01)), 'main_did_not_follow_complete_cue');
+    report.checks.main_audio_waited_for_complete_cue = true;
     await delay(100); assert.ok(uplink.length > count + 2, 'silence_input_paused_during_main');
     const stops = await eventCount('provisional_barge_in');
     await setMic(0.25);
@@ -935,43 +960,35 @@ try {
     report.checks.main_audio_revoked_pending_waiting_decision = true;
     report.pending_waiting_events = late.events;
 
-    report.waiting_preemption_cases = [];
+    report.waiting_complete_handoff_cases = [];
     for (const mainDelayMs of [800, 1000]) {
       await completedListeningCaller();
       const release = await yieldFixtureCaller();
       await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
-        && row.phase === 'waiting')), 'preemption_waiting_cue_missing');
-      await until(() => page.evaluate(() => window.duplexGraphEvidence.samples.some(row => row.cue && row.rms > .01
-        && row.at_ms > window.duplexSession.startAt + window.duplexSession.events.find(row => row.kind === 'cue_started'
-          && row.phase === 'waiting').at_ms)), 'preemption_waiting_cue_not_audible');
+        && row.phase === 'waiting')), 'handoff_waiting_cue_missing');
       await until(() => page.evaluate(at => performance.now() >= at,
-        release.origin_ms + release.released_at_ms + mainDelayMs), 'preemption_deadline_not_reached', 2000);
+        release.origin_ms + release.released_at_ms + mainDelayMs), 'handoff_deadline_not_reached', 2000);
       sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
       await streamMain(provider, .6);
       sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'stopped', turn: 2 });
-      const preempt = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
-      const cutMoment = preempt.graph.starts.find(row => row.samples === 16800);
-      const readyMain = preempt.graph.starts.find(row => row.samples === 320);
-      const fade = cueFade(preempt.graph, cutMoment);
-      assert.equal(cutMoment.stopped, true, 'main_did_not_cut_waiting_clip');
-      assert.ok(cutMoment.stopped_ms <= readyMain.started_ms, 'main_source_created_before_waiting_stop');
-      assert.ok(cutMoment.stopped_context_s <= readyMain.scheduled_at_s, 'waiting_and_main_audio_were_simultaneous');
-      assert.ok(fade && Math.abs(fade.duration_ms - 8) < .01, 'actual_eight_ms_gain_ramp_missing');
-      assert.ok(Math.abs(cutMoment.stopped_context_s - fade.end_context_s) < .000001, 'cue_stop_missed_fade_end');
-      assert.ok(Math.abs(readyMain.scheduled_at_s - fade.end_context_s) < .000001, 'main_start_missed_fade_barrier');
-      const recordedFade = await verifyRecordedFade(cutMoment, fade);
-      assert.ok(recordedFade.faded_transition_mse < .00001
-        && recordedFade.faded_transition_mse < recordedFade.unfaded_transition_mse * .1, 'gain_fade_not_present_in_recorded_output');
-      report.waiting_preemption_cases.push({ main_ready_after_release_ms: mainDelayMs,
-        waiting_clip_complete: false, waiting_clip_intentionally_stopped: true,
-        waiting_clip_scheduled_ms: cutMoment.seconds * 1000,
-        waiting_clip_played_ms: (cutMoment.stopped_context_s - cutMoment.scheduled_at_s) * 1000,
-        assistant_audio_overlap_ms: Math.max(0, cutMoment.stopped_context_s - readyMain.scheduled_at_s) * 1000,
-        fade, recorded_fade: recordedFade, added_main_delay_ms: (readyMain.scheduled_at_s - fade.start_context_s) * 1000,
-        events: preempt.events, graph: preempt.graph });
+      await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'complete_handoff_main_not_drained');
+      const result = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+      const cue = result.graph.starts.find(row => row.samples === 16800), main = result.graph.starts.find(row => row.samples === 320);
+      const cueEnd = cue.scheduled_at_s + cue.seconds;
+      assert.ok(cue.ended_ms && !cue.stopped, 'main_truncated_waiting_clip');
+      assert.equal(cueFade(result.graph, cue), null, 'main_faded_complete_cue');
+      assert.ok(Math.abs(cueEnd - main.scheduled_at_s) < .000001, 'whole_cue_handoff_gap_or_overlap');
+      const hold = result.events.find(row => row.kind === 'main_handoff');
+      assert.ok(hold && hold.hold_ms > 0 && hold.hold_ms <= 1100.001, 'main_handoff_bound_missing');
+      const transition = await verifyRecordedCompleteTransition(cue);
+      assert.ok(transition.mse < .00001, 'complete_cue_transition_not_present_in_post_gain_recording');
+      report.waiting_complete_handoff_cases.push({ main_ready_after_release_ms: mainDelayMs,
+        waiting_clip_complete: true, waiting_clip_intentionally_stopped: false, waiting_clip_scheduled_ms: cue.seconds * 1000,
+        waiting_clip_played_ms: cue.seconds * 1000, assistant_audio_overlap_ms: Math.max(0, cueEnd - main.scheduled_at_s) * 1000,
+        added_main_delay_ms: hold.hold_ms, recorded_transition: transition, events: result.events, graph: result.graph });
     }
-    report.checks.ready_main_intentionally_preempted_waiting_clip_without_overlap = true;
-    report.checks.actual_eight_ms_fade_present_before_main_without_source_overlap = true;
+    report.checks.ready_main_preserved_whole_waiting_clip_without_overlap = true;
+    report.checks.complete_cue_main_transition_verified_in_post_gain_recording = true;
 
     await completedListeningCaller();
     const heldRelease = await yieldFixtureCaller();
@@ -1102,8 +1119,8 @@ try {
     const announcedCue = announcementEvidence.events.find(row => row.kind === 'cue_started');
     assert.ok(announcedCue.at_ms - announcementRelease.released_at_ms >= 540);
     const announcementMain = streamMain(provider, .4);
-    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_stopped'
-      && row.reason === 'main_audio_ready')), 'actual_main_did_not_win_after_early_announcement');
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'main_handoff'
+      && row.hold_ms > 0 && row.hold_ms <= 1100.001)), 'actual_main_handoff_missing_after_early_announcement');
     await announcementMain;
     report.checks.early_announcement_and_silent_tts_gap_preserved_waiting_then_actual_main_won = true;
 
@@ -1141,11 +1158,11 @@ try {
       ignored: window.duplexSession.metrics().local_energy_onsets_ignored_during_cached_cue }));
     const noiseCut = cueNoisePriority.graph.starts.find(row => row.samples === 16800);
     const noiseMain = cueNoisePriority.graph.starts.find(row => row.samples === 320);
-    assert.ok(noiseCut.stopped && noiseMain, 'cue_only_noise_main_handoff_missing');
-    assert.ok(Math.abs(noiseCut.stopped_context_s - noiseMain.scheduled_at_s) < .00001, 'cue_only_noise_main_overlap');
+    assert.ok(!noiseCut.stopped && noiseMain, 'cue_only_noise_main_handoff_missing');
+    assert.ok(Math.abs(noiseCut.scheduled_at_s + noiseCut.seconds - noiseMain.scheduled_at_s) < .00001, 'cue_only_noise_main_overlap');
     assert.ok(cueNoisePriority.ignored >= 1, 'cached_cue_noise_ignore_not_exercised');
     await cueNoiseMain; await setMic(0);
-    report.checks.first_main_pcm_during_cue_only_noise_kept_eight_ms_handoff = true;
+    report.checks.first_main_pcm_during_cue_only_noise_kept_complete_cue_handoff = true;
 
     await newFixtureSession();
     sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 1 });
@@ -1404,7 +1421,130 @@ try {
     report.checks.completed_and_inflight_preparation_reused_only_after_fresh_yield_without_extra_model_work = true;
     report.checks.prediction_join_never_delayed_main_or_bypassed_late_sensitive_words = true;
 
-    // Use the production15s phase cooldown and real browser clocks. Six full
+    // New v4 contracts are additional scenarios. The retained old receipts and
+    // original turn cases above keep their own historical grades unchanged.
+    await newFixtureSession({ waitingPhrase: 'moment', predictionEnabled: false,
+      predictionControlReason: 'exercise_exact_same_frame_ready_audio_handoff' });
+    const instantSession = sessions;
+    await page.evaluate(encoded => {
+      const session = window.duplexSession, prior = session.callbacks.event;
+      session.callbacks.event = event => {
+        prior?.(event);
+        if (event.kind === 'cue_started' && event.phase === 'waiting') {
+          session.receive(JSON.stringify({ type: 'speech-update', role: 'assistant', status: 'started' }));
+          session.receive(Uint8Array.from(atob(encoded), x => x.charCodeAt(0)).buffer);
+        }
+      };
+    }, pcmTone(730, .02).toString('base64'));
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    await yieldFixtureCaller();
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'main_handoff')), 'same_frame_handoff_missing');
+    await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'same_frame_main_not_drained');
+    const instant = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+    const instantCue = instant.graph.starts.find(row => row.samples === 16800), instantMain = instant.graph.starts.find(row => row.samples === 320);
+    const instantHold = instant.events.find(row => row.kind === 'main_handoff');
+    assert.ok(instantCue.ended_ms && !instantCue.stopped, 'same_frame_main_cut_cue');
+    assert.ok(instantHold.hold_ms >= 1000 && instantHold.hold_ms <= 1100.001, 'worst_case_handoff_bound_unexercised');
+    assert.ok(Math.abs(instantMain.scheduled_at_s - instantCue.scheduled_at_s - instantCue.seconds) < .000001, 'same_frame_handoff_overlap');
+    assert.equal(selections(instantSession).length, 1, 'same_frame_main_created_follow_up');
+    report.same_frame_handoff = { added_main_delay_ms: instantHold.hold_ms, events: instant.events, graph: instant.graph };
+    report.checks.same_frame_ready_main_preserved_full_cue_within1100ms = true;
+
+    await newFixtureSession({ waitingPhrase: 'let_me_see', decisionDelayMs: 120 });
+    const correctionSession = sessions;
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    await yieldFixtureCaller('Actually I meant a tire rotation instead of a brake inspection.');
+    await until(async () => await eventCount('cue_started') === 1, 'fresh_correction_waiting_missing');
+    const correctionCue = await page.evaluate(() => window.duplexSession.events.find(row => row.kind === 'cue_started'));
+    assert.equal(correctionCue.phase, 'waiting'); assert.equal(correctionCue.phrase_id, 'let_me_see');
+    assert.equal(selections(correctionSession).some(row => row.phase === 'listening'), false, 'correction_affirmative_listening_not_suppressed');
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    await streamMain(provider, .2); await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'correction_main_not_drained');
+    const corrected = await page.evaluate(() => window.duplexGraphEvidence.starts.find(row => row.samples === 12800));
+    assert.ok(corrected.ended_ms && !corrected.stopped, 'correction_hold_was_truncated');
+    report.checks.fresh_correction_received_complete_neutral_waiting_only = true;
+
+    await newFixtureSession({ decisionDelayMs: 90, waitingPhrase: 'one_sec' });
+    const shortSession = sessions, shortTurns = [];
+    for (let turn = 1; turn <= 3; turn++) {
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn });
+      const release = await yieldFixtureCaller('What is the usual service availability for this week?', { turn });
+      await until(async () => await eventCount('cue_started') === turn, 'short_interturn_waiting_missing');
+      const cue = await page.evaluate(() => window.duplexSession.events.findLast(row => row.kind === 'cue_started'));
+      sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: turn + 100 });
+      await streamMain(provider, .2); await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'short_turn_main_not_drained');
+      sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'stopped', turn: turn + 100 });
+      shortTurns.push({ turn, cue_at_ms: cue.at_ms, after_release_ms: cue.at_ms - release.released_at_ms });
+      await delay(120);
+    }
+    assert.equal(selections(shortSession).length, 3); assert.ok(shortTurns.at(-1).cue_at_ms - shortTurns[0].cue_at_ms < 10000, 'short_interturn_test_reused_old15s_spacing');
+    assert.equal(await eventCount('cue_started'), 3); report.short_interturn_waiting = shortTurns;
+    report.checks.short_turns_recover_waiting_without15s_spacing = true;
+
+    await newFixtureSession({ decisionDelayMs: 120, waitingPhrase: 'one_sec', followUpPhrase: 'let_me_see' });
+    const tailSession = sessions;
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 }); await yieldFixtureCaller();
+    await until(async () => await eventCount('cue_started') === 2, 'long_tail_second_fresh_cue_missing');
+    const tail = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+    const tailCues = tail.events.filter(row => row.kind === 'cue_started');
+    const firstTail = tail.graph.starts.find(row => row.samples === 8000), secondTail = tail.graph.starts.find(row => row.samples === 12800);
+    assert.deepEqual(tailCues.map(row => row.phrase_id), ['one_sec', 'let_me_see']);
+    assert.ok(firstTail.ended_ms && !firstTail.stopped, 'followup_started_before_whole_first_cue');
+    const tailGap = (secondTail.scheduled_at_s - firstTail.scheduled_at_s - firstTail.seconds) * 1000;
+    assert.ok(tailGap >= 1240 && tailGap < 1600, 'fresh_followup_missed1250ms_target_in_bounded_fixture');
+    const followupRequest = selections(tailSession)[1]; assert.equal(followupRequest.follow_up, true);
+    assert.equal(followupRequest.prepared_revision, null); assert.equal(followupRequest.server_classified, true);
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    await streamMain(provider, .3); await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'tail_main_not_drained');
+    await delay(1800); assert.equal(await eventCount('cue_started'), 2); assert.equal(selections(tailSession).length, 2);
+    report.long_tail_followup = { post_first_cue_gap_ms: tailGap, first_phrase: 'one_sec', second_phrase: 'let_me_see',
+      fresh_classification: true, reused_preparation: false, events: tail.events, graph: tail.graph };
+    report.checks.long_tail_used_one_fresh_different_followup_without_third_cue = true;
+
+    for (const outcome of ['main_ready', 'deadline']) {
+      await newFixtureSession({ decisionDelayMs: 90, followUpDelayMs: 900, waitingPhrase: 'one_sec' });
+      const failedTailSession = sessions;
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 }); await yieldFixtureCaller();
+      await until(() => selections(failedTailSession).some(row => row.follow_up), 'tail_cancellation_request_missing');
+      if (outcome === 'main_ready') {
+        sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 }); await streamMain(provider, .2);
+      }
+      await delay(1100);
+      assert.equal(await eventCount('cue_started'), 1, 'late_followup_played_or_hid_failed_tail');
+      const suppressed = await page.evaluate(() => window.duplexSession.events.filter(row => ['cue_suppressed', 'cue_canceled'].includes(row.kind)));
+      assert.ok(suppressed.some(row => row.reason === (outcome === 'main_ready' ? 'main_audio_ready' : 'classifier_deadline')), 'tail_failure_diagnostic_missing');
+      report.checks[outcome === 'main_ready' ? 'ready_main_canceled_inflight_followup' : 'exhausted_followup_deadline_remained_visible_silence'] = true;
+    }
+
+    await newFixtureSession({ waitingPhrase: 'moment', decisionDelayMs: 100 });
+    const resumedSession = sessions;
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    await yieldFixtureCaller('The vehicle is a blue sedan that needs routine service.');
+    await until(() => page.evaluate(() => window.duplexSession.coordinator.hasWaitingAudioStarted()), 'waiting_voiced_start_missing');
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    provider.send(pcmTone(730, .1));
+    await until(async () => await eventCount('main_handoff') === 1, 'resume_queued_main_handoff_missing');
+    const oldGeneration = await page.evaluate(() => window.duplexSession.generation);
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 2 });
+    sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: 'Actually the sedan is red instead.', turn: 2 });
+    await until(() => page.evaluate(() => window.duplexSession.coordinator.utteranceId === 2), 'voiced_waiting_resume_did_not_get_new_epoch');
+    const resumeState = await page.evaluate(old => ({ preserved: window.duplexSession.partial.includes('blue sedan')
+      && window.duplexSession.partial.includes('red instead'),
+      oldRejected: !window.duplexSession.coordinator.receiveMainPcm(old, new Uint8Array(640), 16000) }), oldGeneration);
+    assert.ok(resumeState.preserved && resumeState.oldRejected, 'resume_lost_context_or_revived_old_generation');
+    fixtureContexts.get(resumedSession).waitingPhrase = 'let_me_see';
+    await yieldFixtureCaller('Actually the sedan is red instead.', { turn: 2 });
+    await until(async () => await eventCount('cue_started') === 2, 'resumed_corrected_waiting_missing');
+    const resumedWaiting = selections(resumedSession).filter(row => row.phase === 'waiting');
+    assert.deepEqual(resumedWaiting.map(row => row.epoch), [1, 2]);
+    assert.ok(resumedWaiting.every(row => !row.follow_up), 'new_caller_turn_misclassified_as_followup');
+    const resumedGraph = await page.evaluate(() => window.duplexGraphEvidence);
+    const originalCue = resumedGraph.starts.find(row => row.samples === 16800), oldQueuedMain = resumedGraph.starts.find(row => row.samples === 1600);
+    assert.ok(originalCue.stopped && oldQueuedMain.stopped, 'caller_resume_failed_to_clear_queued_old_audio');
+    assert.ok(oldQueuedMain.stopped_context_s < oldQueuedMain.scheduled_at_s, 'old_queued_main_reached_output');
+    report.checks.voiced_waiting_resume_preserved_facts_and_created_fresh_correction_epoch = true;
+
+    // Retain the original15s-window regression and real browser clocks. Six full
     // waiting clips in one call exceed both the old four-cue lifetime cap and
     // one rolling window without resetting the session, its counts or timers.
     await newFixtureSession({ decisionDelayMs: 90 }); const longSession = sessions;
@@ -1440,7 +1580,7 @@ try {
     assert.equal(selections(longSession).length, 6, 'long_call_requests_were_not_one_per_turn');
     assert.equal(await eventCount('cue_started'), 6); assert.equal(await eventCount('main_started'), 6);
     report.long_conversation = { session_count: 1, turns: 6, waiting_cues: 6, main_answers: 6,
-      first_to_last_cue_ms: longDuration, phase_cooldown_ms: 15000, clocks_or_budgets_modified: false };
+      first_to_last_cue_ms: longDuration, phase_cooldown_ms: 1000, deliberately_spaced_15s_window_regression: true, clocks_or_budgets_modified: false };
     report.checks.six_real_clock_turns_survived_15s_windows_and_four_cue_lifetime_regression = true;
     report.checks.exact_20ms_input_frames = uplink.every(frame => frame.bytes === 640);
     assert.equal(report.checks.exact_20ms_input_frames, true);

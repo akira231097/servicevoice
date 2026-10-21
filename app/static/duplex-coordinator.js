@@ -1,14 +1,16 @@
 // Browser-owned output arbitration. Microphone capture/transport is deliberately
 // independent: neither a cue nor main speech ever disables an input track.
 // Server-side Jev selection is advisory; this coordinator owns the final race.
-const PHRASE_BY_PHASE = Object.freeze({ listening: 'neutral_ack', waiting: 'moment' });
+export const CUE_PHRASES = Object.freeze(['neutral_ack', 'moment', 'one_sec', 'just_a_sec', 'let_me_see', 'checking', 'taking_a_look', 'working_on_it']);
+const PHRASE_BY_PHASE = Object.freeze({ listening: ['neutral_ack'], waiting: CUE_PHRASES.filter(id => id !== 'neutral_ack') });
 
 export class DuplexCoordinator {
   constructor({ selectCue, playback, now = () => performance.now(),
     setTimeout: schedule = (...args) => setTimeout(...args),
     clearTimeout: cancel = timer => clearTimeout(timer), onEvent = () => {},
     listeningDelayMs = 300, waitingDelayMs = 550, decisionDeadlineMs = 850,
-    cueTtlMs = 1000, maxCueDurationMs = 2500, cooldownMs = 15000, maxCues = 4, maxRequests = 64,
+    cueTtlMs = 1000, maxCueDurationMs = 2500, cooldownMs = 15000, waitingCooldownMs = 1000,
+    followUpSilenceMs = 1250, maxCues = 4, maxRequests = 64,
     budgetWindowMs = 15000, maxRequestsPerUtterance = 8,
     minimumRequestIntervalMs = 350, minimumCueIntervalMs = 300,
     minimumConfidence = .9 } = {}) {
@@ -16,7 +18,7 @@ export class DuplexCoordinator {
       || typeof playback.enqueueMain !== 'function' || typeof playback.stopMain !== 'function') {
       throw new TypeError('duplex_dependencies_required');
     }
-    for (const value of [listeningDelayMs, waitingDelayMs, cooldownMs]) {
+    for (const value of [listeningDelayMs, waitingDelayMs, cooldownMs, waitingCooldownMs]) {
       if (!Number.isFinite(value) || value < 0) throw new RangeError('invalid_duplex_timing');
     }
     if (!Number.isFinite(decisionDeadlineMs) || decisionDeadlineMs <= 0 || decisionDeadlineMs > 1000
@@ -28,16 +30,19 @@ export class DuplexCoordinator {
       || !Number.isSafeInteger(maxRequestsPerUtterance) || maxRequestsPerUtterance < 2 || maxRequestsPerUtterance > 16
       || !Number.isFinite(minimumRequestIntervalMs) || minimumRequestIntervalMs < 300 || minimumRequestIntervalMs > 2000
       || !Number.isFinite(minimumCueIntervalMs) || minimumCueIntervalMs < 300 || minimumCueIntervalMs > 2000
+      || !Number.isFinite(followUpSilenceMs) || followUpSilenceMs < 1250 || followUpSilenceMs > 2000
       || !Number.isFinite(minimumConfidence) || minimumConfidence < .9 || minimumConfidence > 1) {
       throw new RangeError('invalid_duplex_limits');
     }
     Object.assign(this, { selectCue, playback, now, schedule, cancel, onEvent,
-      listeningDelayMs, waitingDelayMs, decisionDeadlineMs, cueTtlMs, maxCueDurationMs, cooldownMs,
+      listeningDelayMs, waitingDelayMs, decisionDeadlineMs, cueTtlMs, maxCueDurationMs, cooldownMs, waitingCooldownMs, followUpSilenceMs,
       maxCues, maxRequests, minimumConfidence, minimumRequestIntervalMs, minimumCueIntervalMs });
     Object.assign(this, { budgetWindowMs, maxRequestsPerUtterance });
     this.epoch = 0; this.utteranceId = 0; this.closed = false; this.userSpeaking = false;
     this.cuedUtteranceByPhase = { listening: -1, waiting: -1 };
     this.waitingAttemptUtteranceId = -1;
+    this.waitingAttemptNumber = -1; this.waitingCueCount = 0; this.waitingCompletedAt = null; this.lastWaitingPhrase = null;
+    this.waitingAudioStarted = false;
     this.lastCueAtByPhase = { listening: -Infinity, waiting: -Infinity };
     this.sensitive = false; this.listeningBlocked = false; this.text = ''; this.revision = null; this.finalReceived = false;
     this.generationId = null; this.generating = false; this.mainHasAudio = false; this.mainAnnounced = false;
@@ -85,6 +90,8 @@ export class DuplexCoordinator {
     this.userSpeaking = true; this.text = ''; this.revision = null; this.finalReceived = false; this.turnYieldedAt = null;
     this.utteranceRequests = { listening: 0, waiting: 0 };
     this.preparationRequests = 0;
+    this.waitingCueCount = 0; this.waitingCompletedAt = null; this.lastWaitingPhrase = null; this.waitingAttemptNumber = -1;
+    this.waitingAudioStarted = false;
     this.retryableWaitingUtteranceId = -1;
     this.waitingPacingRetryUsed = false; this.waitingSelectionNotBefore = -Infinity;
     // Old generation IDs remain invalid even if late PCM arrives after speech ends.
@@ -103,6 +110,14 @@ export class DuplexCoordinator {
     this.generationId = null; this.generating = false; this.mainHasAudio = false; this.mainAnnounced = false;
     this.playback.stopMain(); this.emit('caller_resumed');
     if (this.utteranceId !== this.cuedUtteranceByPhase.waiting) this.waitingAttemptUtteranceId = -1;
+  }
+
+  hasWaitingAudioStarted() {
+    if (this.waitingAudioStarted) return true;
+    if (this.cue?.phase === 'waiting') {
+      try { this.waitingAudioStarted = this.cue.handle.hasAudiblyStarted?.() === true; } catch { /* Unknown playback stays conservative. */ }
+    }
+    return this.waitingAudioStarted;
   }
 
   updatePartial(text, { revision = null } = {}) {
@@ -144,7 +159,7 @@ export class DuplexCoordinator {
   beginGeneration(generationId) {
     if (this.closed || typeof generationId !== 'string' || !generationId || generationId.length > 200) return false;
     if (this.generationId === generationId) return false;
-    this.invalidate('generation_started', { stopCue: false }); this.playback.stopMain();
+    this.invalidate('generation_started', { stopCue: this.generationId !== null }); this.playback.stopMain();
     this.generationId = generationId; this.generating = true; this.mainHasAudio = false; this.mainAnnounced = false;
     this.generationBeganAt = this.now();
     if (!this.userSpeaking) this.queueCue('waiting', this.waitingDelayMs);
@@ -184,7 +199,8 @@ export class DuplexCoordinator {
     this.pruneBudget();
     return Object.hasOwn(PHRASE_BY_PHASE, phase) && !this.closed && epoch === this.epoch
       && !this.sensitive && !this.mainHasAudio && !this.mainAnnounced
-      && this.utteranceId !== this.cuedUtteranceByPhase[phase]
+      && (phase === 'waiting' ? this.waitingCueCount < 2 && (this.waitingCueCount === 0 || this.waitingCompletedAt !== null)
+        : this.utteranceId !== this.cuedUtteranceByPhase[phase])
       && (phase === 'listening' ? !this.listeningBlocked && this.userSpeaking && !this.finalReceived
         : !this.userSpeaking && this.generating && Boolean(this.generationId));
   }
@@ -221,8 +237,9 @@ export class DuplexCoordinator {
   cueWait(phase) {
     const now = this.now();
     const yielded = this.turnYieldedAt ?? this.generationBeganAt ?? now;
-    return Math.max(0, this.lastCueAtByPhase[phase] + this.cooldownMs - now,
+    return Math.max(0, this.lastCueAtByPhase[phase] + (phase === 'waiting' ? this.waitingCooldownMs : this.cooldownMs) - now,
       this.lastCueEndedAt + this.minimumCueIntervalMs - now,
+      phase === 'waiting' && this.waitingCueCount === 1 ? this.waitingCompletedAt + this.followUpSilenceMs - now : 0,
       phase === 'waiting' ? yielded + this.waitingDelayMs - now : 0);
   }
 
@@ -233,7 +250,9 @@ export class DuplexCoordinator {
   selectionWait(phase) {
     // Waiting classification overlaps the550ms playback guard once any active
     // clip has finished. Do not spend its absolute TTL behind an entire clip.
-    return phase === 'waiting' ? Math.max(0, this.lastCueAtByPhase[phase] + this.cooldownMs - this.now(),
+    const followUpLead = this.waitingCueCount === 1 ? 650 : 0;
+    return phase === 'waiting' ? Math.max(0, this.lastCueAtByPhase[phase] + this.waitingCooldownMs - this.now(),
+      this.waitingCueCount === 1 ? this.waitingCompletedAt + this.followUpSilenceMs - this.now() - followUpLead : 0,
       this.lastCueAt + this.minimumCueIntervalMs - this.now(), this.waitingSelectionNotBefore - this.now()) : this.cueWait(phase);
   }
 
@@ -243,11 +262,17 @@ export class DuplexCoordinator {
       || this.text.split(/\s+/).length < (phase === 'waiting' ? 1 : 3)
       || this.utteranceRequestCount() >= this.maxRequestsPerUtterance
       || (phase === 'listening' && this.utteranceRequests.listening + this.preparationRequests >= this.maxRequestsPerUtterance - 1)
-      || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId)
+      || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId && this.waitingAttemptNumber === this.waitingCueCount)
       || this.pendingTimer !== null || this.request) return;
     const wait = Math.max(phase === 'waiting' ? 0 : delay, this.selectionWait(phase), this.budgetWait(),
       this.minimumRequestIntervalMs - (this.now() - this.lastRequestAt));
     if (!Number.isFinite(wait)) return;
+    // A rolling budget cannot turn one follow-up into a surprise cue many
+    // seconds later. A missed bounded opportunity stays visibly silent.
+    if (phase === 'waiting' && this.waitingCueCount === 1 && this.now() + wait > this.waitingCompletedAt + 1500) {
+      this.waitingAttemptUtteranceId = this.utteranceId; this.waitingAttemptNumber = this.waitingCueCount;
+      this.emit('cue_suppressed', { reason: 'follow_up_budget_deadline', phase }); return;
+    }
     this.pendingPhase = phase;
     this.pendingTimer = this.schedule(() => {
       this.pendingTimer = null; this.pendingPhase = null;
@@ -263,7 +288,7 @@ export class DuplexCoordinator {
 
   async choose(phase, epoch) {
     if (!this.canCue(phase, epoch) || this.cue || (phase !== 'waiting' && !this.eligible(phase, epoch))
-      || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId)
+      || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId && this.waitingAttemptNumber === this.waitingCueCount)
       || this.selectionWait(phase) > 0 || this.budgetWait() > 0 || this.request
       || this.utteranceRequestCount() >= this.maxRequestsPerUtterance
       || (phase === 'listening' && this.utteranceRequests.listening + this.preparationRequests >= this.maxRequestsPerUtterance - 1)) return;
@@ -277,11 +302,12 @@ export class DuplexCoordinator {
     const followup = () => {
       if (this.text !== snapshot.observedText && this.canCue(phase, epoch)) this.queueCue(phase, 0);
     };
-    const request = { controller, timer: null, snapshotText: snapshot.text, snapshot, phase, epoch, began, decision: null };
+    const request = { controller, timer: null, snapshotText: snapshot.text, snapshot, phase, epoch, began, decision: null,
+      followUp: phase === 'waiting' && this.waitingCueCount === 1 };
     this.lastRequestAt = began;
     this.request = request; this.requests += 1;
     this.requestTimes.push(began); this.utteranceRequests[phase] += 1;
-    if (phase === 'waiting') this.waitingAttemptUtteranceId = this.utteranceId;
+    if (phase === 'waiting') { this.waitingAttemptUtteranceId = this.utteranceId; this.waitingAttemptNumber = this.waitingCueCount; }
     request.timer = this.schedule(() => {
       controller.abort();
       if (this.request === request) this.request = null;
@@ -291,7 +317,7 @@ export class DuplexCoordinator {
     let decision;
     try {
       decision = await this.selectCue({ phase, text: snapshot.text, epoch, utteranceId: this.utteranceId, revision: snapshot.revision,
-        generationId: this.generationId, signal: controller.signal });
+        generationId: this.generationId, signal: controller.signal, followUp: request.followUp });
     } catch {
       if (!controller.signal.aborted) this.emit('cue_suppressed', { reason: 'classifier_unavailable', phase });
       if (this.request === request) this.request = null;
@@ -313,7 +339,8 @@ export class DuplexCoordinator {
     const expiresAt = Math.min(began + maxAge, began + this.decisionDeadlineMs, this.now() + ttl);
     let rejected = null;
     if (phraseId === 'silence') rejected = /^[a-z_]{1,60}$/.test(decision?.reason ?? '') ? decision.reason : 'classifier_silence';
-    else if (phraseId !== PHRASE_BY_PHASE[phase]) rejected = 'selection_phase_mismatch';
+    else if (!PHRASE_BY_PHASE[phase].includes(phraseId)) rejected = 'selection_phase_mismatch';
+    else if (request.followUp && phraseId === this.lastWaitingPhrase) rejected = 'selection_repeated_phrase';
     else if (!Number.isFinite(decision?.confidence) || decision.confidence < this.minimumConfidence) rejected = 'selection_confidence';
     else if (decision.language_choice !== 'cache_compatible') rejected = 'selection_language';
     else if (!Number.isFinite(ttl) || ttl <= 0 || !Number.isFinite(maxAge) || maxAge <= 0 || this.now() >= expiresAt) rejected = 'selection_expired_on_arrival';
@@ -326,7 +353,7 @@ export class DuplexCoordinator {
       // A preclassification pacing refusal has no accepted cue to resurrect.
       // At most one fresh, re-authorized waiting request may use the remaining
       // per-turn budget. Uncertainty, expiry or a reservation never retries.
-      if (phase === 'waiting' && phraseId === 'silence' && decision.requests === 0
+      if (phase === 'waiting' && !request.followUp && phraseId === 'silence' && decision.requests === 0
         && ['classification_throttled', 'cue_spacing'].includes(rejected)
         && Number.isInteger(decision.retry_after_ms) && decision.retry_after_ms >= 1 && decision.retry_after_ms <= 1000
         && !this.waitingPacingRetryUsed && this.canCue(phase, epoch)
@@ -399,14 +426,17 @@ export class DuplexCoordinator {
       if (this.cue === cue) { this.stopCue('cue_duration_limit'); this.wakeWaiting(); }
     }, this.maxCueDurationMs);
     this.cuesPlayed += 1; this.cuedUtteranceByPhase[phase] = this.utteranceId;
+    if (phase === 'waiting') { this.waitingCueCount += 1; this.waitingCompletedAt = null; this.lastWaitingPhrase = phraseId; }
     this.cueTimes.push(this.now());
     this.lastCueAtByPhase[phase] = this.now(); this.lastCueAt = this.now();
     this.emit('cue_started', { phase, phrase_id: phraseId, selection_ms: request.selectedAt - began,
       guard_hold_ms: this.now() - request.selectedAt, decision_age_ms: this.now() - began,
-      snapshot_revision: snapshot.revision, latest_revision: this.revision });
-    Promise.resolve(handle.ended).catch(() => {}).finally(() => {
+      snapshot_revision: snapshot.revision, latest_revision: this.revision, follow_up: request.followUp });
+    Promise.resolve(handle.ended).then(() => true, () => false).then(completed => {
       this.cancel(cue.expiryTimer);
       if (this.cue === cue) {
+        this.hasWaitingAudioStarted();
+        if (phase === 'waiting' && completed) this.waitingCompletedAt = this.now();
         this.cue = null; this.lastCueEndedAt = this.now(); this.emit('cue_ended', { phrase_id: phraseId });
         this.wakeWaiting();
       }
@@ -417,10 +447,17 @@ export class DuplexCoordinator {
     if (this.closed || this.userSpeaking || !generationId || generationId !== this.generationId) {
       this.emit('main_discarded', { reason: 'obsolete_generation_or_caller_speaking' }); return false;
     }
-    // Stop a filler synchronously before the first main sample is queued.
-    if (!this.mainHasAudio) this.invalidate('main_audio_ready');
+    // First PCM revokes all future selections. The output owner lets the current
+    // validated whole clip finish behind one fixed, <=1100ms audio-clock barrier.
+    if (!this.mainHasAudio) this.invalidate('main_audio_ready', { stopCue: false });
     this.mainHasAudio = true;
-    try { return this.playback.enqueueMain({ pcm, sampleRate, generationId }) === true; }
+    try {
+      const accepted = this.playback.enqueueMain({ pcm, sampleRate, generationId }) === true;
+      const handoff = this.playback.takeHandoffTelemetry?.();
+      if (handoff) this.emit('main_handoff', handoff);
+      if (!accepted) this.emit('main_discarded', { reason: 'playback_rejected' });
+      return accepted;
+    }
     catch { this.emit('main_discarded', { reason: 'invalid_audio' }); return false; }
   }
 
@@ -442,16 +479,18 @@ function pcmSamples(pcm) {
   return samples;
 }
 
-// One owned local output path. Main PCM and cached clips share a clock, so a
-// ready main answer can cancel a cue without waiting for its natural end.
+// One output clock. A main answer queues behind the current complete short cue;
+// caller cancellation remains immediate and independent from this handoff.
 export class PcmPlayback {
-  constructor({ context, cueAssets = {}, maxQueuedSeconds = 3 } = {}) {
+  constructor({ context, cueAssets = {}, maxQueuedSeconds = 3, onFailure = () => {} } = {}) {
     if (!context || !Number.isFinite(maxQueuedSeconds) || maxQueuedSeconds <= 0 || maxQueuedSeconds > 10) {
       throw new TypeError('invalid_pcm_playback');
     }
-    this.context = context; this.cueAssets = cueAssets; this.maxQueuedSeconds = maxQueuedSeconds;
+    if (typeof onFailure !== 'function') throw new TypeError('invalid_playback_failure_handler');
+    this.context = context; this.cueAssets = cueAssets; this.maxQueuedSeconds = maxQueuedSeconds; this.onFailure = onFailure;
     this.main = new Set(); this.pausedMain = null; this.cue = null; this.mainEnd = 0;
     this.cueBarrier = 0; this.cueFadeSeconds = .008; this.closed = false;
+    this.maxHandoffSeconds = 1.1; this.mainHandoffBarrier = null; this.handoffTelemetry = null;
   }
 
   buffer(pcm, sampleRate) {
@@ -510,7 +549,7 @@ export class PcmPlayback {
       if (barrier <= now) finish();
       return barrier;
     };
-    const handle = { stop, ended, buffer, when, offset, stopAt: null };
+    const handle = { stop, ended, buffer, when, offset, stopAt: null, naturalEnd: when + buffer.duration - offset };
     source.onended = finish;
     nodes.add(handle);
     try { source.start(when, offset); started = true; } catch (error) { stop(); throw error; }
@@ -519,33 +558,65 @@ export class PcmPlayback {
 
   playCue(phraseId) {
     if (this.closed || this.main.size || this.pausedMain || this.context.state !== 'running'
-      || this.context.currentTime < this.cueBarrier) return null;
+      || !Number.isFinite(this.context.currentTime) || this.context.currentTime < 0
+      || this.context.currentTime < this.cueBarrier || !CUE_PHRASES.includes(phraseId)
+      || (this.cue && (this.cue.stopAt ?? this.cue.naturalEnd) > this.context.currentTime)) return null;
     const asset = this.cueAssets instanceof Map ? this.cueAssets.get(phraseId) : this.cueAssets[phraseId];
     if (!asset) return null;
+    const buffer = this.buffer(asset.pcm, asset.sampleRate);
+    // Admit the whole asset before making a source audible. A too-long phrase
+    // cannot be made safe by cutting its ending when the main answer arrives.
+    if (!Number.isFinite(buffer.duration) || buffer.duration <= 0 || buffer.duration > this.maxHandoffSeconds) return null;
     this.cue?.stop();
-    const nodes = new Set(), handle = this.node(this.buffer(asset.pcm, asset.sampleRate), this.context.currentTime, nodes, 0, true);
+    const nodes = new Set(), handle = this.node(buffer, this.context.currentTime, nodes, 0, true);
+    const samples = buffer.getChannelData?.(0) ?? pcmSamples(asset.pcm);
+    const firstVoiced = samples.findIndex(sample => Math.abs(sample) > 64 / 32768);
+    const voicedAt = firstVoiced < 0 ? Infinity : handle.when + firstVoiced / asset.sampleRate;
+    handle.hasAudiblyStarted = () => this.context.state === 'running' && this.context.currentTime >= voicedAt
+      && (handle.stopAt === null || handle.stopAt > voicedAt);
     this.cue = handle;
     handle.ended.finally(() => { if (this.cue === handle) this.cue = null; });
     return handle;
   }
 
   enqueueMain({ pcm, sampleRate }) {
-    if (this.closed || this.pausedMain || this.context.state !== 'running') return false;
-    const buffer = this.buffer(pcm, sampleRate), now = this.context.currentTime;
-    this.cue?.stop('main_audio_ready'); this.cue = null;
-    // A preempted cue fades for at most8ms. Stop and start use the same audio
-    // clock barrier, preventing assistant-source overlap without waiting for
-    // the remaining phrase or adding another fade to each main PCM chunk.
-    const start = Math.max(now, this.mainEnd, this.cueBarrier);
-    if (start + buffer.duration - now > this.maxQueuedSeconds) return false;
-    this.node(buffer, start, this.main); this.mainEnd = start + buffer.duration;
+    if (this.closed || this.pausedMain) return false;
+    if (this.context.state !== 'running' || !Number.isFinite(this.context.currentTime) || this.context.currentTime < 0) {
+      return this.fail('output_context_unavailable');
+    }
+    let buffer;
+    try { buffer = this.buffer(pcm, sampleRate); }
+    catch (error) { this.fail('output_geometry'); throw error; }
+    const now = this.context.currentTime;
+    if (this.mainHandoffBarrier === null) {
+      const end = this.cue ? this.cue.stopAt ?? this.cue.naturalEnd : now;
+      if (!Number.isFinite(end) || end - now > this.maxHandoffSeconds + 1e-9) return this.fail('output_handoff_bound');
+      this.mainHandoffBarrier = Math.max(now, end, this.cueBarrier);
+      this.handoffTelemetry = { ready_at_s: now, scheduled_at_s: this.mainHandoffBarrier,
+        hold_ms: Math.max(0, this.mainHandoffBarrier - now) * 1000 };
+    }
+    // This barrier is fixed by the first packet; later chunks never extend it.
+    const start = Math.max(now, this.mainEnd, this.mainHandoffBarrier, this.cueBarrier);
+    if (start + buffer.duration - now > this.maxQueuedSeconds) return this.fail('output_queue_bound');
+    try { this.node(buffer, start, this.main); this.mainEnd = start + buffer.duration; }
+    catch (error) { this.fail('output_playback_failed'); throw error; }
     return true;
+  }
+
+  fail(reason) {
+    try { this.onFailure(reason); } catch { /* Failure observation cannot revive output. */ }
+    return false;
+  }
+
+  takeHandoffTelemetry() {
+    const value = this.handoffTelemetry; this.handoffTelemetry = null; return value;
   }
 
   stopMain() {
     this.pausedMain = null;
     for (const handle of [...this.main]) handle.stop();
     this.mainEnd = this.context.currentTime;
+    this.mainHandoffBarrier = null; this.handoffTelemetry = null;
   }
 
   pauseMain() {
@@ -555,14 +626,16 @@ export class PcmPlayback {
       const offset = handle.offset + Math.max(0, now - handle.when);
       if (offset < handle.buffer.duration) remaining.push({ buffer: handle.buffer, offset });
     }
-    this.stopMain(); this.pausedMain = remaining;
+    const barrier = this.mainHandoffBarrier;
+    this.stopMain(); this.pausedMain = remaining; this.mainHandoffBarrier = barrier;
   }
 
   resumeMain() {
     if (this.closed || this.context.state !== 'running') return false;
     const remaining = this.pausedMain;
     if (!remaining) return true;
-    this.pausedMain = null; this.mainEnd = this.context.currentTime;
+    this.pausedMain = null;
+    this.mainEnd = Math.max(this.context.currentTime, this.mainHandoffBarrier ?? 0, this.cueBarrier);
     try {
       for (const row of remaining) {
         this.node(row.buffer, this.mainEnd, this.main, row.offset);

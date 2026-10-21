@@ -18,7 +18,9 @@ listening cues remain occasional rather than filling every conversation pause.
 
 Partial transcripts are data for a bounded Jev content decision: ordinary
 vehicle/service conversation or excluded content. Code maps an accepted listening
-decision to `Mm-hmm.` and an accepted waiting decision to `One moment.`. Jev
+decision to `Mm-hmm.`. Waiting uses a separate disjoint content-kind question and
+code selects from the validated neutral/prospective bank described in
+[the current experiment contract](backchannel-experiment.md). Jev
 classifies the content already present without predicting the next words or
 requiring the caller to finish a request. This binary question
 avoids splitting confidence between synonymous filler phrases. An independent
@@ -30,11 +32,16 @@ question. An explicit name introduction can also qualify. Names never enter
 cached speech, and uncertain short replies still produce silence. Supplied
 contact/payment details and consent remain excluded. A pending intake proposal
 at the details stage blocks listening cues, while a neutral waiting hold can
-remain eligible if no confirmation or business operation is active.
+remain eligible if no confirmation is active. A scoped nonempty pending set
+whose rows are all queued/running can permit waiting only; unknown operations
+remain blocked. The server independently verifies this proof before and after
+selection. Only that accepted-work proof permits `Working on it.`.
 
 Jev runs alongside the conversation. The primary reasoner never waits for it.
-Selection is read-only and has no access to booking actions. Corrections,
-rejection of an agent action, sensitive details, confirmation, urgency, prompt instructions,
+Selection is read-only and has no access to booking actions. Listening remains
+strict about corrections; a fresh neutral waiting hold can follow a clear ordinary
+factual correction without affirming it. Rejection of an agent action, sensitive
+details, confirmation, urgency, prompt instructions,
 unverified state, incompatible language and missed deadlines remain silent.
 The server reads authoritative scheduler state before and after classification.
 Routine vehicle symptoms, oil changes, vehicle model years and waiting-time
@@ -42,7 +49,8 @@ questions are not control commands. Narrow deterministic exceptions preserve
 these facts while Jev still receives the original text.
 
 One caller utterance has separate listening and waiting allowances: at most one
-cue in each phase. Each phase has its own 15-second cooldown across utterances,
+listening cue and two waiting cues. Listening has a 15-second cooldown and waiting
+has a one-second cooldown across utterances,
 with at most four reservations and 64 classification attempts in a rolling
 15-second window, plus eight classification attempts per caller utterance.
 Accepted reservations are not refunded after uncertain delivery or cancellation.
@@ -61,7 +69,9 @@ prefix, leaving the current unstable word out. Compatible transcript extensions
 preserve that pending decision; a rewrite inside its prefix cancels it. A
 350 ms request cadence coalesces rapid updates instead of exhausting the request
 budget. Raw sensitive changes cancel immediately, including in the omitted tail.
-New caller onsets and actual main audio also cancel queued or playing cues.
+New caller onsets cancel queued or playing cues. Actual main audio cancels
+future selections and held decisions; a started approved whole cue follows the
+bounded completion rule below.
 Normal transcript refinements and a caller yielding do not cut an
 already-started acknowledgment. Selection expiry is a deadline to start, not a
 timer that truncates a word. A separate duration guard bounds runaway playback.
@@ -77,13 +87,21 @@ The server may return a bounded `retry_after_ms` only for preclassification
 request throttling or cue spacing. One fresh waiting retry can follow that hint,
 within the same eight-attempt utterance budget and fresh authoritative gates.
 No classifier failure, uncertainty or accepted reservation qualifies.
-The first voiced main audio cancels an active cue before main samples enter the
-output graph. Main playback never waits for a cue to finish; an acknowledgment
-already in progress may therefore be cut short. A late Jev result cannot
-resurrect it after the main answer is ready. Interrupted cues ramp down for at
-most 8 ms, with cue stop and main start scheduled at the same audio-clock
-boundary. This prevents simultaneous assistant output and softens the edge;
-it does not restore the end of a preempted word.
+The first voiced main packet cancels future cue work. An approved cue already
+playing can finish its complete bytes behind one fixed audio-clock barrier of
+at most 1,100 ms; later main packets cannot extend that barrier. Main output can
+therefore wait for the remaining complete phrase. Confirmed caller interruption,
+mute or invalidated generation cancels immediately with a bounded 8 ms fade.
+A late Jev result cannot resurrect a cue after main readiness. Output overflow
+fails the isolated session explicitly instead of silently dropping valid PCM.
+
+One optional long-wait follow-up requires a naturally completed first waiting
+cue, fresh classification/context and a different phrase. Selection begins no
+earlier than 600 ms after completion and the one-second phase cooldown; playback
+cannot begin before 1,250 ms of post-cue silence. Its unchanged absolute 800 ms
+request-age bound includes transport and holding. It cannot use preparation,
+create a third waiting cue or retry uncertainty/expiry. Fast main readiness
+cancels this future work.
 Local microphone energy can provisionally pause owned main playback before the
 provider's interruption event arrives. Pending audio and the already-scheduled
 word suffix are preserved for up to 350 ms. A provider speech event or partial
@@ -98,7 +116,10 @@ listening evaluation.
 
 ASR final clauses accumulate within the caller's turn, with bounded text and
 deduplication of cumulative refinements. Temporary stop/start events before any
-main voice preserve that turn and its cue allowance. Actual main voice, a
+main voice preserve that turn and its cue allowance unless a waiting cue has
+already audibly started. Caller resumption after voiced waiting owns a new
+epoch while retaining supplied local facts; padding-only playback does not
+manufacture a new turn. Actual main voice, a
 completed answer or a bounded abandoned-turn gap closes the retained context.
 
 For browser-owned calls, the gateway recognizes the exact
@@ -127,6 +148,13 @@ SQLite ledger. Unknown allocation outcomes cannot be retried with the same
 session. The call allocator never edits an assistant or phone number.
 
 ## Evidence and acceptance
+
+The results below are retained historical development evidence, including failed
+continuity calls. The newly frozen eight-phrase/correction/follow-up candidate
+has separate offline/model evidence in [the current experiment report](backchannel-experiment.md).
+Do not infer that older live recordings validated the new full-clip handoff or
+that new offline passes repair those recordings. New exact-commit end-to-end
+captures, response-budget checks and acoustic review remain required.
 
 `scripts/benchmark_duplex_cues.py` defaults to an offline plan. Live mode uses
 synthetic partial text and saves content-free decision results under `.local`.
@@ -209,7 +237,7 @@ threshold. This does not establish reliable cue coverage in real conversations.
 
 The first six-turn synthetic recovery call retained a failed coverage verdict:
 three waiting and three listening clips played in full, but three ordinary
-turns had no waiting clip despite 2.67–6.49-second source-end-to-main gaps.
+turns had no waiting clip despite 2.67â€“6.49-second source-end-to-main gaps.
 The recorded PCM matched all six approved cached clips and showed zero
 cue/main overlap. Exact new dispositions identified a canceled listening
 request reaching backend pacing late, a waiting decision expiring behind a
@@ -225,8 +253,10 @@ unmatched output must remain visible. A recorded synthetic test does not prove
 that an arbitrary microphone, room or phone sounds natural.
 
 This implementation is a browser candidate. The main telephone route has not
-been switched. Equivalent phone listening cues would need an owned media bridge
-and its own acceptance evidence. Promotion requires representative audio
+been switched. An opt-in owned phone media bridge is now implemented under
+`integrations/phone-bridge`, with private AudioSocket transport and exact owned
+call admission/cleanup. It still needs live carrier, encryption, interruption
+and telephone acoustic acceptance; the browser results do not provide that evidence. Promotion requires representative audio
 comparison, not just a fast first sound or a green unit test.
 
 ### Partial waiting preparation
@@ -248,8 +278,8 @@ maximum of 4.95 seconds. One listening and one waiting cue were recorded. The
 waiting cue began 0.56 seconds after final browser yield; another 2.41 seconds
 elapsed between its end event and main audio. These browser events establish
 remaining coverage and continuity problems, not sample-level acoustic quality.
-The classifier itself took 108–227 ms, while whole selection requests took
-287–586 ms. Silence, uncertain content and language decisions caused most misses;
+The classifier itself took 108â€“227 ms, while whole selection requests took
+287â€“586 ms. Silence, uncertain content and language decisions caused most misses;
 no main-arrival cancellation or cooldown rejection was recorded in that call.
 
 A frozen 24-case synthetic comparison tested a narrow clarification that an
