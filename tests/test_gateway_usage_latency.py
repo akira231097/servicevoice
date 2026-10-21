@@ -1,6 +1,7 @@
 """Usage/timing are diagnostics, never speech or authority to execute a tool."""
 import asyncio
 import json
+from uuid import UUID
 
 import httpx
 import pytest
@@ -9,7 +10,10 @@ from app.gemini_gateway import MODEL, sse
 from test_gemini_gateway import frame, post, request_body, setup, tool_stream
 
 
-def test_usage_only_frame_is_not_speech_and_observed_counts_stay_content_free(tmp_path):
+def test_usage_only_frame_is_not_speech_and_observed_counts_stay_content_free(tmp_path, monkeypatch):
+    # A random transport ID can legitimately contain the same digits as a token
+    # count. Assert on parsed speech/usage fields, including that collision.
+    monkeypatch.setattr("app.gemini_gateway.uuid4", lambda: UUID("00000000-0000-4270-8000-000000000001"))
     def provider(request):
         payload = json.loads(request.content)
         assert payload["stream_options"] == {"include_usage": True}
@@ -24,7 +28,13 @@ def test_usage_only_frame_is_not_speech_and_observed_counts_stay_content_free(tm
         try:
             response = await post(app, request_body())
             assert response.status_code == 200 and "A short synthetic answer." in response.text
-            assert "4270" not in response.text and "do-not-save" not in response.text
+            chunks = [json.loads(line[6:]) for line in response.text.splitlines()
+                      if line.startswith("data: ") and line != "data: [DONE]"]
+            assert all("usage" not in chunk for chunk in chunks)
+            spoken = "".join(choice.get("delta", {}).get("content", "")
+                             for chunk in chunks for choice in chunk.get("choices", []))
+            assert spoken == "A short synthetic answer."
+            assert "do-not-save" not in response.text
             [row] = gateway.latency_snapshot("call-a")
             assert row["usage"] == {"input_tokens": 4200, "output_tokens": 70, "total_tokens": 4270,
                                     "cached_input_tokens": 4096, "reasoning_tokens": 40}
