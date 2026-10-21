@@ -233,8 +233,13 @@ class BackchannelAudioCache:
             or voice is not None and voice != self.spec.voice
             or not isinstance(text, str)):
             return None
-        item = self._loaded.get(text)
+        # Vapi's flush chunk can include ASCII edge padding. Strip only that
+        # transport padding; case, punctuation, internal spacing, Unicode and
+        # additional words remain exact. Never normalize arbitrary sentences.
+        canonical_text = text.strip(" \t\r\n")
+        item = self._loaded.get(canonical_text)
         if item is None:
             return None
         pcm, metadata = item
-        return pcm, {**metadata, "cache_manifest_sha256": self.manifest_sha256}
+        return pcm, {**metadata, "cache_manifest_sha256": self.manifest_sha256,
+                     "cache_text_normalized":canonical_text != text}

@@ -51,7 +51,8 @@ def provider_audio(pcm=b"\x01\x00\x02\x00", rate=16000):
     return b"data: " + json.dumps({"candidates": [candidate]}).encode() + b"\n\n"
 
 
-def test_candidate_cache_returns_exact_bytes_without_any_provider_request(bank, monkeypatch):
+@pytest.mark.parametrize("padding",[""," ","\t\r\n"])
+def test_candidate_cache_returns_exact_bytes_without_any_provider_request(bank, monkeypatch,padding):
     async def scenario():
         requests, rows = [], []
         def forbidden(request):
@@ -61,7 +62,7 @@ def test_candidate_cache_returns_exact_bytes_without_any_provider_request(bank, 
             adapter = GeminiTTS(lambda: settings(bank), client=client)
             await adapter.start()
             monkeypatch.setattr(adapter.backchannel_cache, "_read", lambda *_: pytest.fail("TTS cache hit read disk"))
-            response = await adapter.response(envelope(), observer=rows.append)
+            response = await adapter.response(envelope(TEXT+padding), observer=rows.append)
             assert response.headers["content-type"] == "application/octet-stream"
             assert response.headers["cache-control"] == "no-store"
             assert await body(response) == PCM
@@ -69,6 +70,7 @@ def test_candidate_cache_returns_exact_bytes_without_any_provider_request(bank, 
         assert requests == []
         assert [row["event"] for row in rows] == ["tts.request_started", "tts.cache_hit",
             "tts.first_audio_ready", "tts.audio_stream_started", "tts.completed"]
+        assert rows[-1]["cache_text_normalized"] is bool(padding)
     asyncio.run(scenario())
 
 
@@ -77,7 +79,7 @@ def test_opt_out_and_configuration_or_exact_text_mismatch_keep_live_google_contr
     async def scenario():
         values, requests, rows = settings(bank), [], []
         rate = 8000 if kind == "rate" else 16000
-        text = TEXT + " " if kind == "different_text" else TEXT
+        text = TEXT + " Another sentence." if kind == "different_text" else TEXT
         def provider(request):
             requests.append(request)
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=provider_audio(rate=rate))

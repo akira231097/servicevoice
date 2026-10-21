@@ -148,6 +148,11 @@ exact isolated `VAPI_BACKCHANNEL_ASSISTANT_ID` and a validated, warmed immutable
 `SERVICEVOICE_BACKCHANNEL_AUDIO_MANIFEST`. The custom speech service uses the same
 model, voice and manifest. It returns a cache hit only for exact text, voice,
 model and sample geometry; normal sentences retain the existing synthesis path.
+Vapi may append ASCII edge whitespace to a flushed phrase. The lookup removes
+only outer ASCII spaces, tabs and line endings, and records
+`cache_text_normalized`; it does not change case, punctuation, internal spacing,
+Unicode characters or additional words. Input hashes still describe the actual
+provider request, while asset hashes describe the immutable approved recording.
 Keep generated audio, provider snapshots and runtime settings outside Git.
 
 ## Reading the candidate's evaluation
@@ -174,3 +179,34 @@ answer latency with the accepted assistant, including whether a queued short
 clip makes an otherwise-ready answer arrive later. Keep provider playback,
 audible interruption and late carrier packet discard as unverified until an
 appropriate audio test establishes them.
+
+## Full-duplex boundary
+
+The current candidate is an after-turn acknowledgment experiment. Vapi continues
+listening during speech and supports barge-in, but this selector runs when Vapi
+requests the next model response. It does not yet select or play listening cues
+while the caller is still talking.
+
+[Partial transcript and speech events](https://docs.vapi.ai/server-url/events)
+can support speculative Jev decisions during caller speech. Such a selector
+should choose a fixed phrase ID or silence from the current context, rather than
+generate or guess arbitrary next words. Every partial revision needs an epoch;
+late decisions must become obsolete, and partial text must never authorize a
+booking or confirmation.
+
+Audible overlap needs stronger coordination. Vapi's documented live `say`
+controls lack cue-specific cancellation, expiry and an atomic speaker-state
+check. Disabling interruption can ignore caller speech; enabling assistant
+interruption can discard the main response. Neither global mute nor clearing a
+local queue proves that an accepted remote cue is cancelled.
+
+An owned browser playback coordinator around
+[Vapi WebSocket transport](https://docs.vapi.ai/calls/websocket-transport) is a
+possible next prototype: keep forwarding caller PCM to Soniox, receive the
+existing main PCM, and schedule cached listening cues with cancellable local
+epochs. This changes the transport/playback path and needs its own audio,
+interruption and timing evaluation. Phone support would additionally need a
+media bridge. It is not implemented or approved by the current candidate's tests.
+Vapi's [GPT-Live](https://docs.vapi.ai/gpt-live/overview) takes a different path
+that replaces separate transcription/speech and does not retain this exact
+custom-audio stack, so it is not used here.
