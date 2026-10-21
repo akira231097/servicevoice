@@ -29,6 +29,7 @@ function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen 
   const audio = pcm(), hash = createHash('sha256').update(audio).digest('hex');
   const output = { cues: [], main: [], stops: 0, pauses: 0, resumes: 0, paused: false, closed: false,
     playCue(phrase) { const done = deferred(); const handle = { phrase, stopped: false, ended: done.promise,
+      finish() { done.resolve(); },
       stop() { this.stopped = true; done.resolve(); } }; this.cues.push(handle); return handle; },
     enqueueMain(row) { this.main.push(row); return true; }, stopMain() { this.stops++; this.paused = false; },
     pauseMain() { this.pauses++; this.paused = true; }, resumeMain() { this.resumes++; this.paused = false; return true; },
@@ -79,6 +80,157 @@ function message(session, body) { session.receive(JSON.stringify(body)); }
 function speech(session, role, status) { message(session, { type: 'speech-update', role, status }); }
 function transcript(session, text, final = false) { message(session, { type: 'transcript', role: 'user', transcript: text, transcriptType: final ? 'final' : 'partial' }); }
 
+test('an early provider main announcement cannot erase a waiting cue during a silent TTS gap', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
+  await f.time.advance(160); speech(f.session, 'assistant', 'started');
+  f.session.receive(pcm(0).buffer); await f.time.advance(550);
+  assert.equal(f.output.cues.length, 1); assert.equal(f.output.cues[0].phrase, 'moment');
+  assert.equal(f.output.main.length, 0);
+  f.session.receive(pcm(2000).buffer);
+  assert.equal(f.output.cues[0].stopped, true); assert.equal(f.output.main.length, 1); await f.session.stop();
+});
+
+test('fast voiced main still cancels held waiting even after an early announcement', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
+  await f.time.advance(160); speech(f.session, 'assistant', 'started');
+  await f.time.advance(400); f.session.receive(pcm(2000).buffer); await f.time.advance(300);
+  assert.equal(f.output.cues.length, 0); assert.equal(f.output.main.length, 1); await f.session.stop();
+});
+
+test('idle microphone noise cannot cancel waiting selection or manufacture output pauses', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
+  await f.time.advance(160); f.microphones[0].options.onSpeech(true);
+  await f.time.advance(550);
+  assert.equal(f.output.cues.length, 1); assert.equal(f.output.pauses, 0);
+  assert.equal(f.session.metrics().local_energy_onsets_ignored_without_output, 1);
+  await f.session.stop();
+});
+
+test('false-energy cooldown protects main output but never delays a confirmed caller interruption', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+  f.microphones[0].options.onSpeech(true); await f.time.advance(100); f.microphones[0].options.onSpeech(false);
+  assert.equal(f.output.pauses, 1); assert.equal(f.output.resumes, 1);
+  for (let i = 0; i < 5; i++) {
+    f.microphones[0].options.onSpeech(true); await f.time.advance(80); f.microphones[0].options.onSpeech(false);
+    f.session.receive(pcm().buffer);
+  }
+  assert.equal(f.output.pauses, 1); assert.equal(f.session.metrics().local_energy_onsets_ignored_during_cooldown, 5);
+  speech(f.session, 'user', 'started'); assert.equal(f.session.callerSpeaking, true);
+  assert.equal(f.session.mainAllowed, false); assert.equal(f.session.mainSpeaking, false);
+  const accepted = f.output.main.length; f.session.receive(pcm(2000).buffer); assert.equal(f.output.main.length, accepted);
+  await f.session.stop();
+});
+
+test('duplicate and late punctuated ASR finals do not create tiny turns or cut a listening cue', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'I need routine service for my vehicle'); await f.time.advance(0);
+  const utterance = f.session.coordinator.utteranceId; const cue = f.output.cues[0];
+  transcript(f.session, 'I need routine service for my vehicle.', true); speech(f.session, 'user', 'stopped');
+  await f.time.advance(160); transcript(f.session, 'I need routine service for my vehicle!', true);
+  await f.time.advance(10);
+  assert.equal(f.session.coordinator.utteranceId, utterance); assert.equal(cue.stopped, false);
+  assert.equal(f.events.filter(x => x.kind === 'caller_started' && x.source === 'user_transcript').length, 0);
+  assert.ok(f.events.some(x => x.kind === 'transcript_refinement_ignored')); await f.session.stop();
+});
+
+test('ten separated false energy bursts can pause one main generation at most twice', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+  const generation = f.session.generation;
+  for (let index = 0; index < 10; index++) {
+    f.microphones[0].options.onSpeech(true); await f.time.advance(100); f.microphones[0].options.onSpeech(false);
+    await f.time.advance(3100); f.session.receive(pcm().buffer);
+  }
+  assert.equal(f.output.pauses, 2); assert.equal(f.output.resumes, 2);
+  assert.equal(f.session.generation, generation); assert.equal(f.session.mainSpeaking, true);
+  speech(f.session, 'user', 'started'); assert.equal(f.session.mainSpeaking, false);
+  assert.equal(f.session.generation, null); await f.session.stop();
+});
+
+test('unconfirmed energy preserves an active cached hold but confirmed speech stops it', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
+  await f.time.advance(710); const cue = f.output.cues[0];
+  f.microphones[0].options.onSpeech(true); await f.time.advance(100); f.microphones[0].options.onSpeech(false);
+  assert.equal(cue.stopped, false); await f.time.advance(200); cue.finish(); await flush();
+  assert.equal(cue.stopped, false); assert.ok(f.events.some(x => x.kind === 'cue_ended'));
+  await f.session.stop();
+  const g = fixture(); await g.session.start(); transcript(g.session, 'What services are available?', true);
+  await g.time.advance(710); const interrupted = g.output.cues[0];
+  g.microphones[0].options.onSpeech(true); speech(g.session, 'user', 'started');
+  assert.equal(interrupted.stopped, true); await g.session.stop();
+});
+
+test('noise during cue-only playback cannot buffer newly-ready main behind a350ms provisional pause', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
+  await f.time.advance(710); const cue = f.output.cues[0];
+  f.microphones[0].options.onSpeech(true);
+  assert.equal(f.session.provisional, null); assert.equal(cue.stopped, false);
+  speech(f.session, 'assistant', 'started'); f.session.receive(pcm(2000).buffer);
+  assert.equal(f.output.main.length, 1); assert.equal(cue.stopped, true);
+  assert.equal(f.output.pauses, 0); assert.equal(f.session.metrics().local_energy_onsets_ignored_during_cached_cue, 1);
+  await f.session.stop();
+});
+
+for (const text of ['I have a 2020 Toyota Camry', 'My car is not starting this morning',
+  'The engine does not start', 'I want to change the oil', 'What is the current wait time for service']) {
+  test(`routine service text reaches Jev without the old lexical false block: ${text}`, async () => {
+    const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, text);
+    await f.time.advance(0); assert.equal(f.session.coordinator.sensitive, false); assert.equal(f.cues().length, 1);
+    await f.session.stop();
+  });
+}
+
+for (const text of ['Do not start booking', 'No, change the appointment', 'My PIN is 2020',
+  'My vehicle card is 4111 1111 1111 1111', 'Call my phone 202 555 0100', 'My email is alex@example.com']) {
+  test(`routine exceptions never hide a sensitive control or contact: ${text}`, async () => {
+    const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, text);
+    await f.time.advance(0); assert.equal(f.session.coordinator.sensitive, true); assert.equal(f.cues().length, 0);
+    await f.session.stop();
+  });
+}
+
+test('eight finalized clauses retain the entire bounded car story through endpointing jitter', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  const clauses = ['I have a 2020 Toyota Camry.', 'I drive it mostly around town.', 'It has been making a noise.',
+    'The noise is near the front wheel.', 'I would like to understand the options.', 'The car is not starting reliably.',
+    'I need to arrange routine service.', 'What can you do?'];
+  for (const clause of clauses) {
+    transcript(f.session, clause.replace(/\S+\s*$/, 'different')); await f.time.advance(20);
+    transcript(f.session, clause, true); speech(f.session, 'user', 'stopped');
+    await f.time.advance(50); speech(f.session, 'user', 'started');
+  }
+  assert.equal(f.session.coordinator.utteranceId, 1); assert.equal(f.session.finalSegments.length, 8);
+  assert.ok(f.session.partial.startsWith(clauses[0])); assert.ok(f.session.partial.endsWith(clauses.at(-1)));
+  assert.ok(!f.session.partial.includes('different'));
+  await f.time.advance(110); f.output.cues[0].finish(); await flush();
+  speech(f.session, 'user', 'stopped'); await f.time.advance(710);
+  const waitingRequest = f.cues().findLast(row => row.body.phase === 'waiting');
+  assert.ok(waitingRequest); assert.equal(waitingRequest.body.text, clauses.join(' '));
+  assert.equal(f.events.filter(x => x.kind === 'caller_started' && x.source).length, 1);
+  await f.session.stop();
+});
+
+test('a resumed clause keeps listening ownership but a real answered turn clears accumulated text', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'I have a Toyota Camry', true); await f.time.advance(0);
+  const listening = f.output.cues[0]; speech(f.session, 'user', 'stopped'); await f.time.advance(200);
+  speech(f.session, 'user', 'started'); transcript(f.session, 'I drive it around town', true);
+  assert.equal(f.session.coordinator.utteranceId, 1); assert.equal(listening.stopped, false);
+  assert.equal(f.session.partial, 'I have a Toyota Camry I drive it around town');
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); speech(f.session, 'assistant', 'started');
+  f.session.receive(pcm().buffer); speech(f.session, 'assistant', 'stopped');
+  speech(f.session, 'user', 'started'); transcript(f.session, 'What time do you close', true);
+  assert.equal(f.session.coordinator.utteranceId, 2); assert.equal(f.session.partial, 'What time do you close'); await f.session.stop();
+});
+
+test('a voice-failed completed provider turn and a long pending gap cannot retain old caller context', async () => {
+  const f = fixture(); await f.session.start(); transcript(f.session, 'I have a Toyota Camry', true); await f.time.advance(160);
+  speech(f.session, 'assistant', 'started'); speech(f.session, 'assistant', 'stopped');
+  transcript(f.session, 'What time do you close', true); assert.equal(f.session.coordinator.utteranceId, 2);
+  assert.equal(f.session.partial, 'What time do you close'); await f.time.advance(160 + 15001);
+  transcript(f.session, 'What services are available', true); assert.equal(f.session.coordinator.utteranceId, 3);
+  assert.equal(f.session.partial, 'What services are available'); await f.session.stop();
+});
+
 test('continuous input frames flow during a listening cue and main speech without any capture mute', async () => {
   const f = fixture(); await f.session.start();
   f.microphones[0].options.onSpeech(true); speech(f.session, 'user', 'started');
@@ -117,13 +269,14 @@ test('answer latency measures turn release separately from the end of local micr
   await f.session.stop();
 });
 
-test('a final transcript immediately cancels listening selection and waits for genuine speech stop', async () => {
+test('an interim finalized ASR clause stays listening-eligible while the caller keeps speaking', async () => {
   const f = fixture(); await f.session.start(); f.microphones[0].options.onSpeech(true);
   speech(f.session, 'user', 'started'); transcript(f.session, 'I need routine service for my vehicle', true);
-  await f.time.advance(600); assert.equal(f.cues().length, 0);
-  speech(f.session, 'user', 'stopped'); await f.time.advance(200); assert.equal(f.cues().length, 0, 'Local capture remains active');
+  await f.time.advance(600); assert.equal(f.cues().length, 1); assert.equal(f.cues()[0].body.phase, 'listening');
+  speech(f.session, 'user', 'stopped'); await f.time.advance(200); assert.equal(f.cues().length, 1, 'Local capture remains active');
+  f.output.cues[0].finish(); await flush();
   f.microphones[0].options.onSpeech(false); await f.time.advance(160 + 550);
-  assert.equal(f.cues().length, 1); assert.equal(f.cues()[0].body.phase, 'waiting');
+  assert.equal(f.cues().length, 2); assert.equal(f.cues()[1].body.phase, 'waiting');
   await f.session.stop();
 });
 
@@ -194,7 +347,7 @@ test('an older snapshot response cannot reapply a hard block after the turn-yiel
     if (++reads === 1) return old.promise;
     return reply({ ended: false, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] });
   } });
-  await f.session.start(); transcript(f.session, 'Alex', true); await f.time.advance(0);
+  await f.session.start(); transcript(f.session, 'Alex', true); await f.time.advance(160);
   assert.equal(f.cues().length, 1); assert.equal(f.session.coordinator.sensitive, false);
   old.resolve(reply({ ended: false, stage: 'confirmation', proposal: { id: 'fixture-proposal' }, pending_operations: [] }));
   await flush(); assert.equal(f.session.coordinator.sensitive, false); assert.equal(f.cues()[0].options.signal.aborted, false);
@@ -283,7 +436,7 @@ test('a long caller turn receives at most one cue per listening and waiting phas
   assert.equal(f.cues().length, 2); assert.equal(f.output.cues.length, 2);
   assert.deepEqual(f.cues().map(row => row.body.phase), ['listening', 'waiting']);
   assert.deepEqual(f.cues().map(row => row.body.epoch), [1, 1]);
-  await f.time.advance(16000);
+  await f.time.advance(300);
   transcript(f.session, 'Please also tell me more about the same issue and timing', true); await f.time.advance(710);
   assert.equal(f.cues().length, 2, 'A revised final cannot create a second waiting cue');
   assert.equal(f.output.cues.length, 2); await f.session.stop();
@@ -448,7 +601,7 @@ for (const phrase of ['not ready', "don't book it", 'never do that', 'only if it
 
 test('assistant stopped cancels a pending waiting cue even when its start or audio was unavailable', async () => {
   const f = fixture(); await f.session.start(); transcript(f.session, 'Please explain the available service options', true);
-  await f.time.advance(0); assert.equal(f.session.coordinator.generating, true);
+  await f.time.advance(160); assert.equal(f.session.coordinator.generating, true);
   speech(f.session, 'assistant', 'stopped'); await f.time.advance(1000);
   assert.equal(f.session.coordinator.generating, false); assert.equal(f.cues().length, 1);
   assert.equal(f.cues()[0].options.signal.aborted, true, 'Stop revokes the overlapped waiting request before audio');

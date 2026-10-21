@@ -8,6 +8,8 @@
  * even when the same utterance already received a listening cue.
  * --waiting-only requires the waiting/main handoff without requiring a prior
  * listening cue, for short caller replies such as a name or a brief FAQ.
+ * --conversation-plan JSON adds up to six fixed synthetic follow-up turns to
+ * the same provider call, preserving the first turn and every later outcome.
  * Provider replay proves transport/playback behavior, never Jev model quality.
  */
 import fs from 'node:fs/promises';
@@ -135,8 +137,13 @@ async function streamMain(socket, duration = 0.7) {
   }
 }
 async function setMic(level) { await page.evaluate(volume => { window.duplexFixtureInput.gain.gain.value = volume; }, level); }
-async function newFixtureSession({ snapshot = null, previousAssistant = '', shortReplies = [] } = {}) {
+async function newFixtureSession({ snapshot = null, previousAssistant = '', shortReplies = [],
+  decisionDelayMs = null, maxRequestAgeMs = null, firstWaitingReason = null,
+  serverReadDelayMs = null, serverAfterReadDelayMs = null, enforceServerPacing = false } = {}) {
   fixtureContexts.set(sessions + 1, { previousAssistant, shortReplies,
+    decisionDelayMs, maxRequestAgeMs, firstWaitingReason,
+    serverReadDelayMs, serverAfterReadDelayMs, enforceServerPacing,
+    serverLastClassifiedAt: -Infinity, serverLastCueAt: -Infinity, serverRevision: 0,
     snapshot: { mode: 'live', stage: 'service', ended: false, proposal: null, pending_operations: [], transcript: [], events: [], ...snapshot } });
   await page.evaluate(async () => {
     await window.duplexSession?.stop('fixture_reset');
@@ -160,11 +167,15 @@ async function newFixtureSession({ snapshot = null, previousAssistant = '', shor
   return provider;
 }
 
-async function yieldFixtureCaller(text = 'What are the usual maintenance options for this vehicle?') {
+async function yieldFixtureCaller(text = 'What are the usual maintenance options for this vehicle?', { turn = 1 } = {}) {
+  const stopped = await eventCount('caller_stopped');
   await setMic(0);
-  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: text, turn: 1 });
-  sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn: 1 });
-  await until(async () => await eventCount('caller_stopped') > 0, 'fixture_caller_did_not_yield');
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn });
+  // A waiting-only fixture must really release both speech gates. Finals
+  // delivered while either gate is active are valid listening observations.
+  await until(() => page.evaluate(() => !window.duplexSession.localSpeaking), 'fixture_microphone_did_not_yield');
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: text, turn });
+  await until(async () => await eventCount('caller_stopped') > stopped, 'fixture_caller_did_not_yield');
   return page.evaluate(() => ({ origin_ms: window.duplexSession.startAt,
     released_at_ms: window.duplexSession.events.findLast(row => row.kind === 'caller_stopped').at_ms }));
 }
@@ -176,6 +187,29 @@ async function completedListeningCaller() {
   await until(async () => await eventCount('cue_started') > 0, 'scenario_listening_cue_missing');
   await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(source => source.samples === 10720
     && source.ended_ms && !source.stopped)), 'scenario_listening_clip_incomplete');
+}
+
+async function captureBackendCueEvidence() {
+  if (!live || !page) return;
+  try {
+    report.backend_cue_evidence = await page.evaluate(async () => {
+      const evidence = await window.duplexSession.request('/duplex/evidence');
+      const numbers = ['epoch', 'revision', 'confidence', 'probability', 'language_probability', 'retry_after_ms',
+        'request_elapsed_ms', 'classification_ms', 'expires_in_ms', 'max_request_age_ms'];
+      const budgetKeys = ['window_ms', 'cue_reservations_in_window', 'classification_attempts_in_window',
+        'turn_classification_attempts', 'lifetime_cue_reservations', 'lifetime_classification_attempts'];
+      const rows = Array.isArray(evidence.cue_decisions) ? evidence.cue_decisions.slice(-256) : [];
+      return { available: Array.isArray(evidence.cue_decisions),
+        scope: evidence.cue_decision_scope === 'bounded_server_selection_results_not_proof_of_browser_playback'
+          ? evidence.cue_decision_scope : 'unknown',
+        cue_decisions: rows.map(row => ({ phase: ['listening', 'waiting'].includes(row.phase) ? row.phase : null,
+          phrase_id: ['neutral_ack', 'moment', 'silence'].includes(row.phrase_id) ? row.phrase_id : null,
+          reason: /^[a-z_]{1,60}$/.test(row.reason || '') ? row.reason : 'unclassified_result',
+          ...Object.fromEntries(numbers.map(key => [key, Number.isFinite(row[key]) ? row[key] : null])),
+          budget: Object.fromEntries(budgetKeys.map(key => [key, Number.isFinite(row.budget?.[key]) ? row.budget[key] : null])) })),
+        transcript_or_credentials_included: false };
+    });
+  } catch { report.backend_cue_evidence = { available: false, reason: 'readback_unavailable' }; }
 }
 
 async function saveLiveRecordings() {
@@ -307,7 +341,10 @@ try {
             return connect(destination, ...args);
           };
           source.start = (...args) => {
-            row = { sample_rate: source.buffer.sampleRate, samples: source.buffer.length, seconds: source.buffer.duration,
+            const offset = Number.isFinite(args[1]) ? args[1] : 0;
+            row = { sample_rate: source.buffer.sampleRate, samples: source.buffer.length,
+              buffer_seconds: source.buffer.duration, start_offset_s: offset,
+              seconds: Math.max(0, source.buffer.duration - offset),
               scheduled_at_s: args[0], started_ms: performance.now(), stopped: false, gain_id: outputGainId };
             window.duplexGraphEvidence.starts.push(row); return start(...args);
           };
@@ -347,6 +384,21 @@ try {
     const interruptPcm = value('--interrupt-pcm') ? await fs.readFile(path.resolve(value('--interrupt-pcm'))) : null;
     if (interruptPcm && (!interruptPcm.length || interruptPcm.length % 2 || interruptPcm.length > 16000 * 2 * 15)) throw new Error('interrupt_pcm_invalid');
     if (interruptPcm) report.interruption = { requested: true, input_seconds: interruptPcm.length / 32000, passed: false };
+    const extraTurns = [];
+    if (value('--conversation-plan')) {
+      if (interruptPcm) throw new Error('conversation_plan_and_interrupt_are_separate_scenarios');
+      const planPath = path.resolve(value('--conversation-plan'));
+      const turnPlan = JSON.parse(await fs.readFile(planPath, 'utf8'));
+      if (!Array.isArray(turnPlan) || !turnPlan.length || turnPlan.length > 6) throw new Error('conversation_plan_bounds');
+      for (const turn of turnPlan) {
+        if (!/^[a-z0-9_-]{1,50}$/.test(turn.id) || typeof turn.pcm_path !== 'string'
+          || typeof turn.expect_waiting !== 'boolean' || !Number.isFinite(turn.pause_ms)
+          || turn.pause_ms < 300 || turn.pause_ms > 17000) throw new Error('conversation_turn_invalid');
+        const audio = await fs.readFile(path.resolve(path.dirname(planPath), turn.pcm_path));
+        if (!audio.length || audio.length % 2 || audio.length > 16000 * 2 * 25) throw new Error('conversation_pcm_invalid');
+        extraTurns.push({ id: turn.id, expect_waiting: turn.expect_waiting, pause_ms: turn.pause_ms, audio });
+      }
+    }
     base = address.origin;
     report.cue_decisions = [];
     page.on('request', request => {
@@ -407,7 +459,7 @@ try {
       window.duplexGraphEvidence = { starts: [], samples: [], gains: [] };
       window.duplexSession = new DuplexSession({ callbacks: { event: row => window.duplexEvidence.push(row) },
         runtime: { getUserMedia: async () => { window.duplexSession.context.tapConversationCaller(destination.stream); return destination.stream; }, AudioContext: window.DuplexObservedAudioContext } });
-      window.duplexLiveInput = { input, ...caller, interruption };
+      window.duplexLiveInput = { input, destination, ...caller, interruption };
       await input.resume(); await window.duplexSession.start();
     }, { caller: pcm.toString('base64'), interruption: interruptPcm?.toString('base64') || null });
     report.calls_started = 1; report.external_requests = 'provider_requests_from_operator_backend';
@@ -462,6 +514,41 @@ try {
         } };
       report.interruption.passed = Object.values(report.interruption.checks).every(Boolean);
     } else await until(async () => (await replyState(report.caller_input)).ready, 'main_answer_not_completed', 35000);
+    if (extraTurns.length) {
+      const summarizeTurn = async (id, input, expectWaiting) => page.evaluate(({ id, input, expectWaiting }) => {
+        const session = window.duplexSession, events = session.events;
+        const main = events.find(row => row.kind === 'main_started' && row.at_ms >= input.input_end_ms);
+        const cues = events.filter(row => row.kind === 'cue_started' && row.at_ms >= input.started_at_ms && row.at_ms < main.at_ms);
+        const waiting = cues.find(row => row.phase === 'waiting');
+        const release = events.findLast(row => row.kind === 'caller_stopped' && row.at_ms >= input.started_at_ms && row.at_ms < main.at_ms);
+        const delay = main.at_ms - input.input_end_ms;
+        return { id, ...input, main_packet_ready_at_ms: main.at_ms, main_after_source_end_ms: delay,
+          main_after_release_ms: main.at_ms - release.at_ms, expected_waiting_when_slow: expectWaiting,
+          waiting_cue_present: Boolean(waiting), waiting_after_source_end_ms: waiting ? waiting.at_ms - input.input_end_ms : null,
+          listening_cues: cues.filter(row => row.phase === 'listening').length,
+          cue_stop_reasons: events.filter(row => row.kind === 'cue_stopped' && row.at_ms >= input.started_at_ms && row.at_ms <= main.at_ms + 50).map(row => row.reason),
+          passed: !expectWaiting || delay < 1100 || Boolean(waiting) };
+      }, { id, input, expectWaiting });
+      report.conversation_turns = [await summarizeTurn('initial', report.caller_input, requireWaiting)];
+      for (const turn of extraTurns) {
+        await delay(turn.pause_ms);
+        const input = await page.evaluate(encoded => {
+          const input = window.duplexLiveInput.input, session = window.duplexSession;
+          if (session.closed) throw new Error('conversation_ended_before_next_turn');
+          const bytes = Uint8Array.from(atob(encoded), x => x.charCodeAt(0)), view = new DataView(bytes.buffer);
+          const samples = new Float32Array(bytes.length / 2);
+          for (let index = 0; index < samples.length; index++) samples[index] = view.getInt16(index * 2, true) / 32768;
+          const buffer = input.createBuffer(1, samples.length, 16000); buffer.copyToChannel(samples, 0);
+          const source = input.createBufferSource(); source.buffer = buffer; source.connect(window.duplexLiveInput.destination);
+          const started = performance.now() - session.startAt; source.start();
+          return { started_at_ms: started, input_end_ms: started + samples.length / 16, duration_ms: samples.length / 16 };
+        }, turn.audio.toString('base64'));
+        await delay(turn.audio.length / 32 + 400);
+        await until(async () => (await replyState(input)).ready, 'conversation_reply_not_completed_' + turn.id, 35000);
+        report.conversation_turns.push(await summarizeTurn(turn.id, input, turn.expect_waiting));
+      }
+      report.checks.multi_turn_waiting_coverage = report.conversation_turns.every(row => row.passed);
+    }
     // Provider speech-stop can precede the final queued browser samples. Drain
     // the actual playback clock so recordings retain the sentence's ending.
     await delay(400);
@@ -470,6 +557,7 @@ try {
       return session.playback.main.size === 0 && session.context.currentTime >= session.playback.mainEnd - 0.01;
     }), 'audio_playback_not_drained', 4000);
     report.checks.final_browser_playback_drained = true;
+    await captureBackendCueEvidence();
     const evidence = await page.evaluate(() => ({ events: window.duplexSession.events, metrics: window.duplexSession.metrics(),
       graph: window.duplexGraphEvidence, start_at_ms: window.duplexSession.startAt, input_start_ms: window.duplexLiveInput.started_at_ms,
       input_end_ms: window.duplexLiveInput.started_at_ms + window.duplexLiveInput.seconds * 1000 }));
@@ -531,6 +619,7 @@ try {
       && (waitingOnly || (report.checks.listening_cue_during_input && report.checks.microphone_frames_during_actual_cue
         && report.checks.audible_caller_overlapped_audible_cue))
       && (!requireWaiting || report.waiting_cue?.passed === true)
+      && (!extraTurns.length || report.checks.multi_turn_waiting_coverage)
       && (!interruptPcm || report.interruption?.passed === true);
   } else {
     server = http.createServer(async (request, response) => {
@@ -565,17 +654,57 @@ try {
         const hardBlocked = state?.ended || state?.pending_operations?.length || ['confirmation', 'complete', 'handoff'].includes(state?.stage)
           || (state?.proposal && state.stage !== 'details');
         const listeningBlocked = input.phase === 'listening' && Boolean(state?.proposal);
-        const silence = hardBlocked || listeningBlocked || /actually|stop|correct|confirm|goodbye/i.test(input.text) || (short && !trustedShort);
+        const firstWaitingReason = input.phase === 'waiting' && trusted?.firstWaitingReason
+          && !cueRequests.some(row => row.session === sessionNumber && row.phase === 'waiting') ? trusted.firstWaitingReason : null;
+        let silence = hardBlocked || listeningBlocked || firstWaitingReason
+          || /actually|stop|correct|confirm|goodbye/i.test(input.text) || (short && !trustedShort);
         // First session reproduces a provider stream whose partials arrive far
         // faster than a classifier response. A stable-only fixture missed this.
         const entry = { session: sessionNumber, phase: input.phase, epoch: input.epoch,
           revision: input.revision, at_ms: performance.now() };
         cueRequests.push(entry);
-        await delay(sessionNumber === 7 && input.phase === 'waiting' ? 700
+        response.on('close', () => { entry.transport_closed_at_ms = performance.now(); });
+        const byPhase = setting => typeof setting === 'number' ? setting : setting?.[input.phase] ?? 0;
+        const readDelay = byPhase(trusted?.serverReadDelayMs);
+        if (readDelay) await delay(readDelay);
+        entry.after_initial_read_ms = performance.now();
+        let pacingReason = null, retryAfter = null;
+        if (trusted?.enforceServerPacing) {
+          trusted.serverRevision = Math.max(trusted.serverRevision, input.revision);
+          const cueRemaining = trusted.serverLastCueAt + 300 - performance.now();
+          const requestRemaining = trusted.serverLastClassifiedAt + 300 - performance.now();
+          if (cueRemaining > 0) { pacingReason = 'cue_spacing'; retryAfter = Math.ceil(cueRemaining); }
+          else if (requestRemaining > 0) { pacingReason = 'classification_throttled'; retryAfter = Math.ceil(requestRemaining); }
+        }
+        const configuredDelay = trusted?.decisionDelayMs;
+        const decisionDelay = (configuredDelay !== null && typeof configuredDelay === 'object' ? configuredDelay[input.phase] : configuredDelay)
+          ?? (sessionNumber === 7 && input.phase === 'waiting' ? 700
           : [10, 11].includes(sessionNumber) && input.phase === 'waiting' ? 150 : [1, 5].includes(sessionNumber) ? 220 : 35);
+        const absoluteAge = trusted?.maxRequestAgeMs ?? (sessionNumber === 11 && input.phase === 'waiting' ? 300 : 800);
+        entry.server_classified = !pacingReason;
+        let superseded = false;
+        if (!pacingReason) {
+          entry.classification_started_at_ms = performance.now();
+          trusted.serverLastClassifiedAt = entry.classification_started_at_ms;
+          await delay(decisionDelay);
+          superseded = trusted.enforceServerPacing && trusted.serverRevision !== input.revision;
+          if (superseded) silence = true;
+          if (!silence) { trusted.serverLastCueAt = performance.now(); entry.reserved_at_ms = trusted.serverLastCueAt; }
+        }
+        const afterReadDelay = byPhase(trusted?.serverAfterReadDelayMs);
+        if (afterReadDelay) await delay(afterReadDelay);
+        if (pacingReason) silence = true;
         entry.responded_at_ms = performance.now();
-        reply({ phrase_id: silence ? 'silence' : input.phase === 'listening' ? 'neutral_ack' : 'moment', reason: 'fixture_decision', confidence: 1,
-          probability: 1, language_choice: 'cache_compatible', expires_in_ms: sessionNumber === 11 && input.phase === 'waiting' ? 300 : 800,
+        entry.max_request_age_ms = absoluteAge;
+        entry.expires_in_ms = Math.max(0, absoluteAge - Math.ceil(entry.responded_at_ms - entry.at_ms));
+        entry.reason = pacingReason || (superseded ? 'superseded' : null) || firstWaitingReason
+          || (hardBlocked ? 'unverified_or_sensitive_context' : 'fixture_decision');
+        entry.retry_after_ms = retryAfter === null ? null : Math.max(1, retryAfter - Math.ceil(entry.responded_at_ms - entry.after_initial_read_ms));
+        reply({ phrase_id: silence ? 'silence' : input.phase === 'listening' ? 'neutral_ack' : 'moment',
+          reason: entry.reason, requests: pacingReason ? 0 : 1,
+          ...(pacingReason ? { retry_after_ms: entry.retry_after_ms } : {}), confidence: 1,
+          probability: 1, language_choice: 'cache_compatible', expires_in_ms: silence ? 0 : entry.expires_in_ms,
+          max_request_age_ms: absoluteAge,
           epoch: input.epoch, revision: input.revision, phase: input.phase }); return;
       }
       if (pathname.endsWith('/duplex/event') || pathname.endsWith('/duplex/stop') || pathname.endsWith('/end')) { reply({ ok: true }); return; }
@@ -668,9 +797,7 @@ try {
 
     await newFixtureSession();
     await setMic(0.25); sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
-    await delay(220); await setMic(0);
-    sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: 'What time does your service department close on weekdays?', turn: 1 });
-    sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn: 1 });
+    await delay(220); await yieldFixtureCaller('What time does your service department close on weekdays?');
     await until(async () => await eventCount('cue_started') > 0, 'waiting_cue_not_played');
     events = await page.evaluate(() => window.duplexSession.events);
     if (events.find(event => event.kind === 'cue_started').phase !== 'waiting') throw new Error('waiting_phase_was_not_selected');
@@ -896,6 +1023,302 @@ try {
     await freshReply; sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'stopped', turn: 2 });
     await until(async () => (await replyState(shortInput)).ready, 'fresh_short_reply_completion_not_detected');
     report.checks.short_turn_early_greeting_stop_and_stale_reply_race_rejected = true;
+
+    // A response's remaining TTL is not its original absolute age allowance.
+    // Charging the300ms selection twice would expire this result before guard.
+    await newFixtureSession({ decisionDelayMs: 300, maxRequestAgeMs: 800 });
+    const ttlSession = sessions;
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    const ttlRelease = await yieldFixtureCaller();
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+      && row.phase === 'waiting')), 'remaining_ttl_was_charged_twice');
+    const ttlCue = await page.evaluate(() => window.duplexSession.events.find(row => row.kind === 'cue_started'));
+    const ttlRequest = cueRequests.find(row => row.session === ttlSession && row.phase === 'waiting');
+    assert.ok(ttlRequest.expires_in_ms <= 500 && ttlRequest.expires_in_ms > 350, 'remaining_ttl_fixture_invalid');
+    assert.ok(ttlCue.at_ms - ttlRelease.released_at_ms >= 540 && ttlCue.at_ms - ttlRelease.released_at_ms < 750,
+      'remaining_ttl_did_not_preserve_original_guard');
+    assert.ok(ttlCue.decision_age_ms > ttlRequest.expires_in_ms && ttlCue.decision_age_ms < 800,
+      'double_count_regression_was_not_exercised');
+    report.remaining_ttl_case = { ...ttlRequest, playback_after_release_ms: ttlCue.at_ms - ttlRelease.released_at_ms,
+      playback_request_age_ms: ttlCue.decision_age_ms };
+    report.checks.remaining_ttl_and_absolute_age_were_not_double_counted = true;
+
+    await newFixtureSession({ decisionDelayMs: 150 });
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    const announcementRelease = await yieldFixtureCaller();
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    for (let index = 0; index < 6; index++) { provider.send(Buffer.alloc(640)); await delay(100); }
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+      && row.phase === 'waiting')), 'early_announcement_erased_pending_waiting_cue');
+    const announcementEvidence = await page.evaluate(() => ({ events: window.duplexSession.events,
+      graph: window.duplexGraphEvidence }));
+    assert.equal(announcementEvidence.events.filter(row => row.kind === 'main_started').length, 0,
+      'quiet_pcm_was_mistaken_for_main');
+    const announcedCue = announcementEvidence.events.find(row => row.kind === 'cue_started');
+    assert.ok(announcedCue.at_ms - announcementRelease.released_at_ms >= 540);
+    const announcementMain = streamMain(provider, .4);
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_stopped'
+      && row.reason === 'main_audio_ready')), 'actual_main_did_not_win_after_early_announcement');
+    await announcementMain;
+    report.checks.early_announcement_and_silent_tts_gap_preserved_waiting_then_actual_main_won = true;
+
+    await newFixtureSession({ decisionDelayMs: 150 });
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    await yieldFixtureCaller();
+    await setMic(.25); await delay(100); await setMic(0);
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+      && row.phase === 'waiting')), 'idle_noise_canceled_held_waiting_selection');
+    const idleNoise = await page.evaluate(() => ({ events: window.duplexSession.events, metrics: window.duplexSession.metrics() }));
+    assert.equal(idleNoise.events.filter(row => row.kind === 'provisional_barge_in').length, 0);
+    assert.ok(idleNoise.metrics.local_energy_onsets_ignored_without_output >= 1, 'idle_noise_was_not_exercised');
+    report.checks.idle_energy_did_not_revoke_guard_held_waiting_result = true;
+
+    // Noise while the short clip is sounding cannot truncate its last word.
+    await setMic(.25); await delay(80); await setMic(0);
+    await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 16800
+      && row.ended_ms && !row.stopped)), 'unconfirmed_noise_truncated_active_cached_clip');
+    const cueNoise = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+    assert.equal(cueNoise.events.filter(row => row.kind === 'cue_started').length, 1);
+    assert.equal(cueNoise.events.filter(row => row.kind === 'cue_stopped').length, 0);
+    report.checks.unconfirmed_energy_preserved_complete_active_waiting_clip = true;
+
+    await newFixtureSession();
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    await yieldFixtureCaller();
+    await until(async () => await eventCount('cue_started') === 1, 'cue_noise_priority_preflight_missing');
+    await setMic(.25); await delay(80);
+    assert.equal(await eventCount('provisional_barge_in'), 0, 'cue_only_noise_created_main_pause');
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    const cueNoiseMainAt = performance.now(); const cueNoiseMain = streamMain(provider, .3);
+    await until(async () => await eventCount('main_started') === 1, 'cue_only_noise_delayed_first_main_pcm');
+    assert.ok(performance.now() - cueNoiseMainAt < 150, 'cue_only_noise_buffered_main_for_confirmation_grace');
+    const cueNoisePriority = await page.evaluate(() => ({ graph: window.duplexGraphEvidence,
+      ignored: window.duplexSession.metrics().local_energy_onsets_ignored_during_cached_cue }));
+    const noiseCut = cueNoisePriority.graph.starts.find(row => row.samples === 16800);
+    const noiseMain = cueNoisePriority.graph.starts.find(row => row.samples === 320);
+    assert.ok(noiseCut.stopped && noiseMain, 'cue_only_noise_main_handoff_missing');
+    assert.ok(Math.abs(noiseCut.stopped_context_s - noiseMain.scheduled_at_s) < .00001, 'cue_only_noise_main_overlap');
+    assert.ok(cueNoisePriority.ignored >= 1, 'cached_cue_noise_ignore_not_exercised');
+    await cueNoiseMain; await setMic(0);
+    report.checks.first_main_pcm_during_cue_only_noise_kept_eight_ms_handoff = true;
+
+    await newFixtureSession();
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 1 });
+    const noisyMain = streamMain(provider, 4.5);
+    await until(() => page.evaluate(() => window.duplexGraphEvidence.samples.some(row => !row.cue)), 'noise_main_not_audible');
+    const noisyGeneration = await page.evaluate(() => window.duplexSession.generation);
+    for (let index = 0; index < 6; index++) { await setMic(.25); await delay(80); await setMic(0); await delay(300); }
+    const noiseBeforeConfirm = await page.evaluate(() => ({ events: window.duplexSession.events,
+      metrics: window.duplexSession.metrics(), generation: window.duplexSession.generation,
+      current_ms: performance.now(), cooldown_until_ms: window.duplexSession.energyCooldownUntil,
+      samples: window.duplexGraphEvidence.samples.slice(-12) }));
+    assert.equal(noiseBeforeConfirm.generation, noisyGeneration, 'false_noise_replaced_main_generation');
+    const pauses = noiseBeforeConfirm.events.filter(row => row.kind === 'provisional_barge_in').length;
+    assert.ok(pauses >= 1 && pauses <= 2, 'false_noise_pause_budget_not_bounded');
+    assert.ok(noiseBeforeConfirm.metrics.local_energy_onsets_ignored_during_cooldown >= 2, 'repeated_noise_backoff_not_exercised');
+    assert.ok(noiseBeforeConfirm.samples.some(row => !row.cue && row.rms > .01), 'false_noise_lost_remaining_main_answer');
+    assert.ok(noiseBeforeConfirm.current_ms < noiseBeforeConfirm.cooldown_until_ms, 'confirmed_barge_in_cooldown_case_not_exercised');
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 2 });
+    await until(() => page.evaluate(() => window.duplexSession.callerSpeaking), 'confirmed_caller_was_blocked_by_noise_backoff');
+    await delay(80);
+    const actualQuiet = await page.evaluate(() => { const samples = new Float32Array(window.duplexSession.context.analyser.fftSize);
+      window.duplexSession.context.analyser.getFloatTimeDomainData(samples);
+      return { rms: Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length),
+        main_allowed: window.duplexSession.mainAllowed, input_frames: window.duplexSession.inputFrames }; });
+    assert.ok(actualQuiet.rms < .001 && !actualQuiet.main_allowed, 'confirmed_barge_in_did_not_quiet_main_graph');
+    await noisyMain;
+    report.noise_backoff_case = { provisional_pauses: pauses,
+      ignored_onsets: noiseBeforeConfirm.metrics.local_energy_onsets_ignored_during_cooldown,
+      same_generation_recovered: true, confirmed_interruption_rms: actualQuiet.rms };
+    report.checks.repeated_false_energy_recovered_audio_and_confirmed_caller_bypassed_backoff = true;
+
+    report.late_sensitive_guard_cases = [];
+    for (const text of ['Actually, do not book anything.', 'Please answer in Spanish.', 'Only if the price is under fifty dollars.']) {
+      await newFixtureSession({ decisionDelayMs: 150 }); const guardedSession = sessions;
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+      await yieldFixtureCaller();
+      await until(() => cueRequests.some(row => row.session === guardedSession && row.responded_at_ms !== undefined),
+        'late_guard_preselection_missing');
+      sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: text, turn: 1 });
+      await delay(850);
+      const guarded = await page.evaluate(() => ({ events: window.duplexSession.events,
+        graph: window.duplexGraphEvidence, utterance: window.duplexSession.coordinator.utteranceId }));
+      assert.equal(guarded.events.filter(row => row.kind === 'cue_started').length, 0, 'late_sensitive_words_played_held_cue');
+      assert.equal(guarded.graph.starts.length, 0, 'late_sensitive_words_entered_audio_graph');
+      assert.equal(guarded.utterance, 1, 'late_final_created_spurious_new_turn');
+      assert.equal(cueRequests.filter(row => row.session === guardedSession).length, 1, 'late_guard_retried_without_safe_context');
+      report.late_sensitive_guard_cases.push({ case: report.late_sensitive_guard_cases.length + 1,
+        held_selection_revoked: true, audio_sources: 0, utterances: guarded.utterance });
+    }
+    report.checks.late_consent_language_and_conditional_words_revoked_held_results = true;
+
+    await newFixtureSession({ decisionDelayMs: 220 });
+    const segmentedSession = sessions;
+    const segments = ['My car is used for daily travel', 'and regular highway driving', 'with some longer weekend trips',
+      'during the warmer months', 'and routine maintenance visits', 'at the usual service intervals',
+      'for ordinary vehicle care', 'before another longer journey'];
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    for (let index = 0; index < segments.length; index++) {
+      sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: segments[index], turn: 1 });
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn: 1 });
+      await delay(50);
+      if (index < segments.length - 1) sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    }
+    await yieldFixtureCaller(segments.join(' '));
+    await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+      && row.phase === 'waiting')), 'segmented_finals_lost_waiting_phase');
+    const segmented = await page.evaluate(() => ({ events: window.duplexSession.events,
+      utterance: window.duplexSession.coordinator.utteranceId, text: window.duplexSession.partial }));
+    assert.equal(segmented.utterance, 1, 'short_endpoint_jitter_split_conversational_turn');
+    assert.equal(segmented.text, segments.join(' '), 'segmented_finals_lost_or_repeated_words');
+    assert.deepEqual(segmented.events.filter(row => row.kind === 'cue_started').map(row => row.phase), ['listening', 'waiting']);
+    assert.equal(cueRequests.filter(row => row.session === segmentedSession).length, 2, 'segmented_finals_unbounded_selection_attempts');
+    report.checks.eight_final_segments_and_50ms_endpoint_jitter_preserved_one_turn_and_both_phases = true;
+
+    report.context_recovery_cases = [];
+    for (const reason of ['unverified_or_sensitive_context', 'classification_uncertain']) {
+      await newFixtureSession({ firstWaitingReason: reason }); const recoverySession = sessions;
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+      await yieldFixtureCaller();
+      await until(() => page.evaluate(wanted => window.duplexSession.events.some(row => row.kind === 'cue_suppressed'
+        && row.reason === wanted), reason), 'context_recovery_initial_silence_missing');
+      const trusted = fixtureContexts.get(recoverySession);
+      trusted.snapshot.pending_operations = [{ id: 'fixture-pending-operation' }];
+      await page.evaluate(() => window.duplexSession.refreshSnapshot());
+      assert.equal(await page.evaluate(() => window.duplexSession.snapshotHardBlocked), true);
+      await delay(100); trusted.snapshot.pending_operations = [];
+      await page.evaluate(() => window.duplexSession.refreshSnapshot());
+      if (reason === 'unverified_or_sensitive_context') {
+        await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+          && row.phase === 'waiting')), 'authoritative_context_clear_failed_to_reclassify');
+        assert.equal(cueRequests.filter(row => row.session === recoverySession).length, 2);
+      } else {
+        await delay(850); assert.equal(await eventCount('cue_started'), 0);
+        assert.equal(cueRequests.filter(row => row.session === recoverySession).length, 1, 'stable_uncertainty_was_retried_after_context_clear');
+      }
+      report.context_recovery_cases.push({ prior_reason: reason,
+        selection_requests: cueRequests.filter(row => row.session === recoverySession).length,
+        cues_played: await eventCount('cue_started') });
+    }
+    report.checks.only_authoritative_gate_clear_reclassified_context_failure = true;
+
+    // Model authoritative reads separately from classification. Browser abort
+    // does not unwind server work that has already crossed its first read.
+    report.api_pacing_recovery_cases = [];
+    for (const expectedReason of ['classification_throttled', 'cue_spacing']) {
+      await newFixtureSession({ decisionDelayMs: { listening: 100, waiting: 35 },
+        serverReadDelayMs: { listening: 280, waiting: expectedReason === 'cue_spacing' ? 240 : 0 },
+        enforceServerPacing: true });
+      const pacedSession = sessions;
+      const text = 'I would like information about routine maintenance options for my car';
+      sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+      sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript: text, turn: 1 });
+      await until(() => cueRequests.some(row => row.session === pacedSession && row.phase === 'listening'),
+        'delayed_routing_listening_request_missing');
+      await delay(80); await yieldFixtureCaller(text);
+      sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+      await until(() => page.evaluate(reason => window.duplexSession.events.some(row => row.kind === 'cue_retry_scheduled'
+        && row.reason === reason), expectedReason), 'preclassification_pacing_did_not_schedule_fresh_retry');
+      await until(() => page.evaluate(() => window.duplexSession.events.some(row => row.kind === 'cue_started'
+        && row.phase === 'waiting')), 'fresh_pacing_retry_did_not_play_waiting_cue');
+      const pacedRequests = cueRequests.filter(row => row.session === pacedSession);
+      const lateListening = pacedRequests.find(row => row.phase === 'listening');
+      const waitingRequests = pacedRequests.filter(row => row.phase === 'waiting');
+      assert.ok(lateListening.classification_started_at_ms > lateListening.transport_closed_at_ms,
+        'canceled_request_did_not_reach_delayed_server_work');
+      assert.equal(waitingRequests.length, 2, 'pacing_retry_was_not_one_fresh_request');
+      assert.equal(waitingRequests[0].reason, expectedReason);
+      assert.equal(waitingRequests[0].server_classified, false, 'pacing_refusal_spent_a_classification');
+      assert.ok(waitingRequests[0].retry_after_ms >= 1 && waitingRequests[0].retry_after_ms <= 1000);
+      assert.ok(waitingRequests[1].revision > waitingRequests[0].revision, 'pacing_retry_reused_old_revision');
+      assert.equal(waitingRequests[1].server_classified, true);
+      const paced = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+      assert.equal(paced.events.filter(row => row.kind === 'cue_started' && row.phase === 'listening').length, 0,
+        'canceled_listening_response_played_after_yield');
+      assert.equal(paced.events.filter(row => row.kind === 'cue_retry_scheduled').length, 1);
+      const accepted = paced.events.find(row => row.kind === 'cue_started');
+      assert.ok(accepted.decision_age_ms < 800, 'fresh_pacing_retry_extended_an_accepted_deadline');
+      await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 16800
+        && row.ended_ms && !row.stopped)), 'fresh_retry_waiting_clip_was_incomplete');
+      report.api_pacing_recovery_cases.push({ reason: expectedReason, waiting_requests: waitingRequests,
+        delayed_listening: lateListening, retry_count: 1, accepted_request_age_ms: accepted.decision_age_ms,
+        complete_waiting_clip_ms: 1050 });
+    }
+    report.checks.delayed_api_reads_caused_one_fresh_throttle_or_spacing_retry_without_classifying_refusals = true;
+
+    await newFixtureSession({ serverReadDelayMs: 180, decisionDelayMs: 200, serverAfterReadDelayMs: 100,
+      enforceServerPacing: true });
+    const lateClipSession = sessions;
+    const lateClipText = 'Please explain the usual routine maintenance options for my vehicle';
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+    sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript: lateClipText, turn: 1 });
+    await until(async () => await eventCount('cue_started') === 1, 'late_listening_decision_did_not_play');
+    await delay(20);
+    sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn: 1 });
+    sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: lateClipText, turn: 1 });
+    sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+    await until(async () => await eventCount('caller_stopped') > 0, 'late_listening_caller_did_not_yield');
+    await delay(300);
+    assert.equal(cueRequests.filter(row => row.session === lateClipSession && row.phase === 'waiting').length, 0,
+      'waiting_selection_spent_ttl_behind_active_listening_clip');
+    await until(async () => await eventCount('cue_started') === 2, 'late_listening_clip_starved_waiting_phase');
+    const lateClip = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+    const latePhases = lateClip.events.filter(row => row.kind === 'cue_started');
+    assert.deepEqual(latePhases.map(row => row.phase), ['listening', 'waiting']);
+    const lateWaitingRequests = cueRequests.filter(row => row.session === lateClipSession && row.phase === 'waiting');
+    assert.equal(lateWaitingRequests.length, 1, 'accepted_waiting_decision_was_refreshed');
+    assert.ok(latePhases[1].at_ms - latePhases[0].at_ms >= 960, 'late_clip_end_spacing_was_bypassed');
+    assert.ok(latePhases[1].decision_age_ms >= 450 && latePhases[1].decision_age_ms < 800,
+      'late_clip_decision_absolute_age_was_not_preserved');
+    assert.equal(lateClip.events.filter(row => row.kind === 'cue_retry_scheduled').length, 0,
+      'accepted_waiting_selection_used_pacing_retry');
+    assert.equal(lateClip.events.filter(row => row.reason === 'selection_expired_before_playback').length, 0,
+      'late_listening_clip_consumed_waiting_ttl');
+    await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 16800
+      && row.ended_ms && !row.stopped)), 'late_listening_waiting_clip_was_incomplete');
+    report.late_listening_decision_case = { api_before_read_ms: 180, classifier_ms: 200, api_after_read_ms: 100,
+      waiting_requests: 1, accepted_expiry_refreshed: false, waiting_request_age_ms: latePhases[1].decision_age_ms,
+      listening_to_waiting_start_ms: latePhases[1].at_ms - latePhases[0].at_ms, complete_waiting_clip_ms: 1050 };
+    report.checks.late_listening_clip_deferred_waiting_selection_instead_of_expiring_an_accepted_decision = true;
+
+    // Use the production15s phase cooldown and real browser clocks. Six full
+    // waiting clips in one call exceed both the old four-cue lifetime cap and
+    // one rolling window without resetting the session, its counts or timers.
+    await newFixtureSession({ decisionDelayMs: 90 }); const longSession = sessions;
+    report.long_conversation_turns = [];
+    for (let turn = 1; turn <= 6; turn++) {
+      if (turn > 1) {
+        const quietWait = await page.evaluate(() => { const last = window.duplexSession.events.findLast(row => row.kind === 'cue_started'
+          && row.phase === 'waiting'); return Math.max(0, window.duplexSession.startAt + last.at_ms + 15100 - performance.now()); });
+        await delay(quietWait);
+      }
+      const frames = uplink.length;
+      await setMic(.25); sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn });
+      await delay(70);
+      const release = await yieldFixtureCaller(`What routine maintenance options are available for my vehicle during visit number ${turn}?`, { turn });
+      sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: turn + 100 });
+      await until(async () => await eventCount('cue_started') === turn, 'long_call_lost_waiting_cue_after_lifetime_cap');
+      const current = await page.evaluate(() => ({ cue: window.duplexSession.events.findLast(row => row.kind === 'cue_started'),
+        origin: window.duplexSession.startAt, utterance: window.duplexSession.coordinator.utteranceId }));
+      await until(() => page.evaluate(start => window.duplexGraphEvidence.starts.some(row => row.samples === 16800
+        && row.started_ms >= start - 10 && row.ended_ms && !row.stopped), current.origin + current.cue.at_ms),
+      'long_call_waiting_clip_was_incomplete');
+      assert.equal(current.cue.phase, 'waiting'); assert.equal(current.utterance, turn);
+      assert.ok(uplink.length - frames >= 20, 'long_call_microphone_paused_during_waiting_clip');
+      await streamMain(provider, .25);
+      sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'stopped', turn: turn + 100 });
+      await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'long_call_main_did_not_drain');
+      report.long_conversation_turns.push({ turn, utterance: current.utterance, cue_started_at_ms: current.cue.at_ms,
+        cue_after_release_ms: current.cue.at_ms - release.released_at_ms, complete_waiting_clip_ms: 1050,
+        continuous_input_frames: uplink.length - frames });
+    }
+    const longDuration = report.long_conversation_turns.at(-1).cue_started_at_ms - report.long_conversation_turns[0].cue_started_at_ms;
+    assert.ok(longDuration >= 75000, 'long_call_production_cooldown_duration_not_exercised');
+    assert.equal(cueRequests.filter(row => row.session === longSession).length, 6, 'long_call_requests_were_not_one_per_turn');
+    assert.equal(await eventCount('cue_started'), 6); assert.equal(await eventCount('main_started'), 6);
+    report.long_conversation = { session_count: 1, turns: 6, waiting_cues: 6, main_answers: 6,
+      first_to_last_cue_ms: longDuration, phase_cooldown_ms: 15000, clocks_or_budgets_modified: false };
+    report.checks.six_real_clock_turns_survived_15s_windows_and_four_cue_lifetime_regression = true;
     report.checks.exact_20ms_input_frames = uplink.every(frame => frame.bytes === 640);
     assert.equal(report.checks.exact_20ms_input_frames, true);
     report.checks.browser_errors = errors.length; assert.equal(errors.length, 0);
@@ -915,6 +1338,7 @@ try {
     report.events_at_failure = evidence.events;
     if (live) { report.metrics = evidence.metrics; report.audio_graph = evidence.graph; }
   } catch {} }
+  await captureBackendCueEvidence();
   try { await saveLiveRecordings(); } catch { report.recording_failure = true; }
 } finally {
   if (page) {

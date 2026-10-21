@@ -157,6 +157,69 @@ def test_name_language_context_is_confined_to_waiting_payload_and_default_word_g
     assert eligible_state(messages, minimum_words=1)[1] == "eligible"
 
 
+@pytest.mark.parametrize("text", ["My 2018 car does not start", "My car is not starting",
+    "The engine has no power", "I need to change the oil", "What is the wait time?", "What is the waiting time?"])
+def test_routine_vehicle_language_preserves_original_text_for_jev(text):
+    for phase in ("listening", "waiting"):
+        state, reason = cue_state(text, phase, "How can I help with your vehicle?", SAFE)
+        assert reason == "eligible" and state["partial_utterance"] == text
+
+
+@pytest.mark.parametrize("text", ["Do not start booking", "Do not start the appointment", "No I do not approve",
+    "Do not change the oil", "Wait do not book", "Change my appointment", "Actually my car does not start"])
+def test_routine_normalization_never_hides_action_rejection_or_correction(text):
+    assert cue_state(text, "waiting", "How can I help with your vehicle?", SAFE)[0] is None
+
+
+def test_generic_followup_and_compound_name_question_do_not_assert_consent():
+    assert cue_state("What services do you offer?", "waiting", "Is there anything else I can help with?", SAFE)[1] == "eligible"
+    state, reason = cue_state("My name is Alex Morgan", "waiting", "May I have your name and phone number?",
+        {**SAFE, "stage": "details", "has_pending_proposal": True})
+    assert reason == "eligible" and state["previous_assistant"] == "May I have your name and phone number?"
+    assert cue_state("Yes", "waiting", "Would you like me to book that?", SAFE)[0] is None
+    assert cue_state("What services do you offer?", "waiting", "Please confirm the booking readback", SAFE)[0] is None
+
+
+def test_rolling_reservations_are_bounded_and_do_not_refund_ambiguous_delivery():
+    async def scenario():
+        clock = Clock()
+        session = DuplexCueSession(ImmediatePolicy(), max_cues=2, cooldown_seconds=1, clock=clock)
+        assert (await session.choose(**args())).phrase_id == "neutral_ack"
+        clock.now = .31
+        assert (await session.choose(**args(revision=2, phase="waiting"))).phrase_id == "moment"
+        session.invalidate(reason="main_speaking")
+        clock.now = 2
+        assert (await session.choose(**args(epoch=2))).reason == "call_budget"
+        clock.now = 15
+        assert (await session.choose(**args(epoch=3))).phrase_id == "neutral_ack"
+        assert session.count == 3 and session.budget_state()["cue_reservations_in_window"] == 2
+    asyncio.run(scenario())
+
+
+def test_per_turn_attempt_limit_leaves_one_waiting_attempt_and_new_turn_recovers():
+    async def scenario():
+        clock = Clock()
+        class SilentPolicy(ImmediatePolicy):
+            async def choose(self, *a, **kw):
+                self.calls += 1
+                return BackchannelDecision(reason="classifier_silence", requests=1)
+        policy = SilentPolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        for revision in range(1, 8):
+            clock.now = revision * .31
+            assert (await session.choose(**args(revision=revision))).reason == "classifier_silence"
+        clock.now += .31
+        assert (await session.choose(**args(revision=8))).reason == "utterance_classification_budget"
+        clock.now += .31
+        assert (await session.choose(**args(revision=9, phase="waiting"))).reason == "classifier_silence"
+        clock.now += .31
+        assert (await session.choose(**args(revision=10, phase="waiting"))).reason == "utterance_classification_budget"
+        clock.now += .31
+        assert (await session.choose(**args(epoch=2))).reason == "classifier_silence"
+        assert policy.calls == session.classifications == 9
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("content_probability,language_probability,expected", [
     (.97, 1., "silence"), (.98, .99, "moment"), (1., .98, "silence"),
 ])
@@ -272,8 +335,9 @@ def test_cue_budget_is_per_phase_and_call_with_monotonic_revisions():
         clock.now = 15
         assert (await session.choose(**args(epoch=2, revision=2))).phrase_id == "neutral_ack"
         clock.now = 30
-        assert (await session.choose(**args(epoch=3))).reason == "call_budget"
-        assert session.count == policy.calls == 2
+        assert (await session.choose(**args(epoch=3))).phrase_id == "neutral_ack"
+        assert session.count == policy.calls == 3
+        assert session.budget_state()["cue_reservations_in_window"] == 1
     asyncio.run(scenario())
 
 
@@ -297,7 +361,7 @@ def test_listening_then_waiting_can_reserve_once_each_without_refunds():
     asyncio.run(scenario())
 
 
-def test_phase_cooldowns_are_independent_but_call_cap_covers_both():
+def test_phase_cooldowns_are_independent_and_long_calls_recover():
     async def scenario():
         clock, policy = Clock(), ImmediatePolicy()
         session = DuplexCueSession(policy, clock=clock)
@@ -311,9 +375,11 @@ def test_phase_cooldowns_are_independent_but_call_cap_covers_both():
         clock.now = 16
         assert (await session.choose(**args(epoch=2, revision=3, phase="waiting"))).phrase_id == "moment"
         clock.now = 31
-        assert (await session.choose(**args(epoch=3))).reason == "call_budget"
-        assert (await session.choose(**args(epoch=3, revision=2, phase="waiting"))).reason == "call_budget"
-        assert session.count == session.classifications == policy.calls == 4
+        assert (await session.choose(**args(epoch=3))).phrase_id == "neutral_ack"
+        clock.now = 31.31
+        assert (await session.choose(**args(epoch=3, revision=2, phase="waiting"))).phrase_id == "moment"
+        assert session.count == session.classifications == policy.calls == 6
+        assert session.reservations == {(3, "listening"), (3, "waiting")}
     asyncio.run(scenario())
 
 
@@ -465,6 +531,75 @@ def test_sampling_can_resume_after_throttle_without_reusing_an_old_partial():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("guard", ["classification_throttled", "cue_spacing"])
+def test_preclassification_pacing_hint_allows_only_a_fresh_revision_without_spending(guard):
+    async def scenario():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        if guard == "classification_throttled":
+            session.last_attempt_at = .0
+        else:
+            session.last_cue_at = .0
+        clock.now = .1
+        refused = await session.choose(**args(phase="waiting"))
+        assert refused.phrase_id == "silence" and refused.reason == guard
+        assert 199 <= refused.retry_after_ms <= 201
+        assert refused.expires_in_ms == 0
+        assert policy.calls == session.classifications == session.count == 0
+        assert not session.reservations
+        clock.now += refused.retry_after_ms / 1000
+        assert (await session.choose(**args(phase="waiting"))).reason == "stale_revision"
+        accepted = await session.choose(**args(phase="waiting", revision=2))
+        assert accepted.phrase_id == "moment" and accepted.retry_after_ms is None
+        assert session.count == session.classifications == policy.calls == 1
+        duplicate = await session.choose(**args(phase="waiting", revision=3))
+        assert duplicate.reason == "phase_already_acknowledged" and duplicate.retry_after_ms is None
+        assert session.count == session.classifications == policy.calls == 1
+    asyncio.run(scenario())
+
+
+def test_cancelled_listening_can_throttle_waiting_without_losing_later_phase_selection():
+    async def scenario():
+        entered = asyncio.Event()
+        clock = Clock()
+
+        class PendingListeningPolicy(ImmediatePolicy):
+            async def choose(self, *a, phase, **kw):
+                if phase == "listening":
+                    entered.set()
+                    await asyncio.sleep(10)
+                return await super().choose(*a, phase=phase, **kw)
+        policy = PendingListeningPolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        listening = asyncio.create_task(session.choose(**args()))
+        await entered.wait()
+        clock.now = .1
+        refused = await session.choose(**args(phase="waiting", revision=2))
+        assert refused.reason == "classification_throttled" and refused.retry_after_ms == 200
+        assert (await listening).reason == "superseded"
+        assert session.classifications == 1 and not session.reservations
+        clock.now = .301
+        accepted = await session.choose(**args(phase="waiting", revision=3))
+        assert accepted.phrase_id == "moment" and accepted.retry_after_ms is None
+        assert session.classifications == 2 and session.count == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("text,reason", [("Stop booking", "sensitive_utterance"),
+    ("Yes", "sensitive_utterance")])
+def test_new_sensitive_waiting_text_cannot_receive_a_pacing_retry_hint(text, reason):
+    async def scenario():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        session.last_attempt_at = session.last_cue_at = 0
+        request = args(phase="waiting")
+        request["text"] = text
+        decision = await session.choose(**request)
+        assert decision.reason == reason and decision.retry_after_ms is None
+        assert policy.calls == session.classifications == session.count == 0
+    asyncio.run(scenario())
+
+
 def test_silence_still_has_a_bounded_classification_budget():
     async def scenario():
         clock = Clock()
@@ -481,6 +616,9 @@ def test_silence_still_has_a_bounded_classification_budget():
         clock.now += .31
         assert (await session.choose(**args(revision=3))).reason == "classification_budget"
         assert session.classifications == policy.calls == 2 and session.count == 0
+        clock.now = 16
+        assert (await session.choose(**args(epoch=2))).reason == "classifier_silence"
+        assert session.classifications == policy.calls == 3
     asyncio.run(scenario())
 
 

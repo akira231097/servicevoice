@@ -6,9 +6,11 @@ adapter. Vapi administration credentials stay in the operator's local process.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import sqlite3
 from pathlib import Path
 import time
@@ -17,12 +19,30 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import Header, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from .backchannel_audio import BackchannelAudioCache
 from .backchannel_catalog import PHRASES
-from .duplex_cues import DuplexCuePolicy, DuplexCueSession
+from .duplex_cues import DuplexCuePolicy, DuplexCueSession, cue_state
+
+REQUEST_MAX_AGE_MS = 800
+DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "invalid_phase",
+    "unverified_or_sensitive_context", "main_speaking", "conditional_utterance", "sensitive_utterance",
+    "private_contact_detail", "invalid_context", "turn_not_allowed", "sensitive_context", "invalid_messages",
+    "not_final_user_turn", "input_bounds", "cached_language_unverified", "short_or_ambiguous",
+    "urgent_or_safety", "untrusted_control_content", "prior_context_bounds", "sensitive_prior_turn",
+    "credential_missing", "policy_not_ready", "classification_capacity", "provider_unavailable",
+    "invalid_response", "response_bounds", "model_mismatch", "policy_closed", "classification_deadline",
+    "classifier_silence", "classification_uncertain", "classification_unavailable", "session_closed",
+    "invalid_revision", "stale_revision", "phase_already_acknowledged", "call_budget", "cooldown",
+    "cue_spacing", "classification_budget", "utterance_classification_budget", "classification_throttled",
+    "superseded", "phase_mismatch", "decision_expired", "scheduler_changed", "request_expired"})
+EVENT_REASONS = DECISION_REASONS | frozenset({"classifier_deadline", "classifier_unavailable",
+    "selection_phase_mismatch", "selection_confidence", "selection_language", "selection_expired_on_arrival",
+    "selection_expired_before_playback", "clip_unavailable", "caller_resumed", "caller_started", "partial_revised",
+    "final_revised", "caller_stopped", "generation_started", "generation_finished", "sensitive_state_changed",
+    "main_audio_ready", "main_announced", "call_ended", "provisional_barge_in", "muted", "sensitive_state", "listening_context"})
 
 
 class CueRequest(BaseModel):
@@ -39,6 +59,19 @@ class PlaybackEvent(BaseModel):
     epoch: int = Field(ge=0, le=10000, strict=True)
     at_ms: float = Field(ge=0, le=360000, allow_inf_nan=False)
     phrase_id: str | None = Field(default=None, pattern="^(neutral_ack|moment|silence)$")
+    phase: str | None = Field(default=None, pattern="^(listening|waiting)$")
+    reason: str | None = Field(default=None, pattern="^(?:" + "|".join(sorted(EVENT_REASONS)) + ")$")
+    blocked: bool | None = Field(default=None, strict=True)
+    retry_after_ms: int | None = Field(default=None, ge=1, le=1000, strict=True)
+
+    @model_validator(mode="after")
+    def bounded_pacing_retry(self):
+        if self.event == "cue_retry_scheduled" or self.retry_after_ms is not None:
+            if (self.event != "cue_retry_scheduled" or self.phase != "waiting"
+                    or self.reason not in ("classification_throttled", "cue_spacing")
+                    or self.retry_after_ms is None):
+                raise ValueError("Only a bounded waiting pacing retry may carry a retry delay.")
+        return self
 
 
 def cue_context(snapshot):
@@ -61,6 +94,8 @@ class DuplexControl:
         self.lock = asyncio.Lock()
         self.audio = None
         self.events = {}
+        self.decisions = {}
+        self.clock = time.monotonic
         self.creating = set()
         self.created = set()
         self.calls = {}
@@ -100,6 +135,7 @@ class DuplexControl:
                     raise HTTPException(429, "Duplex session capacity reached.")
                 self.sessions[sid] = DuplexCueSession(self.policy)
                 self.events[sid] = []
+                self.decisions[sid] = deque(maxlen=256)
             return self.sessions[sid]
 
     def reserve_call(self, sid):
@@ -241,6 +277,7 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
 
     @app.post("/api/sessions/{sid}/duplex/cue")
     async def cue(sid: str, body: CueRequest, x_session_token: str = Header(default="")):
+        received_at = control.clock()
         row = await control.authenticated(sid, x_session_token)
         session = await control.session(sid)
         # The private console uses one fresh authenticated-snapshot callback for
@@ -255,12 +292,57 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
         decision = await session.choose(epoch=body.epoch, revision=body.revision, text=body.text,
             phase=body.phase, key=control.config().get("TYPESAFE_API_KEY"), context=context,
             previous_assistant=previous)
+        selected_at = control.clock()
         after = await run_in_threadpool(control.snapshot, sid, x_session_token)
-        if cue_context(after) != context:
+        after_context = cue_context(after)
+        after_previous = next((item.get("text", "") for item in reversed(after.get("transcript", []))
+                               if item.get("role") == "assistant"), "")[-1600:]
+        stage_only_change = (context["stage"] in ("service", "slot")
+            and after_context["stage"] in ("service", "slot")
+            and all(context[key] is False and after_context[key] is False for key in context if key != "stage")
+            and after_previous == previous
+            and cue_state(body.text, body.phase, after_previous, after_context)[1] == "eligible")
+        result = asdict(decision)
+        elapsed_ms = max(0, math.ceil((control.clock() - received_at) * 1000))
+        # Remaining TTL is measured at response construction, after the fresh
+        # authoritative read. The browser anchors this remainder to receipt and
+        # separately caps absolute age from its own HTTP-request start.
+        remaining = min(decision.expires_in_ms - math.ceil((control.clock() - selected_at) * 1000),
+                        REQUEST_MAX_AGE_MS - elapsed_ms)
+        result["max_request_age_ms"] = REQUEST_MAX_AGE_MS
+        if after_context != context and not stage_only_change:
             session.invalidate(reason="scheduler_changed")
-            return {"phrase_id": "silence", "reason": "scheduler_changed", "confidence": 0,
-                    "epoch": body.epoch, "revision": body.revision, "expires_in_ms": 0}
-        return asdict(decision)
+            result.update(phrase_id="silence", reason="scheduler_changed", confidence=0, expires_in_ms=0)
+        elif decision.phrase_id != "silence" and remaining <= 0:
+            result.update(phrase_id="silence", reason="request_expired", expires_in_ms=0)
+        else:
+            result["expires_in_ms"] = max(0, remaining) if decision.phrase_id != "silence" else 0
+        retry_after = result.get("retry_after_ms")
+        if (result["phrase_id"] == "silence" and result["reason"] in
+                ("classification_throttled", "cue_spacing") and type(retry_after) is int
+                and 1 <= retry_after <= 1000):
+            # The hint is remaining pacing at response construction. A retry
+            # must be a new authenticated selection with current state; this
+            # cannot revive an accepted, expired or uncertain decision.
+            result["retry_after_ms"] = max(1, retry_after - max(0,
+                math.ceil((control.clock() - selected_at) * 1000)))
+        else:
+            result.pop("retry_after_ms", None)
+        # Never retain utterances, prior turns, tokens, provider bodies or URLs.
+        def statistic(value):
+            return value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1 else None
+        control.decisions[sid].append({"phase": body.phase, "epoch": body.epoch, "revision": body.revision,
+            "phrase_id": result["phrase_id"],
+            "reason": result["reason"] if result["reason"] in DECISION_REASONS else "unclassified_result",
+            "confidence": statistic(result.get("confidence")), "probability": statistic(result.get("probability")),
+            "language_probability": statistic(result.get("language_probability")),
+            "request_elapsed_ms": elapsed_ms, "classification_ms": (decision.classification_ms
+                if type(decision.classification_ms) in (int, float) and math.isfinite(decision.classification_ms)
+                and decision.classification_ms >= 0 else None),
+            "expires_in_ms": result["expires_in_ms"], "max_request_age_ms": REQUEST_MAX_AGE_MS,
+            "retry_after_ms": result.get("retry_after_ms"),
+            "budget": session.budget_state()})
+        return result
 
     @app.post("/api/sessions/{sid}/duplex/event")
     async def event(sid: str, body: PlaybackEvent, x_session_token: str = Header(default="")):
@@ -279,6 +361,8 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
         control.config()
         await run_in_threadpool(control.authorize, sid, x_session_token, True)
         return {"events": control.events.get(sid, []), "scope": "browser_reported_playback_events",
+                "cue_decisions": list(control.decisions.get(sid, [])),
+                "cue_decision_scope": "bounded_server_selection_results_not_proof_of_browser_playback",
                 "provider_packet_generation_ids": "unavailable", "human_listening": "not_established"}
 
     return control

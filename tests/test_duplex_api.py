@@ -310,6 +310,49 @@ def test_scheduler_becoming_protected_during_classification_suppresses_a_previou
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("after,allowed", [
+    ({"stage": "slot"}, True), ({"stage": "details"}, False),
+    ({"stage": "confirmation"}, False), ({"stage": "slot", "proposal": {"id": "fixture"}}, False),
+    ({"stage": "slot", "pending_operations": [{"id": "fixture", "status": "running"}]}, False),
+    ({"stage": "slot", "ended": True}, False),
+    ({"stage": "slot", "transcript": [{"role": "assistant", "text": "Please confirm the booking readback."}]}, False),
+])
+def test_safe_stage_only_transition_can_preserve_hold_but_other_scheduler_changes_cannot(tmp_path, after, allowed):
+    async def run():
+        async with harness(tmp_path) as h:
+            original_snapshot = h.control.snapshot
+            changed = []
+            def snapshot(sid, token):
+                return {**original_snapshot(sid, token), **(after if changed else {})}
+            h.control.snapshot = snapshot
+            h.policy.callback = lambda *_: changed.append(True)
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting"))
+            assert response.status_code == 200
+            assert response.json()["phrase_id"] == ("moment" if allowed else "silence")
+            if not allowed:
+                assert response.json()["reason"] == "scheduler_changed"
+    asyncio.run(run())
+
+
+def test_fixed_content_free_client_dispositions_are_accepted_but_arbitrary_reason_text_is_rejected(tmp_path):
+    async def run():
+        async with harness(tmp_path) as h:
+            for kind, reason, blocked in (("cue_suppressed", "selection_expired_on_arrival", None),
+                    ("cue_canceled", "caller_resumed", None), ("cue_gate_changed", "sensitive_state", False)):
+                body = {"event": kind, "epoch": 1, "at_ms": 100, "phase": "waiting", "reason": reason}
+                if blocked is not None:
+                    body["blocked"] = blocked
+                response = await h.client.post(path(h.first, "event"), headers=headers(h.first), json=body)
+                assert response.status_code == 200
+            rejected = await h.client.post(path(h.first, "event"), headers=headers(h.first), json={
+                "event": "cue_suppressed", "epoch": 1, "at_ms": 100, "reason": "PRIVATE_CALLER_WORDS"})
+            assert rejected.status_code == 422
+            evidence = await h.client.get(path(h.first, "evidence"), headers=headers(h.first))
+            assert len(evidence.json()["events"]) == 3
+            assert "PRIVATE_CALLER_WORDS" not in evidence.text
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("identical_callback", [False, True])
 @pytest.mark.parametrize("change", ["none", "confirmation", "ended"])
 def test_cue_reuses_only_identical_authenticated_snapshot_and_always_revalidates(tmp_path, identical_callback, change):
@@ -366,6 +409,155 @@ def test_identical_authenticated_snapshot_failure_stops_before_classifier_or_ses
             assert response.status_code == 401
             assert reads == [h.first["id"]]
             assert not h.policy.calls and not h.calls and not h.control.sessions
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("after_read_seconds,expired", [(.25, False), (.75, True)])
+def test_request_ttl_includes_authorization_and_fresh_read_and_is_remaining_at_response(tmp_path, after_read_seconds, expired):
+    from test_duplex_cues import Clock
+
+    async def run():
+        async with harness(tmp_path) as h:
+            clock, reads = Clock(), []
+            h.control.clock = clock
+            session = await h.control.session(h.first["id"])
+            session.clock = clock
+
+            def fresh_snapshot(sid, token):
+                clock.now += .2 if not reads else after_read_seconds
+                reads.append(True)
+                h.store.authorize(sid, token, True)
+                return h.store.snapshot(sid)
+            h.control.authorize = h.control.snapshot = fresh_snapshot
+            def classification(*_):
+                clock.now += .15
+            h.policy.callback = classification
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue())
+            assert response.status_code == 200
+            value = response.json()
+            assert value["max_request_age_ms"] == 800
+            if expired:
+                assert value["phrase_id"] == "silence" and value["reason"] == "request_expired"
+                assert value["expires_in_ms"] == 0
+            else:
+                assert value["phrase_id"] == "neutral_ack"
+                # 200 ms auth +150 ms policy +250 ms revalidation leaves200 ms
+                # of the absolute800 ms request lifetime, not the old650 ms.
+                assert 198 <= value["expires_in_ms"] <= 200
+            assert len(reads) == 2 and len(h.policy.calls) == 1
+            row = h.control.decisions[h.first["id"]][-1]
+            assert row["expires_in_ms"] == value["expires_in_ms"]
+            assert row["max_request_age_ms"] == 800
+            assert row["request_elapsed_ms"] >= 600
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("guard", ["classification_throttled", "cue_spacing"])
+def test_pacing_retry_hint_is_remaining_after_authoritative_read_and_requires_new_selection(tmp_path, guard):
+    from test_duplex_cues import Clock
+
+    async def run():
+        async with harness(tmp_path) as h:
+            clock = Clock()
+            h.control.clock = clock
+            session = await h.control.session(h.first["id"])
+            session.clock = clock
+            if guard == "classification_throttled":
+                session.last_attempt_at = 0
+            else:
+                session.last_cue_at = 0
+            clock.now = .1
+            reads = []
+
+            def fresh_snapshot(sid, token):
+                h.store.authorize(sid, token, True)
+                if len(reads) % 2:
+                    clock.now += .05
+                reads.append(True)
+                return h.store.snapshot(sid)
+            h.control.authorize = h.control.snapshot = fresh_snapshot
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting"))
+            value = response.json()
+            assert value["phrase_id"] == "silence" and value["reason"] == guard
+            assert value["requests"] == 0 and value["expires_in_ms"] == 0
+            assert 149 <= value["retry_after_ms"] <= 151
+            assert h.control.decisions[h.first["id"]][-1]["retry_after_ms"] == value["retry_after_ms"]
+            assert not h.policy.calls and not session.reservations
+            clock.now += value["retry_after_ms"] / 1000 + .001
+            accepted = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting", revision=2))
+            assert accepted.json()["phrase_id"] == "moment"
+            assert "retry_after_ms" not in accepted.json()
+            assert session.count == session.classifications == len(h.policy.calls) == 1
+    asyncio.run(run())
+
+
+def test_changed_authoritative_state_revokes_pacing_retry_hint(tmp_path):
+    from test_duplex_cues import Clock
+
+    async def run():
+        async with harness(tmp_path) as h:
+            clock, reads = Clock(), []
+            h.control.clock = clock
+            session = await h.control.session(h.first["id"])
+            session.clock = clock
+            session.last_attempt_at = 0
+
+            def fresh_snapshot(sid, token):
+                h.store.authorize(sid, token, True)
+                snapshot = h.store.snapshot(sid)
+                if reads:
+                    snapshot["stage"] = "confirmation"
+                reads.append(True)
+                return snapshot
+            h.control.authorize = h.control.snapshot = fresh_snapshot
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting"))
+            assert response.json()["reason"] == "scheduler_changed"
+            assert "retry_after_ms" not in response.json()
+            assert h.control.decisions[h.first["id"]][-1]["retry_after_ms"] is None
+            assert not h.policy.calls and not session.reservations
+    asyncio.run(run())
+
+
+def test_waiting_pacing_retry_event_is_bounded_and_content_free(tmp_path):
+    async def run():
+        async with harness(tmp_path) as h:
+            body = {"event": "cue_retry_scheduled", "epoch": 1, "at_ms": 10,
+                "phase": "waiting", "reason": "cue_spacing", "retry_after_ms": 150}
+            response = await h.client.post(path(h.first, "event"), headers=headers(h.first), json=body)
+            assert response.status_code == 200
+            saved = h.control.events[h.first["id"]][-1]
+            assert saved["retry_after_ms"] == 150 and saved["phase"] == "waiting"
+            for changes in ({"retry_after_ms": 0}, {"retry_after_ms": 1001}, {"retry_after_ms": True},
+                    {"retry_after_ms": None}, {"phase": "listening"},
+                    {"reason": "classification_uncertain"}, {"event": "cue_suppressed"}):
+                rejected = await h.client.post(path(h.first, "event"), headers=headers(h.first),
+                    json={**body, **changes})
+                assert rejected.status_code == 422
+            assert len(h.control.events[h.first["id"]]) == 1
+    asyncio.run(run())
+
+
+def test_decision_evidence_is_bounded_content_free_and_owner_scoped(tmp_path):
+    async def run():
+        async with harness(tmp_path) as h:
+            for revision in range(1, 261):
+                response = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                    json=cue(text="PRIVATE_UTTERANCE_FIXTURE", phase="waiting", revision=revision))
+                assert response.status_code == 200
+            forbidden = await h.client.get(path(h.first, "evidence"), headers=headers(h.second))
+            assert forbidden.status_code == 401
+            response = await h.client.get(path(h.first, "evidence"), headers=headers(h.first))
+            assert response.status_code == 200
+            rows = response.json()["cue_decisions"]
+            assert len(rows) == 256 and rows[0]["revision"] == 5 and rows[-1]["revision"] == 260
+            assert rows[-1]["phase"] == "waiting" and rows[-1]["reason"] == "phase_already_acknowledged"
+            assert rows[-1]["budget"]["lifetime_cue_reservations"] == 1
+            assert all(secret not in response.text for secret in ("PRIVATE_UTTERANCE_FIXTURE", JEV_KEY,
+                VAPI_KEY, h.first["token"], h.second["token"], "https://", "previous_assistant"))
+            assert not h.calls
     asyncio.run(run())
 
 

@@ -66,6 +66,147 @@ function waiting(coordinator, id = 'main-1') {
   caller(coordinator); coordinator.userSpeechStopped(); coordinator.beginGeneration(id);
 }
 
+test('remaining server TTL is not subtracted twice from a delayed HTTP selection', async () => {
+  const done = deferred(), { coordinator, time, output } = setup({ selectCue: () => done.promise });
+  waiting(coordinator); await time.advance(500);
+  done.resolve(decision('waiting', { expires_in_ms: 480, max_request_age_ms: 800 })); await flush();
+  assert.equal(output.handles.length, 0); assert.equal(coordinator.request.expiresAt, 800);
+  await time.advance(50); assert.equal(output.handles.length, 1); coordinator.close();
+});
+
+test('an explicit TTL total cannot roll forward or exceed the absolute800ms client bound', async () => {
+  const done = deferred(), { coordinator, time, output, events } = setup({ selectCue: () => done.promise });
+  waiting(coordinator); await time.advance(801);
+  done.resolve(decision('waiting', { expires_in_ms: 700, max_request_age_ms: 5000 })); await flush();
+  assert.equal(output.handles.length, 0);
+  assert.ok(events.some(x => x.reason === 'selection_expired_on_arrival')); coordinator.close();
+});
+
+test('server silence reasons survive as content-free suppression diagnostics', async () => {
+  const { coordinator, time, events } = setup({ selectCue: async () => decision('waiting', {
+    phrase_id: 'silence', reason: 'classification_uncertain' }) });
+  waiting(coordinator); await time.advance(0);
+  assert.ok(events.some(x => x.reason === 'classification_uncertain' && x.phase === 'waiting'));
+  assert.ok(!JSON.stringify(events).includes('routine service')); coordinator.close();
+});
+
+test('only a fresh safe context transition may reopen a failed waiting context preflight', async () => {
+  let count = 0;
+  const { coordinator, time, output } = setup({ selectCue: async () => ++count === 1
+    ? decision('waiting', { phrase_id: 'silence', reason: 'unverified_or_sensitive_context' }) : decision('waiting') });
+  waiting(coordinator); await time.advance(1000); assert.equal(count, 1); assert.equal(output.handles.length, 0);
+  coordinator.setSensitive(true); coordinator.recoverWaitingContext(); await time.advance(1000); assert.equal(count, 1);
+  coordinator.setSensitive(false); coordinator.recoverWaitingContext(); await time.advance(0);
+  assert.equal(count, 2); assert.equal(output.handles.length, 1);
+  coordinator.recoverWaitingContext(); await time.advance(1000); assert.equal(count, 2); coordinator.close();
+});
+
+test('a safe context transition never retries ordinary uncertain silence', async () => {
+  let count = 0;
+  const { coordinator, time } = setup({ selectCue: async () => { count++; return decision('waiting', {
+    phrase_id: 'silence', reason: 'classification_uncertain' }); } });
+  waiting(coordinator); await time.advance(0); coordinator.setSensitive(true); coordinator.setSensitive(false);
+  coordinator.recoverWaitingContext(); await time.advance(1000); assert.equal(count, 1); coordinator.close();
+});
+
+for (const reason of ['classification_throttled', 'cue_spacing']) {
+  test(`one fresh waiting request can recover a preclassification ${reason} refusal`, async () => {
+    const calls = [];
+    const { coordinator, time, output, events } = setup({ selectCue: async request => {
+      calls.push(request); return calls.length === 1 ? decision('waiting', {
+        phrase_id: 'silence', reason, requests: 0, retry_after_ms: 120, expires_in_ms: 0 }) : decision('waiting');
+    } });
+    waiting(coordinator); await time.advance(0); assert.equal(calls.length, 1);
+    await time.advance(349); assert.equal(calls.length, 1);
+    await time.advance(1); assert.equal(calls.length, 2);
+    await time.advance(200); assert.equal(output.handles.length, 1);
+    assert.ok(events.some(row => row.kind === 'cue_retry_scheduled' && row.reason === reason));
+    await time.advance(3000); assert.equal(calls.length, 2); coordinator.close();
+  });
+}
+
+test('a second pacing refusal cannot create a classification retry loop', async () => {
+  let calls = 0;
+  const { coordinator, time, output } = setup({ selectCue: async () => {
+    calls++; return decision('waiting', { phrase_id: 'silence', reason: 'classification_throttled',
+      requests: 0, retry_after_ms: 200, expires_in_ms: 0 });
+  } });
+  waiting(coordinator); await time.advance(5000);
+  assert.equal(calls, 2); assert.equal(output.handles.length, 0); coordinator.close();
+});
+
+for (const [name, overrides] of [
+  ['uncertainty', { reason: 'classification_uncertain' }],
+  ['accepted or attempted classification', { requests: 1 }],
+  ['zero retry delay', { retry_after_ms: 0 }],
+  ['unbounded retry delay', { retry_after_ms: 1001 }],
+]) {
+  test(`waiting pacing recovery never retries ${name}`, async () => {
+    let calls = 0;
+    const { coordinator, time } = setup({ selectCue: async () => { calls++; return decision('waiting', {
+      phrase_id: 'silence', reason: 'cue_spacing', requests: 0, retry_after_ms: 200, expires_in_ms: 0, ...overrides }); } });
+    waiting(coordinator); await time.advance(5000); assert.equal(calls, 1); coordinator.close();
+  });
+}
+
+for (const [name, act] of [
+  ['ready main PCM', coordinator => coordinator.receiveMainPcm('main-1', pcm(), 16000)],
+  ['sensitive caller change', coordinator => coordinator.setSensitive(true)],
+  ['confirmed caller resumes', coordinator => coordinator.resumeUserSpeech()],
+  ['Stop', coordinator => coordinator.close()],
+]) {
+  test(`a scheduled fresh waiting retry is revoked by ${name}`, async () => {
+    let calls = 0;
+    const { coordinator, time, output } = setup({ selectCue: async () => { calls++; return decision('waiting', {
+      phrase_id: 'silence', reason: 'cue_spacing', requests: 0, retry_after_ms: 500, expires_in_ms: 0 }); } });
+    waiting(coordinator); await time.advance(100); act(coordinator); await time.advance(1000);
+    assert.equal(calls, 1); assert.equal(output.handles.length, 0); coordinator.close();
+  });
+}
+
+test('late listening playback finishes before waiting selection consumes its absolute lifetime', async () => {
+  let time; const selected = [];
+  const f = setup({ selectCue: request => {
+    selected.push({ phase: request.phase, at: time.now() });
+    return request.phase === 'listening' ? Promise.resolve(decision('listening'))
+      : new Promise(resolve => time.setTimeout(() => resolve(decision('waiting', {
+        max_request_age_ms: 800, expires_in_ms: 500 })), 300));
+  } });
+  time = f.time; caller(f.coordinator); await time.advance(300);
+  await time.advance(200); f.coordinator.userSpeechStopped(); f.coordinator.beginGeneration('main');
+  await time.advance(470); assert.equal(selected.length, 1);
+  f.output.handles[0].finish(); await flush(); await time.advance(0);
+  assert.deepEqual(selected, [{ phase: 'listening', at: 300 }, { phase: 'waiting', at: 970 }]);
+  await time.advance(300); assert.equal(f.output.handles.length, 2);
+  assert.equal(f.events.findLast(row => row.kind === 'cue_started').at_ms, 1270); f.coordinator.close();
+});
+
+test('a full rolling cue window defers new work and recovers without a new call', async () => {
+  const { coordinator, time, output, requests } = setup({ maxCues: 2, maxRequests: 2, cooldownMs: 0 });
+  for (let turn = 0; turn < 2; turn++) {
+    if (turn) coordinator.userSpeechStopped(); caller(coordinator);
+    await time.advance(350); output.handles.at(-1).finish(); await flush();
+  }
+  coordinator.userSpeechStopped(); caller(coordinator); await time.advance(1000);
+  assert.equal(requests.length, 2); assert.equal(output.handles.length, 2);
+  await time.advance(15000); assert.equal(output.handles.length, 3);
+  assert.equal(coordinator.cuesPlayed, 3); coordinator.close();
+});
+
+test('per-utterance listening attempts reserve one bounded request for waiting', async () => {
+  const selected = [];
+  const { coordinator, time } = setup({ selectCue: async request => { selected.push(request); return decision(request.phase, {
+    phrase_id: request.phase === 'listening' ? 'silence' : 'moment', reason: 'classification_uncertain' }); } });
+  caller(coordinator);
+  for (let index = 0; index < 12; index++) {
+    coordinator.updatePartial(`I need routine service for my car with detail ${index}`, { revision: index + 2 });
+    await time.advance(350);
+  }
+  assert.equal(selected.length, 7);
+  coordinator.userSpeechStopped(); coordinator.beginGeneration('answer'); await time.advance(550);
+  assert.equal(selected.length, 8); assert.equal(selected.at(-1).phase, 'waiting'); coordinator.close();
+});
+
 test('a listening cue is selected and played while the caller is still speaking', async () => {
   const { coordinator, time, requests, output, events } = setup();
   caller(coordinator);
@@ -181,7 +322,7 @@ test('a sensitive state cancels active cues and requires fresh evidence after cl
   assert.equal(output.handles.length, 2); coordinator.close();
 });
 
-test('cue cooldown, per-call count and request limits bound both speech and provider attempts', async () => {
+test('cue and request windows recover in a long call while same-phase pacing remains bounded', async () => {
   const { coordinator, time, output, requests } = setup({ maxCues: 2, maxRequests: 2 });
   caller(coordinator); await time.advance(300);
   coordinator.updatePartial('Here are a few more service details', { revision: 2 }); await time.advance(300);
@@ -193,7 +334,7 @@ test('cue cooldown, per-call count and request limits bound both speech and prov
   await time.advance(15000);
   coordinator.userSpeechStopped(); coordinator.userSpeechStarted();
   coordinator.updatePartial('Let me also explain the issue clearly', { revision: 4 }); await time.advance(300);
-  assert.equal(requests.length, 2); assert.equal(output.handles.length, 2); coordinator.close();
+  assert.equal(requests.length, 3); assert.equal(output.handles.length, 3); coordinator.close();
 });
 
 test('each phase has one allowance across revisions while the global cue cap remains bounded', async () => {
@@ -219,7 +360,7 @@ test('slow main permits a waiting cue after a full listening clip and a quiet ga
   await time.advance(200); coordinator.updateFinal('I need routine service for my car', { revision: 2 });
   coordinator.userSpeechStopped(); coordinator.beginGeneration('main-1');
   await time.advance(470); // Listening clip has now sounded for its full670ms.
-  assert.equal(requests.length, 2); assert.equal(output.handles[0].stopped, false);
+  assert.equal(requests.length, 1); assert.equal(output.handles[0].stopped, false);
   output.handles[0].finish(); await flush();
   assert.equal(time.pending, 1, 'Clip completion owns one waiting timer, not a polling loop');
   await time.advance(299); assert.equal(requests.length, 2);
@@ -312,15 +453,15 @@ test('the original client deadline includes the held guard and cannot be extende
   assert.equal(output.handles.length, 0); assert.equal(requests.length, 1); coordinator.close();
 });
 
-test('listening completion cannot retry an already-expired held waiting decision', async () => {
+test('waiting selection starts after listening completion and a short TTL still cannot roll past its guard', async () => {
   const requests = [];
   const { coordinator, time, output } = setup({ selectCue: async request => {
     requests.push(request); return decision(request.phase, { expires_in_ms: request.phase === 'waiting' ? 300 : 800 });
   } });
   caller(coordinator); await time.advance(300); await time.advance(200);
   coordinator.userSpeechStopped(); coordinator.beginGeneration('main-1'); await time.advance(470);
-  assert.deepEqual(requests.map(request => request.phase), ['listening', 'waiting']);
-  assert.equal(coordinator.request, null, 'The waiting result expired while the original listening clip was still active');
+  assert.deepEqual(requests.map(request => request.phase), ['listening']);
+  assert.equal(coordinator.request, null, 'No accepted waiting result spends its TTL behind a playing clip');
   output.handles[0].finish(); await flush(); await time.advance(2000);
   assert.equal(requests.length, 2); assert.equal(output.handles.length, 1); coordinator.close();
 });
@@ -375,13 +516,13 @@ test('listening-only context block preserves an already-held waiting decision an
   await time.advance(400); assert.equal(output.handles.length, 1); assert.equal(requests.length, 1); coordinator.close();
 });
 
-test('listening-only block stops the listening source while retaining a concurrent waiting result', async () => {
+test('listening-only block stops the listening source then starts a fresh waiting selection', async () => {
   const { coordinator, time, output, requests } = setup();
   caller(coordinator); await time.advance(300); await time.advance(200);
   coordinator.userSpeechStopped(); coordinator.beginGeneration('main-1'); await time.advance(200);
-  assert.equal(requests.length, 2); const held = coordinator.request;
+  assert.equal(requests.length, 1);
   coordinator.setListeningBlocked(true); assert.equal(output.handles[0].stopped, true);
-  assert.equal(coordinator.request, held); assert.equal(requests[1].signal.aborted, false);
+  await time.advance(0); assert.equal(requests.length, 2); assert.equal(requests[1].signal.aborted, false);
   await time.advance(349); assert.equal(output.handles.length, 1);
   await time.advance(1); assert.equal(output.handles.length, 2); coordinator.close();
 });
@@ -445,7 +586,7 @@ test('main PCM reentered during clip creation stops the uncommitted node and lea
   await time.advance(3000); assert.equal(output.handles.length, 1); coordinator.close();
 });
 
-test('phase pairing still obeys the total call cap and cannot repeat a waiting cue', async () => {
+test('phase pairing cannot repeat a waiting cue while a later utterance recovers its window budget', async () => {
   const { coordinator, time, output, requests } = setup({ maxCues: 2 });
   caller(coordinator); await time.advance(300);
   output.handles[0].finish(); await flush();
@@ -454,7 +595,7 @@ test('phase pairing still obeys the total call cap and cannot repeat a waiting c
   coordinator.updateFinal('I need routine service for my car tomorrow', { revision: 2 });
   await time.advance(550); assert.equal(requests.length, 2);
   coordinator.userSpeechStarted(); coordinator.updatePartial('Could you explain your service options today', { revision: 3 });
-  await time.advance(1000); assert.equal(requests.length, 2); assert.equal(output.handles.length, 2);
+  await time.advance(1000); assert.equal(requests.length, 3); assert.equal(output.handles.length, 3);
   coordinator.close();
 });
 

@@ -34,17 +34,25 @@ remain eligible if no confirmation or business operation is active.
 
 Jev runs alongside the conversation. The primary reasoner never waits for it.
 Selection is read-only and has no access to booking actions. Corrections,
-negation, sensitive details, confirmation, urgency, prompt instructions,
+rejection of an agent action, sensitive details, confirmation, urgency, prompt instructions,
 unverified state, incompatible language and missed deadlines remain silent.
 The server reads authoritative scheduler state before and after classification.
+Routine vehicle symptoms, oil changes, vehicle model years and waiting-time
+questions are not control commands. Narrow deterministic exceptions preserve
+these facts while Jev still receives the original text.
 
 One caller utterance has separate listening and waiting allowances: at most one
 cue in each phase. Each phase has its own 15-second cooldown across utterances,
-with a shared four-cue call cap and bounded classification attempts. A waiting
+with at most four reservations and 64 classification attempts in a rolling
+15-second window, plus eight classification attempts per caller utterance.
+Accepted reservations are not refunded after uncertain delivery or cancellation.
+A waiting
 cue starts no earlier than 550 ms after confirmed caller yield and at least
-300 ms after the previous clip ends. Selection starts in parallel with this
-playback guard; an early result retains its original expiry while it waits.
-It is optional when the main reply is fast. A main announcement or actual main
+300 ms after the previous clip ends. After any active listening clip finishes,
+selection starts in parallel with the remaining playback guard; an early result
+retains its original expiry while it waits. Selection does not consume that
+expiry waiting behind a full listening clip.
+It is optional when the main reply is fast. Actual voiced main
 audio revokes in-flight and held selection, so a late result cannot add speech
 after the real answer begins. No additional selection is made simply because
 an accepted result expired before playback.
@@ -58,7 +66,17 @@ Normal transcript refinements and a caller yielding do not cut an
 already-started acknowledgment. Selection expiry is a deadline to start, not a
 timer that truncates a word. A separate duration guard bounds runaway playback.
 
-The main speech announcement cancels pending waiting work for that generation.
+Provider speech announcements can precede audible TTS by seconds and do not
+cancel waiting work. Both the remaining server TTL at response construction and
+an absolute 800 ms request-age limit bound decisions; network/classification
+elapsed time is charged once. A new selection is permitted after an
+authoritative hard-block-to-safe transition only when the previous attempt
+failed context preflight without reserving a cue. Stable model uncertainty,
+accepted or expired decisions and unknown operations cannot trigger retries.
+The server may return a bounded `retry_after_ms` only for preclassification
+request throttling or cue spacing. One fresh waiting retry can follow that hint,
+within the same eight-attempt utterance budget and fresh authoritative gates.
+No classifier failure, uncertainty or accepted reservation qualifies.
 The first voiced main audio cancels an active cue before main samples enter the
 output graph. Main playback never waits for a cue to finish; an acknowledgment
 already in progress may therefore be cut short. A late Jev result cannot
@@ -70,9 +88,18 @@ Local microphone energy can provisionally pause owned main playback before the
 provider's interruption event arrives. Pending audio and the already-scheduled
 word suffix are preserved for up to 350 ms. A provider speech event or partial
 transcript confirms the interruption and discards the old answer; unconfirmed
-noise resumes the same answer and buffered audio. The energy detector is a
+noise resumes the same answer and buffered audio. At most two speculative
+pauses per answer and increasing false-onset cooldowns bound noise disruption.
+Unconfirmed energy during a cached cue does not cut that clip or delay the next
+main packet; confirmed provider speech or a transcript still cancels it.
+Idle energy does not manufacture a caller turn. The energy detector is a
 heuristic; echo, background noise and quiet speech still need representative
 listening evaluation.
+
+ASR final clauses accumulate within the caller's turn, with bounded text and
+deduplication of cumulative refinements. Temporary stop/start events before any
+main voice preserve that turn and its cue allowance. Actual main voice, a
+completed answer or a bounded abandoned-turn gap closes the retained context.
 
 For browser-owned calls, the gateway recognizes the exact
 `servicevoice_duplex_playback=browser-owned-v1` variable and suppresses its older
@@ -163,6 +190,33 @@ microphone frames sent during cues and during main output. Cue timing and main
 answer timing stay separate. Browser-origin events are labeled as such, rather
 than being promoted to provider or human listening evidence. LangSmith's
 existing main-call review remains a separate source of booking/generation facts.
+The server also retains at most 256 content-free decision dispositions per
+session, including phase, reason, probability, elapsed time, expiry and budgets.
+These records contain no transcript, credential or provider URL, and are not
+proof that a selected clip was heard.
+
+A subsequent real microphone conversation exposed a coverage failure despite
+the earlier synthetic results: one listening clip lasted about 151 ms before
+interruption, and no waiting cue played across seven caller turns. Main answer
+gaps after browser turn release ranged from about 1.56 to 3.91 seconds. Historical
+generic suppression events cannot establish each exact classifier reason. The
+recovery changes above address observed ASR context loss and noise behavior,
+plus independently reproduced expiry, budget and announcement races. Their
+32-request synthetic development probe selected 18 of 20 ordinary cases and
+stayed silent for all 32 excluded cases, some rejected before a provider call.
+One ordinary example timed out and one remained below the unchanged confidence
+threshold. This does not establish reliable cue coverage in real conversations.
+
+The first six-turn synthetic recovery call retained a failed coverage verdict:
+three waiting and three listening clips played in full, but three ordinary
+turns had no waiting clip despite 2.67–6.49-second source-end-to-main gaps.
+The recorded PCM matched all six approved cached clips and showed zero
+cue/main overlap. Exact new dispositions identified a canceled listening
+request reaching backend pacing late, a waiting decision expiring behind a
+listening clip, and a preclassification spacing refusal. These findings
+motivated the bounded pacing recovery and delayed selection described above;
+they are not regraded as a passing live call. No appointment or handoff was
+saved in that synthetic conversation.
 
 The WebSocket audio stream has no documented per-frame generation IDs. Local
 playback epochs identify owned work; they do not prove the lineage or rejection
