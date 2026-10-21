@@ -554,6 +554,24 @@ _REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
 _FAQ_VERSION = re.compile(r"^jev-static-faq-\d{4}-\d{2}-\d{2}-\d{1,3}$")
 
 
+def safe_backchannel_timing(cue):
+    """Idempotent, content-free projection shared by disk and trace exports."""
+    if type(cue) is not dict:
+        return None
+    from .diagnostics import safe_attributes
+    fields = {"phrase_id":"backchannel_phrase", "reason":"backchannel_reason",
+        "classification_ms":"classifier_ms", "emitted_ms":"first_text_ms",
+        "probability":"backchannel_probability", "confidence":"backchannel_confidence",
+        "requests":"classifier_requests", "policy_elapsed_ms":"policy_elapsed_ms",
+        "language_choice":"backchannel_language", "language_probability":"backchannel_language_probability",
+        "language_confidence":"backchannel_language_confidence",
+        "content_kind":"backchannel_content_kind", "content_probability":"backchannel_content_probability",
+        "content_confidence":"backchannel_content_confidence"}
+    attributes = safe_attributes({target:cue.get(source) for source,target in fields.items()})
+    return {**{source:attributes[target] for source,target in fields.items() if target in attributes},
+        "evidence_scope":"gateway_yield_not_audible_playback"}
+
+
 def safe_timing_row(row):
     """A fixed projection; unknown data and unreported token counts stay absent/null."""
     if type(row) is not dict:
@@ -596,6 +614,9 @@ def safe_timing_row(row):
         values = values if type(values) is dict else {}
         safe[field] = {key: value if type(value := values.get(key)) is int and 0 <= value <= 100_000_000 else None for key in sorted(keys)}
     safe.update(_generation_fields(row))
+    cue = safe_backchannel_timing(row.get("backchannel"))
+    if cue is not None:
+        safe["backchannel"] = cue
     return safe
 
 

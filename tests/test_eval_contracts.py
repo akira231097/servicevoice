@@ -2,6 +2,7 @@
 import asyncio
 from pathlib import Path
 import socket
+import threading
 
 import dotenv
 import httpx
@@ -31,9 +32,64 @@ def test_all_contracts_exercise_real_domain_and_pass_with_separate_fixtures(monk
     assert [row["id"] for row in rows] == list(contracts.CONTRACT_IDS)
     assert len(paths) == len(set(paths)) == 12
     assert all(not path.parent.exists() for path in paths)
-    assert all(row["passed"] is True and row["checks"] for row in rows), rows
+    failed = [row for row in rows if row["passed"] is not True or not row["checks"]]
+    assert not failed, failed
     assert all(set(row) == {"id", "passed", "checks"} for row in rows)
     assert all(type(check["passed"]) is bool for row in rows for check in row["checks"])
+
+
+def test_offline_wait_budget_keeps_default_pending_and_real_rejection_visible(tmp_path, monkeypatch):
+    """Slow disk changes waiting, never the result or number of executions."""
+    original = contracts.ToolHarness._execute_registered
+    release = threading.Event()
+    both_started = threading.Event()
+    lock = threading.Lock()
+    executions = []
+
+    def blocked(self, *args, **kwargs):
+        with lock:
+            executions.append(args[3])
+            if len(executions) == 2:
+                both_started.set()
+        if not release.wait(15):
+            raise RuntimeError("Synthetic worker gate was not released")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(contracts.ToolHarness, "_execute_registered", blocked)
+
+    async def scenario():
+        row = {"id": "fixture_wait_probe", "passed": False, "checks": []}
+        fixture = contracts.Fixture(tmp_path / "fixture.sqlite3", row)
+        strict = contracts.ToolHarness(fixture.store)
+        assert strict.timeout_seconds == 1.5
+        assert fixture.harness.timeout_seconds == contracts.CORRECTNESS_FIXTURE_TIMEOUT_SECONDS == 10
+        strict_request = asyncio.create_task(strict.run(fixture.sid, "get_dealership_info", {}, "strict-info"))
+        fixture_request = asyncio.create_task(fixture.call("get_dealership_info", {}, call_id="fixture-info"))
+        try:
+            assert await asyncio.to_thread(both_started.wait, 10)
+            pending = await strict_request
+            assert pending["ok"] is False and pending["error"] == "operation_pending", pending
+            assert not fixture_request.done()
+            release.set()
+            receipt = await fixture_request
+            assert receipt["ok"] is True and "_receipt" in receipt, receipt
+            await strict.drain()
+            reconciled = await strict.operation(fixture.sid, pending["operation_id"])
+            assert reconciled["ok"] is True and "_receipt" in reconciled, reconciled
+            assert reconciled["_receipt"]["operation_id"] == pending["operation_id"]
+            assert sorted(executions) == ["fixture-info", "strict-info"]
+            with fixture.store.read_connection() as db:
+                assert db.execute("SELECT count(*) FROM tool_results WHERE session_id=?", (fixture.sid,)).fetchone()[0] == 2
+            rejected = await fixture.call("confirm_action", {"proposal_id": "missing-proposal", "confirmed": True})
+            assert rejected["ok"] is False and rejected["error"] == "proposal_missing", rejected
+            assert fixture.count("appointments") == 0
+        finally:
+            release.set()
+            await asyncio.gather(strict_request, fixture_request, return_exceptions=True)
+            await strict.close()
+            await fixture.harness.close()
+
+    asyncio.run(scenario())
 
 
 def test_missing_time_filter_capability_fails_instead_of_skipping(monkeypatch):

@@ -12,7 +12,7 @@ import math
 import re
 from uuid import UUID, uuid5
 
-from .observability import safe_timing_decision_code
+from .observability import safe_backchannel_timing, safe_timing_decision_code
 
 VERSION = "generation-observability-v1"
 MAX_EVENTS = 10_000
@@ -98,6 +98,18 @@ def project_gateway_timings(rows):
             # that shape so an export retry cannot change immutable children.
             if name in source:
                 row[name] = safe_timing_decision_code(source[name])
+        # Preserve observed optional cue evidence through both disk projection
+        # and LangSmith's repeated export boundary. Missing legacy evidence
+        # remains absent rather than becoming an inferred silent decision.
+        cue = safe_backchannel_timing(source.get("backchannel"))
+        if cue is not None:
+            if "emitted_ms" in cue:
+                value = cue["emitted_ms"]
+                if _bounded_number(value, 0, total):
+                    cue["emitted_ms"] = float(value)
+                else:
+                    cue.pop("emitted_ms")
+            row["backchannel"] = cue
         for name, minimum in (("generation_sequence", 1), ("checkpoint_rejections", 0)):
             value = source.get(name)
             row[name] = value if type(value) is int and minimum <= value <= 100_000_000 else None
