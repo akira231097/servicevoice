@@ -69,9 +69,10 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
     """Keep CLI admission strict; optionally decouple a pytest correctness fixture.
 
     A supplied fixture deadline bounds only this disposable app's ingress,
-    within IngressLimits' five-second maximum. Correctness mode also queues
-    signature persistence through a fixture-local lock and waits up to30s for
-    accepted tools, so incidental disk contention is not a latency assertion.
+    within IngressLimits' five-second maximum. Correctness mode sets up caller
+    admissions sequentially before exercising simultaneous fake-model requests
+    and the real concurrent booking race. It also queues signature persistence
+    through a fixture-local lock and waits up to30s for accepted tools.
     Strict CLI mode retains every production default and concurrent DB writer.
     No mode retries admission or signed tools, or changes a production timer.
     """
@@ -100,6 +101,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
             production_default_ingress_deadline_seconds=default_ingress_deadline,
             production_default_tool_wait_seconds=default_tool_wait,
             fixture_tool_wait_seconds=30 if offline_fixture_deadline is not None else None,
+            fixture_admission_requests_serialized=offline_fixture_deadline is not None,
+            admission_setup='sequential_fixture_setup' if offline_fixture_deadline is not None else 'simultaneous_default_deadline_admission',
             fixture_signature_writes_serialized=offline_fixture_deadline is not None,
             exercise_scope='offline_correctness_fixture_not_default_deadline_performance' if offline_fixture_deadline is not None
                 else 'strict_default_deadline_offline_stress')
@@ -153,8 +156,17 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
             calls=[];histories=[[] for _ in range(callers)];saved_commands={}
             progress['checks']=checks;progress['stage_durations_ms']=stages;progress['http_errors']=[]
             progress['gateway_command_failures']=[]
+            fixture_admission_lock=asyncio.Lock()
             async def inbound(message):
-                response=await client.post('/webhooks/vapi/inbound',json={'message':message},headers={'authorization':'Bearer '+PHONE_SECRET})
+                async def send():
+                    return await client.post('/webhooks/vapi/inbound',json={'message':message},headers={'authorization':'Bearer '+PHONE_SECRET})
+                if offline_fixture_deadline is not None and message['type']=='assistant-request':
+                    # Set up independent callers without charging this host's
+                    # serialized SQLite queue against every caller's timer.
+                    # Each HTTP/ingress operation retains its bounded deadline,
+                    # and every failure is returned exactly once without retry.
+                    async with fixture_admission_lock:response=await send()
+                else:response=await send()
                 if response.status_code!=200:
                     progress['http_errors'].append({'phase':progress['last_phase'],'event':message['type'],'status':response.status_code,
                                                    'code':response.json().get('error',response.json().get('detail'))})
@@ -168,7 +180,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                 progress['admission_statuses']=[r.status_code for r in admissions]
                 progress['admission_errors']=[r.json().get('error') for r in admissions if r.status_code!=200]
                 check(all(r.status_code==200 for r in admissions),
-                      'All configured simultaneous phone admissions must succeed; statuses='+json.dumps(progress['admission_statuses'])+
+                      ('All sequential fixture admissions' if offline_fixture_deadline is not None else 'All configured simultaneous phone admissions')+
+                      ' must succeed; statuses='+json.dumps(progress['admission_statuses'])+
                       '; errors='+json.dumps(progress['admission_errors']))
                 calls=[{**message['call'],**response.json()} for message,response in zip(admission_messages,admissions)]
                 sids=[c['assistantOverrides']['variableValues']['session_id'] for c in calls]
@@ -279,6 +292,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                         'production_default_ingress_deadline_seconds':default_ingress_deadline,
                         'production_default_tool_wait_seconds':default_tool_wait,
                         'fixture_tool_wait_seconds':progress['fixture_tool_wait_seconds'],
+                        'fixture_admission_requests_serialized':progress['fixture_admission_requests_serialized'],
+                        'admission_setup':progress['admission_setup'],
                         'fixture_signature_writes_serialized':progress['fixture_signature_writes_serialized'],
                         'exercise_scope':progress['exercise_scope'],
                         'admission_event_retries':0,

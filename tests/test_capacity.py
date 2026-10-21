@@ -195,7 +195,8 @@ def test_phone_read_then_write_keeps_original_worker_budget(tmp_path,config,monk
 def test_offline_caller_scenario_preserves_end_to_end_invariants(tmp_path,callers):
     import asyncio
     from scripts.stress_ten_callers import exercise
-    # This tests concurrent correctness, not hosted-runner disk performance.
+    # Sequential caller setup precedes concurrent model/tool/booking checks;
+    # this is not simultaneous-admission or hosted-runner disk performance.
     # Dedicated ingress tests retain the unchanged one-second default budget.
     result=asyncio.run(exercise(tmp_path,callers=callers,offline_fixture_deadline=5))
     assert result['passed'] and result['peak_fake_upstream_header_requests']==callers
@@ -205,6 +206,8 @@ def test_offline_caller_scenario_preserves_end_to_end_invariants(tmp_path,caller
     assert result['production_default_ingress_deadline_seconds']==IngressLimits().deadline_seconds==1
     assert result['production_default_tool_wait_seconds']==1.5
     assert result['fixture_tool_wait_seconds']==30 and result['fixture_signature_writes_serialized'] is True
+    assert result['fixture_admission_requests_serialized'] is True
+    assert result['admission_setup']=='sequential_fixture_setup'
     assert result['admission_event_retries']==0
     assert all(result['checks'].values())
 
@@ -213,12 +216,20 @@ def test_contended_admission_keeps_default_deadline_failure_visible_but_isolates
     import asyncio
     from scripts.stress_ten_callers import exercise
     original=TelephonyIngress._insert_binding
+    admit=TelephonyIngress.admit;counts={'active':0,'peak':0};lock=threading.Lock()
+    def observed_admit(self,*args,**kwargs):
+        with lock:
+            counts['active']+=1;counts['peak']=max(counts['peak'],counts['active'])
+        try:return admit(self,*args,**kwargs)
+        finally:
+            with lock:counts['active']-=1
     def contended_insert(self,*args,**kwargs):
         # Ten serialized fixture writes exceed one second deterministically,
         # reproducing a slow hosted disk without changing a production timer.
         time.sleep(.14)
         return original(self,*args,**kwargs)
     monkeypatch.setattr(TelephonyIngress,'_insert_binding',contended_insert)
+    monkeypatch.setattr(TelephonyIngress,'admit',observed_admit)
     strict={}
     with pytest.raises(AssertionError,match='statuses=.*504.*telephony_deadline'):
         asyncio.run(exercise(tmp_path/'strict',strict,callers=10))
@@ -227,13 +238,19 @@ def test_contended_admission_keeps_default_deadline_failure_visible_but_isolates
     assert strict['production_default_ingress_deadline_seconds']==1
     assert strict['production_default_tool_wait_seconds']==1.5
     assert strict['fixture_tool_wait_seconds'] is None and strict['fixture_signature_writes_serialized'] is False
+    assert strict['fixture_admission_requests_serialized'] is False
+    assert strict['admission_setup']=='simultaneous_default_deadline_admission'
+    assert counts['peak']>1 and counts['active']==0
     assert 504 in strict['admission_statuses'] and 'telephony_deadline' in strict['admission_errors']
+    counts['peak']=0
     fixture=asyncio.run(exercise(tmp_path/'fixture',callers=10,offline_fixture_deadline=5))
     assert fixture['admission_statuses']=={'200':10} and fixture['admission_event_retries']==0
     assert fixture['confirmed_appointments']==1 and fixture['losing_capacity_conflicts']==9
     assert fixture['peak_fake_upstream_header_requests']==10 and all(fixture['checks'].values())
     assert fixture['production_default_tool_wait_seconds']==1.5
     assert fixture['fixture_tool_wait_seconds']==30 and fixture['fixture_signature_writes_serialized'] is True
+    assert fixture['fixture_admission_requests_serialized'] is True and counts['peak']==1 and counts['active']==0
+    assert fixture['admission_setup']=='sequential_fixture_setup'
     assert IngressLimits().deadline_seconds==1
 
 
