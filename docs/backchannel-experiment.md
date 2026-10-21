@@ -60,10 +60,13 @@ awkward prosody and costs additional latency; it is excluded from the first
 cached-audio experiment.
 
 The coordinator must suppress an acknowledgment when an answer wins the race,
-the caller resumes, a generation becomes obsolete, the call ends, a correction or
+a generation becomes obsolete, the call ends, a correction or
 confirmation is being handled, a tool continuation is pending, or the cooldown
 has not elapsed. At most one acknowledgment is allowed for an eligible turn.
 An unverified or unsupported context should remain silent.
+Vapi owns caller-speech detection and barge-in; the gateway can reject stale
+work when it observes a replacement request or cancellation. This is not a
+guarantee that every speech restart reaches the gateway before a cue is emitted.
 
 ## Configuration and rollback review
 
@@ -166,10 +169,12 @@ adding caller words or credentials. Older generations without this evidence
 remain absent rather than being assigned an inferred silent decision.
 
 `latency_server_first_ack_p95_ms` measures gateway cue emission.
-`latency_server_substantive_text_p95_ms` measures validated useful text readiness;
+`latency_server_substantive_text_p95_ms` measures validated main-response text readiness;
 the original per-generation `milestones_ms.first_text` keeps this meaning.
-Neither measures heard sound. A `tts.cache_hit` event and PCM hashes establish
-returned bytes, not playback. When any explicit call-scoped cue emission is
+Neither measures heard sound or semantic usefulness. A `tts.cache_hit` event
+and PCM hashes establish returned bytes, not playback. A call or generation join
+requires an explicit shared provider ID; timestamp proximity is insufficient.
+When any explicit call-scoped cue emission is
 observed, general Vapi response-latency checks become uncertain because the
 provider number may include the acknowledgment. A missing timing row cannot
 erase a separately captured component event or turn a filler into an answer.
