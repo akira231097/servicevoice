@@ -327,7 +327,9 @@ def test_body_limit_and_total_deadline_are_enforced_without_admission(factory, m
 @pytest.mark.parametrize("cancel_waiter", [False, True])
 def test_timeout_or_cancellation_retains_capacity_until_real_worker_completion(factory, monkeypatch, cancel_waiter):
     module, app, public = factory()
-    monkeypatch.setattr(module, "TELEPHONY_HTTP_TIMEOUT_SECONDS", .08)
+    # Cancellation ownership must not race this fixture's artificial timeout.
+    # The timeout variant below still exercises the original 80 ms deadline.
+    monkeypatch.setattr(module, "TELEPHONY_HTTP_TIMEOUT_SECONDS", 30 if cancel_waiter else .08)
     monkeypatch.setattr(app.state, "telephony_http_capacity", 1)
     entered, release = threading.Event(), threading.Event()
     original = app.state.telephony_ingress.admit
@@ -336,14 +338,14 @@ def test_timeout_or_cancellation_retains_capacity_until_real_worker_completion(f
         result = original(*args, **kwargs)
         committed.append(result)
         entered.set()
-        assert release.wait(2)
+        assert release.wait(10), "Only the test may release the admitted worker."
         return result
     monkeypatch.setattr(app.state.telephony_ingress, "admit", slow)
     req = admission()
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=public), base_url="https://example.invalid") as client:
             request = asyncio.create_task(client.post(PATH, headers=PHONE_HEADERS, json=req))
-            assert await asyncio.to_thread(entered.wait, 1)
+            assert await asyncio.to_thread(entered.wait, 10)
             if cancel_waiter:
                 request.cancel()
                 with pytest.raises(asyncio.CancelledError):
