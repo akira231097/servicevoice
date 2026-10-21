@@ -1247,6 +1247,139 @@ test('fresh accepted-work snapshot hint enables waiting only and cannot authoriz
   await f.time.advance(2500); assert.equal(f.output.cues.length, 1); assert.equal(f.session.coordinator.sensitive, true); await f.session.stop();
 });
 
+function progressSnapshot(text = 'Book it.') {
+  const turn = { turn_key: 'a'.repeat(64), caller_text_sha256: createHash('sha256').update(text.trim()).digest('hex'),
+    generation_id: '12345678-1234-4234-8234-123456789abc', user_count: 3 };
+  const progress = { source: 'canonical_queued_operation', kind: 'booking_commit', operation_id: 'op_' + 'b'.repeat(24),
+    status: 'running', turn_key: turn.turn_key, caller_text_sha256: turn.caller_text_sha256, generation_id: turn.generation_id };
+  return { ended: false, stage: 'confirmation', proposal: { kind: 'book' },
+    pending_operations: [{ id: progress.operation_id, status: 'running' }], duplex_canonical_turn: turn,
+    accepted_operation_progress: progress };
+}
+
+async function progressFixture(text = 'Book it.', extraHandler = null) {
+  const state = { snapshot: { ended: false, stage: 'confirmation', proposal: { kind: 'book' }, pending_operations: [] } };
+  const f = fixture({ handler: request => {
+    if (extraHandler) { const result = extraHandler(request); if (result) return result; }
+    if (request.url === '/api/sessions/fixture-session') return reply(structuredClone(state.snapshot));
+    if (request.url === '/api/duplex/config') return reply({ enabled: true, sample_rate: 16000,
+      phrases: ['neutral_ack', 'moment', 'working_on_it'].map(phrase_id => ({ phrase_id, sample_rate: 16000,
+        pcm_bytes: pcm().byteLength, sha256: createHash('sha256').update(pcm()).digest('hex') })) });
+    if (request.url.endsWith('/duplex/cue')) return reply({ phrase_id: 'working_on_it', confidence: .99,
+      language_choice: 'cache_compatible', expires_in_ms: 800, requests: 1 });
+    return null;
+  } });
+  await f.session.start(); await flush(); transcript(f.session, text, true); await f.time.advance(160);
+  state.snapshot = progressSnapshot(text); return { ...f, state };
+}
+
+test('exact fresh accepted booking progress allows only one work cue after yield with no prediction', async () => {
+  const f = await progressFixture(); await f.session.refreshSnapshot(); await f.time.advance(710);
+  assert.equal(f.output.cues.length, 1); assert.equal(f.output.cues[0].phrase, 'working_on_it');
+  assert.equal(f.cues()[0].body.phase, 'waiting'); assert.equal(f.preparations().length, 0);
+  assert.equal(f.cues()[0].body.prepared_revision, undefined); assert.equal(f.session.coordinator.listeningBlocked, true);
+  f.output.cues[0].finish(); await flush(); await f.time.advance(1800);
+  assert.equal(f.cues().length, 1); assert.equal(f.output.cues.length, 1); await f.session.stop();
+});
+
+for (const mutation of ['hash', 'generation', 'pending_id', 'unknown', 'no_final', 'caller', 'main', 'revoked']) {
+  test(`accepted progress cannot bypass a mismatched or obsolete ${mutation} binding`, async () => {
+    const f = await progressFixture(); const value = f.state.snapshot;
+    if (mutation === 'hash') value.accepted_operation_progress.caller_text_sha256 = 'c'.repeat(64);
+    if (mutation === 'generation') value.accepted_operation_progress.generation_id = '22345678-1234-4234-8234-123456789abc';
+    if (mutation === 'pending_id') value.pending_operations[0].id = 'op_' + 'c'.repeat(24);
+    if (mutation === 'unknown') value.pending_operations[0].status = 'unknown';
+    if (mutation === 'no_final') f.session.lastUserTranscriptFinal = false;
+    if (mutation === 'caller') f.session.localSpeaking = true;
+    if (mutation === 'main') { speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer); }
+    if (mutation === 'revoked') f.session.revokedProgressTurnKeys.add(value.duplex_canonical_turn.turn_key);
+    await f.session.refreshSnapshot(); await f.time.advance(1200);
+    assert.equal(f.output.cues.length, 0); assert.equal(f.session.snapshotHardBlocked, true); await f.session.stop();
+  });
+}
+
+for (const text of ['Yes.', 'Stop.', 'Cancel it.', 'Actually book another day.', 'Book it only if the price is lower.', 'Book it and speak in Spanish.']) {
+  test(`accepted progress retains the raw text restriction for ${text}`, async () => {
+    const f = await progressFixture(text); await f.session.refreshSnapshot(); await f.time.advance(1200);
+    assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0); await f.session.stop();
+  });
+}
+
+test('async final-text digest cannot restore progress after a new caller event', async () => {
+  const f = await progressFixture(), held = deferred(); f.session.runtime.textDigest = () => held.promise;
+  const refreshing = f.session.refreshSnapshot(); await flush(); speech(f.session, 'user', 'started');
+  held.resolve(f.state.snapshot.accepted_operation_progress.caller_text_sha256); await refreshing;
+  assert.equal(f.session.acceptedOperationProgress, null); assert.equal(f.output.cues.length, 0);
+  await f.session.stop();
+});
+
+test('an in-flight old snapshot cannot bind to a resumed same-words caller turn before any canonical key was observed', async () => {
+  const f = await progressFixture(), held = deferred(), priorRequest = f.session.request.bind(f.session);
+  f.session.request = (path, ...args) => path === '' ? held.promise : priorRequest(path, ...args);
+  const refreshing = f.session.refreshSnapshot(); await flush();
+  assert.equal(f.session.observedCanonicalTurnKey, null);
+  // Isolate the binding fence from the independent newer-read sequence fence.
+  // Later refresh attempts are deliberately unavailable in this fixture.
+  f.session.refreshSnapshot = async () => {};
+  speech(f.session, 'user', 'started'); transcript(f.session, 'Book it.', true);
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  held.resolve(f.state.snapshot); await refreshing;
+  assert.equal(f.session.acceptedOperationProgress, null); assert.equal(f.session.observedCanonicalTurnKey, null);
+  assert.equal(f.session.snapshotHardBlocked, true);
+  await f.session.stop();
+});
+
+test('same-frame main observer cannot erase ownership of an already-started progress clip', async () => {
+  const f = await progressFixture(), prior = f.session.callbacks.event;
+  f.session.callbacks.event = row => {
+    prior(row);
+    if (row.kind === 'cue_started' && row.phrase_id === 'working_on_it') {
+      speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+    }
+  };
+  await f.session.refreshSnapshot(); await f.time.advance(710);
+  assert.equal(f.session.progressCuePlaying, true); assert.equal(f.session.acceptedOperationProgress, null);
+  f.state.snapshot = { ended: false, stage: 'complete', proposal: null, pending_operations: [] };
+  await f.session.refreshSnapshot(); assert.equal(f.output.cues[0].stopped, false);
+  f.output.cues[0].finish(); await flush(); assert.equal(f.session.progressCuePlaying, false);
+  await f.session.stop();
+});
+
+test('caller lifecycle sends only an observed canonical key and the same key cannot enable a new epoch', async () => {
+  const f = await progressFixture();
+  const initial = f.requests.filter(row => row.url.endsWith('/duplex/event') && row.body.event === 'caller_started');
+  assert.ok(initial.length); assert.ok(initial.every(row => row.body.progress_turn_key === undefined));
+  await f.session.refreshSnapshot(); speech(f.session, 'user', 'started'); transcript(f.session, 'Book it.', true);
+  const latest = f.requests.filter(row => row.url.endsWith('/duplex/event') && ['caller_started', 'caller_resumed'].includes(row.body.event)).at(-1);
+  assert.equal(latest.body.progress_turn_key, f.state.snapshot.duplex_canonical_turn.turn_key);
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160); await f.session.refreshSnapshot();
+  assert.equal(f.session.acceptedOperationProgress, null); await f.time.advance(1000); assert.equal(f.output.cues.length, 0);
+  await f.session.stop();
+});
+
+test('operation completion and main arrival preserve only the already-started complete progress phrase', async () => {
+  const f = await progressFixture(); await f.session.refreshSnapshot(); await f.time.advance(710);
+  const clip = f.output.cues[0]; assert.ok(clip);
+  f.state.snapshot = { ended: false, stage: 'complete', proposal: null, pending_operations: [] };
+  f.session.onLocalSpeech(true); // Unconfirmed noise still cannot cut a cue-only phrase.
+  await f.session.refreshSnapshot(); assert.equal(clip.stopped, false); assert.equal(f.session.snapshotHardBlocked, true);
+  f.session.onLocalSpeech(false);
+  transcript(f.session, 'Book it.', true); assert.equal(clip.stopped, false, 'Known endpoint tail cannot cut the started clip');
+  speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer);
+  await f.session.refreshSnapshot(); assert.equal(clip.stopped, false);
+  clip.finish(); await flush(); assert.equal(f.session.progressCuePlaying, false); assert.equal(f.session.coordinator.sensitive, true);
+  await f.time.advance(2000); assert.equal(f.cues().length, 1); await f.session.stop();
+});
+
+for (const change of ['Actually book another day.', 'Stop.', 'Book it for a different vehicle.']) {
+  test(`started progress audio immediately cancels on revised or sensitive text: ${change}`, async () => {
+    const f = await progressFixture(); await f.session.refreshSnapshot(); await f.time.advance(710);
+    const clip = f.output.cues[0]; transcript(f.session, change, true);
+    assert.equal(clip.stopped, true); assert.equal(f.session.acceptedOperationProgress, null);
+    await f.session.stop();
+  });
+}
+
 
 for (const audible of [false, true]) {
   test(`caller resume during waiting ${audible ? 'voiced audio' : 'leading padding'} has the correct turn identity and keeps prior facts`, async () => {

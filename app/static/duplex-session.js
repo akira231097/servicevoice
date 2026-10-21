@@ -31,6 +31,10 @@ const peak = pcm => {
   return result;
 };
 const speechText = text => text.toLowerCase().replace(/[.,!?;:]+/g, '').replace(/\s+/g, ' ').trim();
+const sha256Text = async text => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text.trim())))]
+  .map(value => value.toString(16).padStart(2, '0')).join('');
+const hashKey = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+const progressInvalidations = ['caller_started', 'caller_resumed', 'barge_in', 'main_started', 'ended', 'muted', 'playback_failed'];
 
 export class DuplexSession {
   constructor({ callbacks = {}, runtime = {} } = {}) {
@@ -40,7 +44,7 @@ export class DuplexSession {
       WebSocket: globalThis.WebSocket, getUserMedia: options => navigator.mediaDevices.getUserMedia(options),
       microphoneFactory: options => new DuplexMicrophone(options),
       playbackFactory: options => new PcmPlayback(options),
-      now: () => performance.now(), setTimeout: (...args) => setTimeout(...args), clearTimeout: id => clearTimeout(id),
+      now: () => performance.now(), setTimeout: (...args) => setTimeout(...args), clearTimeout: id => clearTimeout(id), textDigest: sha256Text,
       ...runtime,
     };
     this.events = []; this.closed = false; this.started = false; this.active = false;
@@ -71,6 +75,8 @@ export class DuplexSession {
     this.assistantOutputFinished = false; this.ordinaryTurnDrained = false;
     this.earlyMainStart = null; this.earlyMainStartAttempted = false;
     this.preStartPcm = null; this.preStartPcmAttempted = false;
+    this.observedCanonicalTurnKey = null; this.acceptedOperationProgress = null;
+    this.revokedProgressTurnKeys = new Set(); this.progressVersion = 0; this.progressCuePlaying = false;
   }
 
   playbackGateState() {
@@ -168,15 +174,31 @@ export class DuplexSession {
   }
 
   emit(kind, detail = {}) {
+    // A caller event binds only the previously observed turn. A delayed POST
+    // must never discover and revoke a newer canonical turn on the server.
+    const priorProgressKey = this.observedCanonicalTurnKey;
+    if (progressInvalidations.includes(kind)) {
+      this.progressVersion++;
+      if (hashKey(priorProgressKey) && this.revokedProgressTurnKeys.size < 128) this.revokedProgressTurnKeys.add(priorProgressKey);
+      if (this.acceptedOperationProgress) { this.acceptedOperationProgress = null; this.snapshotHardBlocked = true; }
+    }
     const event = { kind, at_ms: Math.max(0, this.runtime.now() - this.startAt), ...detail };
     if (this.events.length < 1500) this.events.push(event);
-    try { this.callbacks.event?.(event); } catch { /* Optional observers cannot interrupt owned audio or cleanup. */ }
-    if (kind === 'cue_started') this.cuePlaying = true;
+    if (kind === 'cue_started') {
+      this.cuePlaying = true;
+      this.progressCuePlaying = event.phase === 'waiting' && event.phrase_id === 'working_on_it' && Boolean(this.acceptedOperationProgress);
+    }
     if (['cue_ended', 'cue_stopped', 'ended'].includes(kind)) this.cuePlaying = false;
+    if (['cue_ended', 'cue_stopped', 'ended'].includes(kind) && this.progressCuePlaying) {
+      this.progressCuePlaying = false;
+      this.coordinator?.setSensitive(this.snapshotHardBlocked || sensitive(this.partial));
+    }
+    try { this.callbacks.event?.(event); } catch { /* Optional observers cannot interrupt owned audio or cleanup. */ }
     if (['cue_started', 'cue_ended', 'cue_suppressed'].includes(kind)) this.queueWaitingPreparation();
     if (this.session && ['cue_started', 'cue_stopped', 'cue_ended', 'cue_canceled', 'cue_suppressed', 'cue_gate_changed', 'cue_retry_scheduled',
-      'barge_in', 'main_started', 'ended', 'muted', 'playback_failed'].includes(kind)) {
+      ...progressInvalidations].includes(kind)) {
       const body = { event: kind, at_ms: Math.min(event.at_ms, 360000), epoch: this.coordinator?.epoch ?? 0 };
+      if (progressInvalidations.includes(kind) && hashKey(priorProgressKey)) body.progress_turn_key = priorProgressKey;
       if ([...CUE_PHRASES, 'silence'].includes(event.phrase_id)) body.phrase_id = event.phrase_id;
       if (['listening', 'waiting'].includes(event.phase)) body.phase = event.phase;
       if (/^[a-z_]{1,60}$/.test(event.reason ?? '')) body.reason = event.reason;
@@ -208,6 +230,10 @@ export class DuplexSession {
   }
 
   async selectCue(decision) {
+    const progressSelection = Boolean(this.acceptedOperationProgress);
+    if (this.acceptedOperationProgress && (decision.phase !== 'waiting' || decision.followUp)) {
+      return { phrase_id: 'silence', reason: 'accepted_progress_revoked', expires_in_ms: 0, requests: 0 };
+    }
     const pending = this.waitingPreparation, joinBegan = this.runtime.now();
     let joinMs = 0;
     const join = decision.phase === 'waiting' && !decision.followUp && pending && pending.text === decision.text
@@ -226,7 +252,7 @@ export class DuplexSession {
     }
     if (decision.signal.aborted || this.closed) throw new Error('selection_canceled');
     const prepared = this.waitingPrepared;
-    const canReuse = decision.phase === 'waiting' && !decision.followUp && prepared
+    const canReuse = !this.acceptedOperationProgress && decision.phase === 'waiting' && !decision.followUp && prepared
       && prepared.utteranceId === decision.utteranceId && prepared.text === decision.text
       && this.runtime.now() < prepared.expiresAt;
     // Only a completed, successful receipt binds reuse. A different-text or
@@ -236,6 +262,9 @@ export class DuplexSession {
       body: JSON.stringify({ text: decision.text, phase: decision.phase, epoch: decision.utteranceId,
         revision: ++this.cueRevision, ...(decision.followUp ? { follow_up: true } : {}),
         ...(canReuse ? { prepared_revision: prepared.revision } : {}) }) });
+    if (progressSelection && result?.phrase_id !== 'working_on_it') {
+      return { ...result, phrase_id: 'silence', expires_in_ms: 0 };
+    }
     if (!decision.signal.aborted && result?.prepared_reused === true && canReuse) {
       this.waitingPreparationReuses += 1;
       this.emit('waiting_preparation_reused', { join_ms: joinMs });
@@ -245,7 +274,7 @@ export class DuplexSession {
 
   queueWaitingPreparation() {
     const coordinator = this.coordinator;
-    if (this.closed || !this.active || this.muted || !this.callerSpeaking || this.snapshotHardBlocked
+    if (this.closed || !this.active || this.muted || !this.callerSpeaking || this.snapshotHardBlocked || this.acceptedOperationProgress
       || sensitive(this.partial) || !this.partial || !coordinator || coordinator.sensitive
       || coordinator.preparationRequests >= 2 || coordinator.utteranceRequestCount() >= coordinator.maxRequestsPerUtterance - 1
       || coordinator.cuedUtteranceByPhase.waiting === coordinator.utteranceId
@@ -684,7 +713,7 @@ export class DuplexSession {
           // Some providers replay partial prefixes after final yield. Detect
           // these BEFORE userStarted: they carry no new words or voice and must
           // not cancel an already reserved waiting cue. Safety gates still run.
-          const blocked = this.snapshotHardBlocked || sensitive(rawText) || sensitive(this.partial);
+          const blocked = (this.snapshotHardBlocked && !this.mayFinishStartedProgress()) || sensitive(rawText) || sensitive(this.partial);
           if (blocked) this.cancelWaitingPreparation('sensitive_state_changed');
           this.coordinator.setSensitive(blocked);
           this.coordinator.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(rawText) || listeningSensitive(this.partial));
@@ -698,6 +727,11 @@ export class DuplexSession {
         const trailing = quietTail && final;
         if (!this.callerSpeaking && !trailing) this.userStarted('user_transcript');
         const assembled = this.assembleTranscript(rawText, final), text = assembled.text;
+        if ((this.acceptedOperationProgress || this.progressCuePlaying) && text !== this.partial) {
+          if (hashKey(this.observedCanonicalTurnKey) && this.revokedProgressTurnKeys.size < 128) this.revokedProgressTurnKeys.add(this.observedCanonicalTurnKey);
+          this.progressVersion++; this.acceptedOperationProgress = null; this.snapshotHardBlocked = true;
+          this.coordinator.invalidate('partial_revised');
+        }
         // Raw and accumulated safety checks run even for repeated ASR values.
         // A correction revokes any old snapshot/audio before fresh neutral-only
         // waiting classification. It can never affirm the earlier statement.
@@ -783,24 +817,62 @@ export class DuplexSession {
     if (message.type === 'status-update' && message.status === 'ended') void this.stop('provider_ended');
   }
 
+  mayFinishStartedProgress(ended = false) {
+    return this.progressCuePlaying && !ended && !this.closed && !this.muted
+      && !this.callerSpeaking && !this.providerSpeaking
+      && !sensitive(this.partial) && !correction(this.partial);
+  }
+
+  async matchingOperationProgress(snapshot) {
+    const value = snapshot.accepted_operation_progress, turn = snapshot.duplex_canonical_turn;
+    const pending = snapshot.pending_operations;
+    if (this.closed || this.muted || this.callerSpeaking || this.localSpeaking || this.providerSpeaking
+      || this.mainSpeaking || this.userTurnHasMainAudio || this.userTurnClosed || !this.lastUserTranscriptFinal
+      || !this.partial || sensitive(this.partial) || correction(this.partial)
+      || !value || !turn || value.source !== 'canonical_queued_operation' || value.kind !== 'booking_commit'
+      || !['queued', 'running'].includes(value.status) || !/^op_[0-9a-f]{24}$/.test(value.operation_id ?? '')
+      || !hashKey(value.turn_key) || !hashKey(value.caller_text_sha256)
+      || value.turn_key !== turn.turn_key || value.caller_text_sha256 !== turn.caller_text_sha256
+      || value.generation_id !== turn.generation_id || !/^[0-9a-f-]{36}$/.test(value.generation_id ?? '')
+      || !Number.isSafeInteger(turn.user_count) || turn.user_count < 1
+      || this.revokedProgressTurnKeys.has(value.turn_key) || this.revokedProgressTurnKeys.size >= 128
+      || snapshot.ended !== false || snapshot.stage !== 'confirmation' || snapshot.proposal?.kind !== 'book'
+      || !Array.isArray(pending) || pending.length !== 1 || pending[0]?.id !== value.operation_id
+      || pending[0]?.status !== value.status) return null;
+    const digest = await this.runtime.textDigest(this.partial);
+    return digest === value.caller_text_sha256 ? { turnKey: value.turn_key } : null;
+  }
+
   async refreshSnapshot() {
     if (this.closed) return;
     const sequence = ++this.snapshotReadSequence;
+    const bindingNow = () => JSON.stringify([this.progressVersion, this.revision, this.coordinator?.utteranceId,
+      this.callerSpeaking, this.localSpeaking, this.providerSpeaking, this.lastUserTranscriptFinal]);
+    const binding = bindingNow();
     try {
       const snapshot = await this.request('');
-      if (this.closed || sequence !== this.snapshotReadSequence) return;
+      if (this.closed || sequence !== this.snapshotReadSequence || binding !== bindingNow()) return;
+      const progress = await this.matchingOperationProgress(snapshot);
+      if (this.closed || sequence !== this.snapshotReadSequence || binding !== bindingNow()) return;
+      if (hashKey(snapshot.duplex_canonical_turn?.turn_key)) this.observedCanonicalTurnKey = snapshot.duplex_canonical_turn.turn_key;
+      this.acceptedOperationProgress = progress;
+      if (progress) this.cancelWaitingPreparation('accepted_operation_progress');
       const detailsProposal = Boolean(snapshot.proposal) && snapshot.stage === 'details';
       const pending = Boolean(snapshot.pending_operations?.length);
       // This derived server flag covers only scoped queued/running work. It
       // allows a neutral waiting selection, never listening or booking consent.
       const acceptedWork = pending && Array.isArray(snapshot.pending_operations) && snapshot.accepted_work_pending === true;
       const previouslyBlocked = this.snapshotHardBlocked;
-      this.snapshotHardBlocked = Boolean(snapshot.ended || snapshot.stage === 'confirmation'
-        || (pending && !acceptedWork) || (snapshot.proposal && !detailsProposal));
+      this.snapshotHardBlocked = Boolean(snapshot.ended || (!progress && (['confirmation', 'complete', 'handoff'].includes(snapshot.stage)
+        || (pending && !acceptedWork) || (snapshot.proposal && !detailsProposal))));
       if (this.snapshotHardBlocked) this.cancelWaitingPreparation('sensitive_state_changed');
-      this.snapshotListeningBlocked = detailsProposal || pending;
+      this.snapshotListeningBlocked = detailsProposal || pending || Boolean(progress);
       this.coordinator?.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(this.partial));
-      this.coordinator?.setSensitive(this.snapshotHardBlocked || sensitive(this.partial));
+      // A truthful-at-start progress clip keeps its complete ending when work
+      // finishes or main PCM arrives. This grants no new selection and never
+      // survives caller speech, raw sensitive text, mute or call termination.
+      const finishStartedProgress = this.mayFinishStartedProgress(snapshot.ended);
+      this.coordinator?.setSensitive((this.snapshotHardBlocked && !finishStartedProgress) || sensitive(this.partial));
       if (previouslyBlocked && !this.snapshotHardBlocked) this.coordinator?.recoverWaitingContext();
       if (!this.callerSpeaking) this.coordinator?.wakeWaiting();
       else this.queueWaitingPreparation();

@@ -132,9 +132,9 @@ async function verifyRecordedFade(source, fade) {
   return { post_gain_recording_checked: true, transition_samples: expected.length,
     faded_transition_mse: minimum / expected.length, unfaded_transition_mse: abruptError / expected.length };
 }
-async function verifyRecordedCompleteTransition(source) {
+async function verifyRecordedCompleteTransition(source, phraseId = 'moment') {
   const recorded = await page.evaluate(() => window.duplexSession.context.recordBlocks.flatMap(block => [...block]));
-  const tail = 128, head = 128, cue = cueAudio.moment, main = pcmTone(730, head / 16000);
+  const tail = 128, head = 128, cue = cueAudio[phraseId], main = pcmTone(730, head / 16000);
   const expected = [...Array(tail)].map((_, index) => cue.readInt16LE(cue.length - (tail - index) * 2) / 32768)
     .concat([...Array(head)].map((_, index) => main.readInt16LE(index * 2) / 32768));
   let minimum = Infinity;
@@ -211,7 +211,7 @@ async function yieldFixtureCaller(text = 'What are the usual maintenance options
 }
 
 async function timingBoundaryReplay() {
-  report.replay_scope = 'live22_endpointing_and_provisional_boundaries_only';
+  report.replay_scope = 'live22_endpointing_provisional_and_accepted_progress_boundaries_only';
   report.timing_boundaries = [];
   await newFixtureSession({ decisionDelayMs: 500, waitingPhrase: 'one_sec', predictionEnabled: false,
     predictionControlReason: 'retain_pending_wait_through_known_endpointing_tail' });
@@ -265,6 +265,39 @@ async function timingBoundaryReplay() {
   report.timing_boundaries.push({ case: 'real_resume_during_pending_wait', actual_selections: 2,
     epochs: [1, 2], facts_preserved: true, played_cues: 1, events: resumed.events, graph: resumed.graph });
   report.checks.actual_resume_received_fresh_wait_without_refunding_old_request = true;
+
+  await newFixtureSession({ snapshot: { stage: 'confirmation', proposal: { kind: 'book' } },
+    waitingPhrase: 'working_on_it', decisionDelayMs: 80 });
+  const progressSession = sessions;
+  await page.evaluate(() => window.duplexSession.refreshSnapshot());
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+  await yieldFixtureCaller('Book it.');
+  const canonical = { turn_key: 'a'.repeat(64), caller_text_sha256: createHash('sha256').update('Book it.').digest('hex'),
+    generation_id: '12345678-1234-4234-8234-123456789abc', user_count: 3 };
+  Object.assign(fixtureContexts.get(progressSession).snapshot, {
+    pending_operations: [{ id: 'op_' + 'b'.repeat(24), status: 'running' }], duplex_canonical_turn: canonical,
+    accepted_operation_progress: { source: 'canonical_queued_operation', kind: 'booking_commit', operation_id: 'op_' + 'b'.repeat(24),
+      status: 'running', turn_key: canonical.turn_key, caller_text_sha256: canonical.caller_text_sha256, generation_id: canonical.generation_id } });
+  await page.evaluate(() => window.duplexSession.refreshSnapshot());
+  await until(async () => await eventCount('cue_started') === 1, 'accepted_work_progress_clip_missing');
+  await delay(250);
+  Object.assign(fixtureContexts.get(progressSession).snapshot, { stage: 'complete', proposal: null,
+    pending_operations: [], accepted_operation_progress: null });
+  await page.evaluate(() => window.duplexSession.refreshSnapshot());
+  sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 });
+  await streamMain(provider, .2);
+  await until(() => page.evaluate(() => window.duplexSession.playback.main.size === 0), 'progress_main_handoff_not_drained');
+  const completedProgress = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence }));
+  const progressSource = completedProgress.graph.starts.find(row => row.samples === 11200);
+  const progressHandoff = completedProgress.events.find(row => row.kind === 'main_handoff');
+  assert.ok(progressSource.ended_ms && !progressSource.stopped, 'operation_completion_or_main_cut_progress_clip');
+  assert.ok(progressHandoff.hold_ms > 250 && progressHandoff.hold_ms < 700, 'progress_handoff_did_not_use_existing_fixed_barrier');
+  const progressTransition = await verifyRecordedCompleteTransition(progressSource, 'working_on_it');
+  assert.ok(progressTransition.mse < 1e-9, 'progress_complete_ending_absent_from_postgain_recording');
+  await delay(1500); assert.equal(selections(progressSession).length, 1); assert.equal(preparations(progressSession).length, 0);
+  report.timing_boundaries.push({ case: 'accepted_progress_finishes_after_operation_and_main', hold_ms: progressHandoff.hold_ms,
+    complete_clip_ms: 700, transition: progressTransition, events: completedProgress.events, graph: completedProgress.graph });
+  report.checks.accepted_progress_kept_complete_words_after_operation_completed_with_one_fixed_handoff = true;
 
   for (const confirmationMs of [529, null]) {
     await newFixtureSession();
@@ -805,14 +838,17 @@ try {
         const trustedShort = input.phase === 'waiting' && trusted?.previousAssistant
           && trusted.shortReplies.includes(input.text);
         const state = trusted?.snapshot;
-        const hardBlocked = state?.ended || state?.pending_operations?.length || ['confirmation', 'complete', 'handoff'].includes(state?.stage)
-          || (state?.proposal && state.stage !== 'details');
+        const acceptedProgress = input.phase === 'waiting' && !input.prepare_only && !input.follow_up
+          && state?.accepted_operation_progress?.caller_text_sha256 === createHash('sha256').update(input.text.trim()).digest('hex')
+          && state?.accepted_operation_progress?.status === 'running';
+        const hardBlocked = state?.ended || (!acceptedProgress && (state?.pending_operations?.length || ['confirmation', 'complete', 'handoff'].includes(state?.stage)
+          || (state?.proposal && state.stage !== 'details')));
         const listeningBlocked = input.phase === 'listening' && Boolean(state?.proposal);
         const prepareOnly = input.prepare_only === true;
         const firstWaitingReason = !prepareOnly && input.phase === 'waiting' && trusted?.firstWaitingReason
           && !selections(sessionNumber).some(row => row.phase === 'waiting') ? trusted.firstWaitingReason : null;
         let silence = hardBlocked || listeningBlocked || firstWaitingReason
-          || /stop|confirm|goodbye/i.test(input.text) || (input.phase === 'listening' && /actually|correct/i.test(input.text)) || (short && !trustedShort);
+          || /stop|confirm|goodbye/i.test(input.text) || (input.phase === 'listening' && /actually|correct/i.test(input.text)) || (short && !trustedShort && !acceptedProgress);
         // First session reproduces a provider stream whose partials arrive far
         // faster than a classifier response. A stable-only fixture missed this.
         const entry = { session: sessionNumber, phase: input.phase, epoch: input.epoch,
