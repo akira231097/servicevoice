@@ -127,6 +127,6 @@ def test_both_listener_lifespans_share_startup_and_readiness(tmp_path, monkeypat
                     config = (await http.get("/api/config")).json()
                     assert config["jev_faq_ready"] is True
                     assert config["jev_pool_initialization_ms"] is not None
-                    assert config["jev_faq_version"] == "jev-static-faq-2026-10-18-2"
+                    assert config["jev_faq_version"] == "jev-static-faq-2026-10-21-1"
         assert created.is_closed
     asyncio.run(scenario())

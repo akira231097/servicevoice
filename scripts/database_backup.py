@@ -51,6 +51,9 @@ OPTIONAL = {
     "advisor_case_metadata": "handoff_id status revision assigned_operator last_operator last_note updated",
     "advisor_case_audit": "id handoff_id revision from_status to_status operator note at",
     "telephony_bindings": "provider_call_id session_id tenant organization_id phone_number_id assistant_id created ended",
+    "duplex_gateway_turns": "session_id provider_call_id user_context_sha256 user_text_sha256 user_count generation_id updated",
+    "duplex_issued_operations": "session_id provider_call_id tool_call_id tool_name invocation_fingerprint proposal_id user_context_sha256 user_text_sha256 user_count generation_id expires",
+    "phone_bridge_admissions": "outer_call_id session_id tenant organization_id phone_number_id inner_assistant_id created expires_at allocation_requested inner_call_id outer_ended inner_ended closed",
 }
 JSON_FIELDS = {
     "sessions": ("state",), "proposals": ("payload", "result"),
@@ -64,6 +67,9 @@ PRIMARY_KEYS = {
     "tool_observations": ("session_id", "provider_call_id", "tool_call_id", "digest"),
     "advisor_case_metadata": ("handoff_id",), "telephony_bindings": ("provider_call_id",),
     "appointment_services": ("appointment_id", "position"),
+    "duplex_gateway_turns": ("session_id",),
+    "duplex_issued_operations": ("provider_call_id", "tool_call_id"),
+    "phone_bridge_admissions": ("outer_call_id",),
 }
 UNIQUE_KEYS = {
     "appointment_services": ("appointment_id", "service"),
@@ -71,6 +77,7 @@ UNIQUE_KEYS = {
     "tool_invocations": ("session_id", "call_id"), "transcripts": ("session_id", "event_id"),
     "handoffs": ("session_id",), "provider_tool_policies": ("session_id",),
     "advisor_case_audit": ("handoff_id", "revision"), "telephony_bindings": ("session_id",),
+    "phone_bridge_admissions": ("session_id",),
 }
 
 _SQL_TOKENS = re.compile(
@@ -241,6 +248,16 @@ def _schema(db, deadline):
                 raise BackupError("incompatible_key_constraints")
     if ("advisor_case_metadata" in tables) != ("advisor_case_audit" in tables):
         raise BackupError("incompatible_schema")
+    if ("duplex_gateway_turns" in tables) != ("duplex_issued_operations" in tables):
+        raise BackupError("incompatible_schema")
+    if "phone_bridge_admissions" in tables:
+        uniques=[]
+        for index in db.execute('PRAGMA index_list("phone_bridge_admissions")'):
+            if index["unique"] and not index["partial"]:
+                escaped=index["name"].replace('"','""')
+                uniques.append(tuple(row["name"] for row in db.execute(f'PRAGMA index_info("{escaped}")')))
+        if ("inner_call_id",) not in uniques or "telephony_bindings" not in tables:
+            raise BackupError("incompatible_key_constraints")
     if any(name in tables for name in ("gemini_tool_signatures", "telephony_bindings")) and "provider_tool_policies" not in tables:
         raise BackupError("incompatible_schema")
     if "appointment_services" in tables:
@@ -320,13 +337,20 @@ def _verify(db, deadline):
         expected = "op_" + hashlib.sha256((row["session_id"] + "\0" + row["call_id"]).encode()).hexdigest()[:24]
         if row["id"] != expected:
             raise BackupError("operation_identity_mismatch")
-    for table in ("provider_tool_policies", "gemini_tool_signatures", "tool_observations", "telephony_bindings"):
+    for table in ("provider_tool_policies", "gemini_tool_signatures", "tool_observations", "telephony_bindings",
+                  "duplex_gateway_turns", "duplex_issued_operations"):
         if table in tables:
             _require_empty(db, f"SELECT 1 FROM {table} x LEFT JOIN sessions s ON s.id=x.session_id WHERE s.id IS NULL OR s.provider_call_id IS NULL OR x.provider_call_id!=s.provider_call_id LIMIT 1", "provider_scope_mismatch")
     if "provider_tool_policies" in tables:
         _require_empty(db, "SELECT 1 FROM provider_tool_policies WHERE policy NOT IN ('gemini-issued','provider-native') LIMIT 1", "invalid_provider_policy")
     if "telephony_bindings" in tables:
         _require_empty(db, "SELECT 1 FROM telephony_bindings b JOIN sessions s ON s.id=b.session_id LEFT JOIN provider_tool_policies p ON p.provider_call_id=b.provider_call_id WHERE b.tenant!=s.tenant OR p.session_id IS NULL OR p.session_id!=b.session_id OR p.assistant_id!=b.assistant_id OR p.policy!='gemini-issued' LIMIT 1", "telephony_policy_mismatch")
+    if "phone_bridge_admissions" in tables:
+        # The outer leg is ownership metadata, not a second provider session.
+        # Requested allocations without an inner ID remain unresolved forever;
+        # expiry alone never closes or discards their ownership during restore.
+        _require_empty(db, "SELECT 1 FROM phone_bridge_admissions b LEFT JOIN sessions s ON s.id=b.session_id WHERE s.id IS NULL OR b.tenant!=s.tenant OR (b.inner_call_id IS NOT NULL AND s.provider_call_id IS NOT NULL AND b.inner_call_id!=s.provider_call_id) LIMIT 1", "phone_bridge_scope_mismatch")
+        _require_empty(db, "SELECT 1 FROM phone_bridge_admissions WHERE outer_ended NOT IN (0,1) OR inner_ended NOT IN (0,1) OR (inner_ended=1 AND inner_call_id IS NULL) OR (closed IS NOT NULL AND (outer_ended!=1 OR (allocation_requested IS NOT NULL AND inner_ended!=1))) LIMIT 1", "phone_bridge_ownership_mismatch")
     if "tool_observations" in tables:
         for row in db.execute("SELECT * FROM tool_observations"):
             _check(deadline)

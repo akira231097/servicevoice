@@ -1,5 +1,6 @@
 """Offline transport tests; all provider responses and credentials are synthetic."""
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
@@ -207,7 +208,7 @@ def test_upstream_failure_is_sanitized_and_admission_released(tmp_path):
     asyncio.run(run())
 
 
-def test_header_timeout_releases_capacity(tmp_path):
+def test_header_timeout_releases_capacity(tmp_path, monkeypatch):
     async def run():
         entered, never_release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
         provider_calls = []
@@ -237,6 +238,10 @@ def test_header_timeout_releases_capacity(tmp_path):
             assert timing["milestones_ms"]["preflight"] is not None
             assert timing["milestones_ms"]["upstream_headers"] is None
             assert timing["milestones_ms"]["first_upstream_event"] is None
+            # Recovery verifies released capacity, not another 200 ms race with
+            # authenticated SQLite preflight on a contended Windows runner.
+            # Keep the first request's strict timeout and cancellation checks.
+            monkeypatch.setattr(gateway, "limits", replace(gateway.limits, total_seconds=30))
             recovered = await post(app, request_body("call-b"))
             assert recovered.status_code == 200 and "Recovered" in recovered.text
             assert len(provider_calls) == 2

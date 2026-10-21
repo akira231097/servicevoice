@@ -147,7 +147,7 @@ def test_current_explicit_decision_never_inherits_previous_english_receipt(tmp_p
             readback = text_of(await post(env))
             env.history.extend([{"role": "assistant", "content": readback}, {"role": "user", "content": user_text}])
             result = await issue(env, "confirm_action", {"proposal_id": proposal["proposal_id"], "confirmed": True, "presentation": presentation})
-            assert result["ok"]
+            assert result["ok"], result
             assert text_of(await post(env)) == "Gemini fallback"
             assert env.gateway.latency_snapshot(env.cid)[-1]["narration_reason"] == reason
             assert len(env.sent) == 1

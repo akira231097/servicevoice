@@ -44,7 +44,9 @@ async def recovery_fixture(store):
     signatures = SignatureStore(store.path, GatewayLimits())
     observations = ToolObservationStore(store.path)
     advisor = AdvisorQueue(store)
-    harness = ToolHarness(store)
+    # This fixture constructs completed evidence for backup/restore assertions.
+    # It does not test the production 1.5-second pending-response deadline.
+    harness = ToolHarness(store, timeout_seconds=30, status_timeout_seconds=5)
     owner = store.create_session("live")
     cid = str(uuid4())
     with store.connect() as db:
@@ -55,6 +57,7 @@ async def recovery_fixture(store):
         "service": "oil_change", "slot_id": slots["slots"][0]["id"], "customer_name": "Synthetic Alex",
         "phone": "5125550142", "vehicle": "2021 Toyota Camry",
     }, "prepare")
+    assert prepared.get("ok") is True, prepared
     consent_args = {"proposal_id": prepared["proposal_id"], "confirmed": True}
     booked = await harness.run(owner["id"], "confirm_action", consent_args, "commit")
     assert booked["ok"]

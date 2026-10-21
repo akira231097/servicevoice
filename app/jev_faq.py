@@ -1,4 +1,4 @@
-"""Optional bounded first-turn classification for public static facts only."""
+"""Optional bounded classification for public static facts only."""
 from __future__ import annotations
 
 import asyncio
@@ -15,12 +15,25 @@ from starlette.concurrency import run_in_threadpool
 from .domain import TENANT, dealership_facts, today
 from .jev_classifier import ClassificationUnavailable, JevClassifier, route_candidate
 
-FAQ_VERSION = "jev-static-faq-2026-10-18-2"
+FAQ_VERSION = "jev-static-faq-2026-10-21-1"
 QUESTION = re.compile(r"^(?:hi[,!. ]+|hello[,!. ]+)?(?:what|when|where|which|how|are|is|do|does|can|could)\b", re.I)
 TOPIC = re.compile(r"\b(?:hours|open|opens|opening|close|closes|closing|location|address|located|services|offer|offers|support|advisor|adviser|advisors|advisers|transfer|transfers|callback|callbacks)\b", re.I)
 # Eligibility is not intent authority. Broad exclusions trade coverage for no
 # extra classifier latency on obvious actions, dangerous symptoms or a person.
 EXCLUDED = re.compile(r"\b(?:book|booking|schedule|scheduled|scheduling|appointment|appointments|reschedule|cancel|cancellation|move|change|reserve|reservation|available|availability|urgent|emergency|danger|dangerous|smoke|fire|unsafe|safe|drive|driving|brake|brakes|warning|stuck|collision|human|person|speak|talk|connect|save|request|arrange|troubleshoot|diagnose|repair|today|tomorrow|holiday|price|cost|warranty|recall)\b|\b(?:call|transfer)\s+me\b", re.I)
+# Only the isolated browser candidate may consider a later public catalog
+# question. Whole-question matching excludes references, added actions and
+# instructions before any optional classifier request. Other FAQ labels retain
+# their original first-turn-only behavior.
+FOLLOWUP_CATALOG = re.compile(r"(?:(?:what|which)\s+services\s+do\s+you\s+(?:offer|provide)|what\s+are\s+your\s+services)[?!.]?", re.I)
+FOLLOWUP_CONTROL = re.compile(r"\b(?:yes|yep|yeah|no|nope|not|never|don['’]?t|do not|actually|instead|correct|correction|confirm|approved?|consent|stop|wait|only|selected?|chosen?|readback|ignore|override|instructions?|system|prompt|secret|password|token|api\s*key|phone|number|email|address|contact|card|pin|account|ssn)\b|[\d@]", re.I)
+FOLLOWUP_LANGUAGE = re.compile(r"\b(?:speak|reply|respond|answer|talk|language|english|spanish|telugu|hindi|tamil|french|german|arabic|mandarin|cheppu|matladu|batao|bolo|habla|responde|parle)\b", re.I)
+FOLLOWUP_ASSISTANT_RISK = re.compile(r"\b(?:confirm|confirmation|readback|booked|booking|appointment|selected|chosen|scheduled|reserved|reference|approved?|consent|is\s+that\s+correct|shall\s+i|ready\s+to|proposal)\b", re.I)
+FOLLOWUP_SAFETY = re.compile(r"\b(?:emergency|urgent|smoke|fire|unsafe|danger(?:ous)?|collision|crash|injured|injury|bleeding|hurt|pain|faint|poison|attack|cannot\s+stop|can't\s+stop)\b", re.I)
+FOLLOWUP_GREETING = re.compile(r"(?:hi|hello|hey|thanks|thank\s+you)[!.]?", re.I)
+FOLLOWUP_NAME_INTRO = re.compile(r"(?:my\s+name\s+is|i\s+am\s+called|i'm\s+called)\s+[a-z][a-z'-]{0,39}(?:\s+[a-z][a-z'-]{0,39}){0,3}[!.]?", re.I)
+FOLLOWUP_SINGLE_NAME = re.compile(r"[a-z][a-z'-]{0,39}[!.]?", re.I)
+FOLLOWUP_NAME_QUESTION = re.compile(r"(?:(?:what(?:'s|\s+is)\s+your)|(?:(?:can|could|may)\s+i\s+(?:have|get|ask\s+for)\s+your)|(?:please\s+(?:tell|give)\s+me\s+your))\s+(?:(?:first|full)\s+)?name\s*\?", re.I)
 
 
 @dataclass(frozen=True)
@@ -35,16 +48,39 @@ class FaqDecision:
     language_probability: float | None = None
 
 
-def eligible_text(messages):
+def eligible_text(messages, *, allow_followup_public_faq=False):
     history = [message for message in messages if message.get("role") != "system"]
+    user_count = sum(message.get("role") == "user" for message in history)
     if (not history or history[-1].get("role") != "user"
-            or sum(message.get("role") == "user" for message in history) != 1
+            or (user_count != 1 and allow_followup_public_faq is not True)
             or any(message.get("role") == "tool" or message.get("tool_calls") is not None for message in history)):
         return None, "not_first_user_turn"
     text = history[-1].get("content")
     if not isinstance(text, str) or not text.strip() or len(text) > 1600 or not text.isascii():
         return None, "input_or_language_bounds"
     text = text.strip()
+    if user_count > 1:
+        if not FOLLOWUP_CATALOG.fullmatch(text):return None, "action_or_complex_request"
+        for index, message in enumerate(history[:-1]):
+            content = message.get("content")
+            if not isinstance(content, str) or len(content) > 1600 or not content.isascii():
+                return None, "input_or_language_bounds"
+            if FOLLOWUP_LANGUAGE.search(content) or FOLLOWUP_SAFETY.search(content):return None, "action_or_complex_request"
+            if message.get("role") == "user" and (EXCLUDED.search(content) or FOLLOWUP_CONTROL.search(content)):
+                return None, "action_or_complex_request"
+            if message.get("role") == "user":
+                prior = history[index-1] if index else {}
+                # A vocabulary blacklist cannot recognize every romanized
+                # language. All prior caller turns must instead fit the small
+                # benign history needed here; unknown history stays with Gemini.
+                benign = (FOLLOWUP_GREETING.fullmatch(content.strip())
+                    or FOLLOWUP_NAME_INTRO.fullmatch(content.strip())
+                    or FOLLOWUP_CATALOG.fullmatch(content.strip())
+                    or (FOLLOWUP_SINGLE_NAME.fullmatch(content.strip()) and prior.get("role") == "assistant"
+                        and FOLLOWUP_NAME_QUESTION.fullmatch(prior.get("content", "").strip())))
+                if not benign:return None, "action_or_complex_request"
+            if message.get("role") == "assistant" and FOLLOWUP_ASSISTANT_RISK.search(content):
+                return None, "action_or_complex_request"
     if EXCLUDED.search(text):return None, "action_or_complex_request"
     if not QUESTION.search(text) or not TOPIC.search(text):return None, "not_simple_faq_candidate"
     return text, "eligible_text"
@@ -160,13 +196,14 @@ class JevFaqRouter:
         task.add_done_callback(finished)
         return await asyncio.shield(task)
 
-    async def choose(self, sid, call_id, messages, key, on_request=None):
-        began = time.monotonic()
+    async def choose(self, sid, call_id, messages, key, on_request=None, *, allow_followup_public_faq=False):
+        began = time.perf_counter()
         info = {}
         def result(reason, text=None):
-            return FaqDecision(reason, text, round((time.monotonic()-began)*1000, 3), **info)
-        text, reason = eligible_text(messages)
+            return FaqDecision(reason, text, round((time.perf_counter()-began)*1000, 3), **info)
+        text, reason = eligible_text(messages, allow_followup_public_faq=allow_followup_public_faq)
         if text is None:return result(reason)
+        followup = sum(message.get("role") == "user" for message in messages) > 1
         if not isinstance(key, str) or not key:return result("credential_missing")
         if self.closing:return result("router_closed")
         if not self.ready:return result("classifier_not_ready")
@@ -186,9 +223,12 @@ class JevFaqRouter:
                             margin=scores[0]-scores[1], language_probability=decision.language_probabilities["english_only"])
                 route, reason = route_candidate(state, decision, deadline_ms=self.timeout*1000)
                 if route != "static_faq":return result(reason)
+                if followup and decision.label != "services":return result("intent_uncertain")
+                if time.perf_counter()-began >= self.timeout:return result("classification_deadline")
                 if self.closing or not await self.snapshot(sid, call_id):return result("state_changed")
                 answer = static_answer(decision.label, dealership_facts(today()))
                 if answer is None:return result("unknown_label")
+                if time.perf_counter()-began >= self.timeout:return result("classification_deadline")
                 return result("verified_static_faq", answer)
         except TimeoutError:
             return result("classification_deadline")

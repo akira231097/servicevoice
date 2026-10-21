@@ -103,7 +103,17 @@ def test_oversized_or_unsupported_text_is_unverifiable(text):
 
 
 @pytest.mark.parametrize("wrong_reference", [False, True])
-def test_mock_model_books_real_disposable_appointment_and_reference_is_checked(tmp_path, wrong_reference):
+def test_mock_model_books_real_disposable_appointment_and_reference_is_checked(tmp_path, wrong_reference, monkeypatch):
+    from scripts.evaluate_gemini import Conversation
+    original_init = Conversation.__init__
+
+    def reference_fixture(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # Reference equality needs a completed disposable receipt, not a CI
+        # disk-speed benchmark. Production keeps its strict 1.5-second waiter.
+        self.harness.timeout_seconds = 30
+
+    monkeypatch.setattr(Conversation, "__init__", reference_fixture)
     case = {"id": "synthetic-reference", "family": "receipt", "category": "confirmation", "split": "regression",
             "criticality": "critical", "execution": {"kind": "model_text"},
             "turns": ["Prepare the first available oil change for Taylor Reed, 2025550146, 2021 Toyota Camry. Ask before booking.",
@@ -129,7 +139,9 @@ def test_mock_model_books_real_disposable_appointment_and_reference_is_checked(t
         spoken = reference[:-1] + ("0" if reference[-1] != "0" else "1") if wrong_reference else reference
         return reply("Your appointment is confirmed. Your reference is " + spoken + ".")
     row, _, used = execute(tmp_path, provider, raw_case=case)
-    assert row["status"] == "completed" and used == 4 and all(c["passed"] for c in row["checks"])
+    diagnostic = {"status": row["status"], "error_code": row.get("error_code"), "requests": used,
+                  "tool_errors": [item.get("error") for item in row["outputs"]["tools"]]}
+    assert row["status"] == "completed" and used == 4 and all(c["passed"] for c in row["checks"]), diagnostic
     event = row["outputs"]["tools"][-1]
     assert event["result_reference_sha256"] == hashed(actual_references[0])
     assert event["result"]["appointment"]["reference"].startswith("local_object_")

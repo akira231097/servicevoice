@@ -34,6 +34,7 @@ from .jev_classifier import JEV_MODEL
 from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
+from .phone_bridge_api import install_phone_bridge_api
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
 from .diagnostics import NullDiagnostics, create_diagnostics, operation_identifier, turn_identifier
 from .gemini_tts import GeminiTTS, TTSError
@@ -138,6 +139,7 @@ def create_app(db_path=None):
     app.state.store=store
     app.state.capacity=capacity
     app.state.live_admission=LiveAdmission(store,capacity)
+    app.state.phone_bridge=None
     app.state.harness=ToolHarness(store)
     app.state.telemetry=NullTelemetry()
     app.state.local_timings=NullLocalTimingSink()
@@ -213,12 +215,13 @@ def create_app(db_path=None):
             call_id=event.get("provider_call_id")
             if call_id:request.state.diagnostic_call_id=call_id
             diagnose("tts",event.get("event","tts.unknown"),
-                "failure" if event.get("event")=="tts.failed" else "cancelled" if event.get("event")=="tts.cancelled" else "success",
+                "failure" if event.get("event")=="tts.failed" else "cancelled" if event.get("event")=="tts.cancelled" else "success" if event.get("event")=="tts.completed" else "started",
                 call_id=call_id or "unbound_"+event["request_id"],request_id=event["request_id"],
                 start_unix=event.get("started_at_unix"),duration_ms=event.get("elapsed_ms"),attributes={k:event[k] for k in (
                     "model","voice","sample_rate","input_characters","audio_bytes","error_code","failure_phase",
                     "provider","provider_call_id_status","turn_id_status","first_audio_ms","upstream_http_status",
-                    "upstream_sample_rate","resampled","resampler","observation_scope","audio_duration_ms") if k in event})
+                    "upstream_sample_rate","resampled","resampler","observation_scope","audio_duration_ms",
+                    "cache_hit","cache_text_normalized","cache_asset_id","cache_request_sha256","cache_manifest_sha256","cached_sample_rate","synthesis_source") if k in event})
         try:return await app.state.gemini_tts.response(body,observer=observe)
         except TTSError as exc:
             raise HTTPException(getattr(exc,"status_code",502),getattr(exc,"code","speech_unavailable")) from None
@@ -240,6 +243,7 @@ def create_app(db_path=None):
                 "jev_faq_ready":app.state.gemini_gateway.faq.ready,
                 "jev_pool_initialization_ms":app.state.gemini_gateway.faq.initialization_ms,
                 "jev_faq_version":FAQ_VERSION,"jev_model":JEV_MODEL,
+                "duplex_browser_cue_control":"browser-owned-v1",
                 "services":list(SERVICES.values()),"voice_provider":"Vapi","live_voice_available":not missing,"voice_max_duration_seconds":300,
                 "live_voice_missing":missing,"vapi_public_key":values.get("VAPI_PUBLIC_KEY") or "",
                 "vapi_assistant_id":values.get("VAPI_ASSISTANT_ID") or "",
@@ -353,7 +357,7 @@ def create_app(db_path=None):
         if session["mode"]!="live":
             raise HTTPException(403,"Voice call needs a live session.")
 
-    def resolve_call(call_id,sid,token):
+    def resolve_call(call_id,sid,token,call_type=None):
         # Every SQLite operation in this routine runs in a worker thread.
         with store.connect() as db:
             bound=db.execute("SELECT * FROM sessions WHERE provider_call_id=?",(call_id,)).fetchone()
@@ -362,8 +366,15 @@ def create_app(db_path=None):
             phone_table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='telephony_bindings'").fetchone()
             if phone_table and db.execute("SELECT 1 FROM telephony_bindings WHERE provider_call_id=?",(call_id,)).fetchone():
                 raise HTTPException(403,"Phone calls require their dedicated ingress binding.")
+            if app.state.phone_bridge_state_present and app.state.phone_bridge is None:
+                bridge=db.execute("SELECT * FROM phone_bridge_admissions WHERE outer_call_id=? OR inner_call_id=? OR session_id=?",
+                                  (call_id,call_id,sid)).fetchone()
+                if bridge and (not bound or bridge["inner_call_id"]!=call_id):
+                    raise HTTPException(403,"Disabled phone bridge cannot bind a new media call.")
         if bound:
             require_unexpired(bound)
+            if app.state.phone_bridge is not None:
+                app.state.phone_bridge.validate_bound(bound["id"],call_id)
             if sid is not None and sid!=bound["id"]:
                 raise HTTPException(403,"Conflicting session binding.")
             if token is not None:auth(bound["id"],token,True)
@@ -372,6 +383,8 @@ def create_app(db_path=None):
             raise HTTPException(403,"Unknown call. Start from the local browser demo.")
         session=auth(sid,token)
         require_unexpired(session)
+        if app.state.phone_bridge is not None:
+            app.state.phone_bridge.observe_authenticated_inner(sid,call_id,call_type)
         try:
             with store.transaction() as db:
                 # Recheck after acquiring the write lock: /end or another
@@ -418,7 +431,7 @@ def create_app(db_path=None):
             raise HTTPException(422,"Invalid session binding.")
         if token is not None and (not isinstance(token,str) or not 1<=len(token)<=256):
             raise HTTPException(422,"Invalid session binding.")
-        sid=resolve_call(call_id,sid,token)
+        sid=resolve_call(call_id,sid,token,call.get("type"))
         try:
             app.state.gemini_gateway.store.pin_call_policy(sid,call_id,assistant_id,values)
         except GatewayError as exc:
@@ -434,7 +447,14 @@ def create_app(db_path=None):
         # authenticated provider payload already says the call has ended.
         if isinstance(call,dict) and (call.get("status")=="ended" or call.get("endedAt") is not None):
             raise HTTPException(409,"Call has ended. No new generation is allowed.")
-        return bind_provider_call(call,assistant)
+        sid=bind_provider_call(call,assistant)
+        if app.state.phone_bridge is not None:
+            app.state.phone_bridge.require_live(sid,call["id"])
+        elif app.state.phone_bridge_state_present:
+            with store.connect() as db:
+                if db.execute("SELECT 1 FROM phone_bridge_admissions WHERE session_id=?",(sid,)).fetchone():
+                    raise HTTPException(409,"Phone bridge is disabled. No new generation is allowed.")
+        return sid
     install_gateway(app, settings, bind_model_call,limits=GatewayLimits(concurrency=capacity.gateway_concurrency))
     # Dedicated phone identity/credentials are frozen until process restart.
     app.state.telephony_ingress=TelephonyIngress(store,IngressConfig.from_mapping(settings()),
@@ -446,12 +466,23 @@ def create_app(db_path=None):
     app.state.telephony_http_lock=threading.Lock()
     app.state.telephony_http_tasks=set()
     app.state.telephony_http_closing=False
+    install_phone_bridge_api(app,app.state.telephony_ingress,settings)
+    with store.connect() as db:
+        app.state.phone_bridge_state_present=bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_bridge_admissions'").fetchone())
 
     def tool_may_continue(sid,tid,terminal_metadata=False):
         with store.connect() as db:
             session=db.execute("SELECT * FROM sessions WHERE id=?",(sid,)).fetchone()
             require_unexpired(session)
-            if not session["ended"] and not terminal_metadata:return True
+            bridge_live=True
+            if app.state.phone_bridge is not None:
+                try:app.state.phone_bridge.require_live(sid)
+                except IngressError as exc:
+                    if exc.code!="phone_bridge_call_ended":raise
+                    bridge_live=False
+            elif app.state.phone_bridge_state_present:
+                bridge_live=not bool(db.execute("SELECT 1 FROM phone_bridge_admissions WHERE session_id=?",(sid,)).fetchone())
+            if not session["ended"] and bridge_live and not terminal_metadata:return True
             # Existing work may finish and exact retries must remain observable.
             # A new ID after end is refused; nothing cancels accepted effects.
             cached=db.execute("SELECT 1 FROM tool_results WHERE session_id=? AND call_id=?",(sid,tid)).fetchone()

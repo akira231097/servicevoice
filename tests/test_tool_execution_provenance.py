@@ -3,6 +3,7 @@ import importlib
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 
 import dotenv
@@ -147,13 +148,41 @@ def test_original_arguments_checked_before_string_normalization(client):
     assert results(post(client, value, [command]))[0]["ok"]
 
 
-def test_signed_group_can_arrive_individually_or_reordered(client):
+@pytest.mark.parametrize("blocked_worker", [False, True])
+def test_signed_group_can_arrive_individually_or_reordered(
+        client, monkeypatch, complete_pending_tool_results, blocked_worker):
     value = session(client)
     first, second = entry("one"), entry("two", "get_appointment")
     issue(client, value, first, second)
-    assert all(result["ok"] for result in results(post(client, value, [second, first])))
-    assert results(post(client, value, [first]))[0]["ok"]
+    release = threading.Event()
+    if blocked_worker:
+        original = client.app.state.harness._execute_registered
+
+        def gated(*args, **kwargs):
+            assert release.wait(30), "Only the test may release accepted fixture work."
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(client.app.state.harness, "_execute_registered", gated)
+    try:
+        initial = results(post(client, value, [second, first]))
+        initial_copy = json.loads(json.dumps(initial))
+        if blocked_worker:
+            assert [row.get("error") for row in initial] == ["operation_pending", "operation_pending"]
+            assert count(client, "tool_invocations") == 2
+            assert count(client, "tool_results") == count(client, "events") == 0
+        release.set()
+        completed = complete_pending_tool_results(client, value["id"], initial)
+    finally:
+        release.set()
+    assert initial == initial_copy, "Reconciliation must preserve the original HTTP outcomes."
+    assert all(result["ok"] for result in completed), [
+        {"ok": row.get("ok"), "error": row.get("error"), "receipt_present": "_receipt" in row}
+        for row in completed
+    ]
+    replay = results(post(client, value, [first]))[0]
+    assert replay["ok"] and replay == completed[1]
     assert count(client, "tool_invocations") == 2
+    assert count(client, "tool_results") == count(client, "events") == 2
 
 
 @pytest.mark.parametrize("signature_state", ["expired", "deleted"])

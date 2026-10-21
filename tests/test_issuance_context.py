@@ -91,7 +91,10 @@ def test_signature_store_restores_original_only_with_or_without_supplied_extras(
     assert 'user_context_sha256' not in json.dumps(store.restore_group('sid-one','call-one',[tool()]))
     with closing(sqlite3.connect(store.path)) as db:
         names={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert names=={'gemini_tool_signatures','provider_tool_policies'}
+        progress_counts=[db.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+            for name in ('duplex_gateway_turns','duplex_issued_operations')]
+    assert names=={'gemini_tool_signatures','provider_tool_policies','duplex_gateway_turns','duplex_issued_operations'}
+    assert progress_counts==[0,0]  # Ordinary signature storage does not record optional cue evidence.
 
 def test_optional_context_preserves_legacy_storage_fingerprint_and_empty_extras(store):
     store.save_group('sid-one','call-one',[tool('legacy',OPAQUE)])

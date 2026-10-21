@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ServiceVoice · Duplex conversation</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#183c41;background:#f2f5f1}body{max-width:780px;margin:50px auto;padding:0 24px;line-height:1.65}h1{font-size:2.5rem;line-height:1.12;letter-spacing:-1.5px}main,section{background:#fff;border:1px solid #d8e1d8;border-radius:20px;padding:28px;margin:20px 0}button{background:#1c6359;color:white;border:0;border-radius:12px;padding:13px 21px;font:inherit;cursor:pointer;margin-right:8px}button:disabled{opacity:.45;cursor:default}#status{display:inline-block;padding:5px 13px;border-radius:30px;background:#e5eee2}small{color:#59706b}#conversation{max-height:360px;overflow:auto}#conversation p{border-bottom:1px solid #edf0ea;padding-bottom:12px}#notice{color:#944822}meter{width:100%}.secondary{background:#edf2e9;color:#254f48}pre{font-size:.8rem;white-space:pre-wrap}a{color:#1c6359}
+</style>
+<header><small>ServiceVoice / isolated browser experiment</small><h1>A conversation that<br>keeps listening.</h1><p>Speak naturally. The agent may give a short acknowledgment while you talk, then answer when your turn is complete. You can interrupt its reply.</p></header>
+<main><span id="status" role="status">Ready</span><p><meter id="level" min="0" max=".15" value="0" aria-label="Microphone activity"></meter></p><button id="start">Start conversation</button><button id="mute" class="secondary" disabled>Mute</button><button id="end" class="secondary" disabled>End</button><p id="notice" role="alert"></p><small>Five-minute limit. Use fictional details when trying a booking. Your main phone assistant is separate.</small></main>
+<section><h2>Conversation</h2><div id="conversation" aria-live="polite"><p>Your conversation will appear here.</p></div></section>
+<section><h2>Review this test</h2><p>Listen for natural acknowledgments, complete answers, clean interruptions and a corrected readback before booking. A cue is optional and should stay silent during sensitive details or confirmation.</p><button id="export" class="secondary">Export test evidence</button><pre id="metrics">No call yet.</pre><small>Evidence describes browser playback and transport. Listening quality and provider audio packet identity need separate evidence.</small></section>
+<script type="module">
+import {DuplexSession} from '/static/duplex-session.js';
+const $=id=>document.getElementById(id);let session;let partial;
+$('start').onclick=async()=>{
+ $('start').disabled=true;$('end').disabled=false;$('mute').disabled=true;$('mute').textContent='Mute';$('notice').textContent='';$('conversation').replaceChildren();partial=null;
+ session=new DuplexSession({callbacks:{status:value=>{$('status').textContent=value;$('metrics').textContent=JSON.stringify(session.metrics(),null,2);if(value==='Ended'){$('start').disabled=false;$('end').disabled=true;$('mute').disabled=true;}},level:value=>{$('level').value=value;},
+ error:value=>{$('notice').textContent='Connection could not complete ('+value+'). The private candidate console and local credentials may need attention.';},
+ transcript:message=>{if(!partial||message.role!==partial.dataset.role){partial=document.createElement('p');partial.dataset.role=message.role;$('conversation').append(partial);}partial.textContent=(message.role==='user'?'You: ':'Agent: ')+message.text;if(message.final)partial=null;$('conversation').scrollTop=$('conversation').scrollHeight;},
+ event:()=>{$('metrics').textContent=JSON.stringify(session.metrics(),null,2);}}});
+ window.duplexSession=session;window.duplexEvidence=session.events;
+ try{await session.start();if(!session.closed){$('end').disabled=false;$('mute').disabled=false;}}catch{$('start').disabled=false;$('end').disabled=true;$('mute').disabled=true;}
+};
+$('mute').onclick=()=>{session.setMuted(!session.muted);$('mute').textContent=session.muted?'Unmute':'Mute';};
+$('end').onclick=async()=>{await session.stop();$('end').disabled=true;$('mute').disabled=true;$('start').disabled=false;};
+$('export').onclick=()=>{const result={schema:'duplex-browser-evidence-v1',metrics:session?.metrics(),events:session?.events||[]};const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='duplex-test-evidence.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+window.addEventListener('pagehide',()=>{void session?.stop('page_closed');});
+</script></html>

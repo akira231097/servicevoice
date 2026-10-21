@@ -1,6 +1,6 @@
 """Optional, read-only JEV intent evaluation. No scheduler or tool authority.
 
-The gateway's optional first-turn static-FAQ route is off by default. Scores
+The gateway's optional static-FAQ route is off by default. Scores
 never authorize business actions; low confidence falls back to Gemini.
 """
 from __future__ import annotations
@@ -128,7 +128,7 @@ class JevClassifier:
 
     async def classify(self, state):
         payload = request_payload(state)
-        began = time.monotonic()
+        began = time.perf_counter()
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 async with self.client.stream("POST", JEV_URL, headers={"Authorization": "Bearer "+self.key}, json=payload) as response:
@@ -157,5 +157,8 @@ class JevClassifier:
             raise ClassificationUnavailable("timeout") from None
         except httpx.HTTPError:
             raise ClassificationUnavailable("transport_error") from None
+        elapsed = time.perf_counter()-began
+        if elapsed >= self.timeout_seconds:
+            raise ClassificationUnavailable("timeout")
         return Decision(label, probabilities, confidence, language, language_probabilities,
-                        language_confidence, round((time.monotonic()-began)*1000,3), JEV_MODEL, tokens)
+                        language_confidence, round(elapsed*1000,3), JEV_MODEL, tokens)

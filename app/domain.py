@@ -590,9 +590,18 @@ class Store:
             proposal={"id":row["id"],"kind":row["kind"],"summary":json.loads(row["payload"])["summary"],"expires_at":datetime.fromtimestamp(row["expires"],timezone.utc).isoformat()} if row else None
             handoff=self.handoff(db,sid)
             pending=[{"id":r["id"],"status":r["status"]} for r in db.execute("SELECT i.id,i.status FROM tool_invocations i LEFT JOIN tool_results r ON r.session_id=i.session_id AND r.call_id=i.call_id WHERE i.session_id=? AND i.status IN ('queued','running','unknown') AND r.call_id IS NULL",(sid,))]
+            from .duplex_progress import snapshot as duplex_progress_snapshot
+            try:
+                progress=duplex_progress_snapshot(db,sid,pending,state,proposal,
+                    getattr(self,"duplex_progress_generations",{}).get(sid))
+            except sqlite3.Error:
+                # Optional speech evidence never changes canonical task state.
+                progress={"duplex_canonical_turn":None,"accepted_operation_progress":None}
             values=sorted(e["elapsed_ms"] for e in events)
             percentile=lambda p: values[min(len(values)-1,max(0,__import__('math').ceil(len(values)*p)-1))] if values else None
             return {"id":sid,"mode":session["mode"],"ended":bool(session["ended"]),**state,"transcript":transcripts,
                     "events":events,"proposal":proposal,"appointment":self.appointment(db,sid),"pending_operations":pending,
+                    "accepted_work_pending":bool(pending) and all(row["status"] in {"queued","running"} for row in pending),
+                    **progress,
                     "handoff":handoff,
                     "metrics":{"tool_count":len(events),"tool_p50_ms":percentile(.5),"tool_p95_ms":percentile(.95)}}

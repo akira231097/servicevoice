@@ -48,14 +48,33 @@ async def settle_reads(harness):
     await asyncio.sleep(0)  # Allow completion callbacks to release bookkeeping.
 
 
-def test_timed_out_duplicate_polls_keep_one_worker_and_later_read_fresh_receipt(store, monkeypatch):
+@pytest.fixture
+def completed_status_setup(complete_pending_tool_results_async):
+    """Finish the real fixture commit before strict status-read tests begin."""
+    async def commit(harness, sid, arguments):
+        original = await harness.run(sid, "confirm_action", arguments, "commit")
+        preserved = json.dumps(original, sort_keys=True)
+        [completed] = await complete_pending_tool_results_async(harness, sid, [original])
+        assert json.dumps(original, sort_keys=True) == preserved
+        assert completed.get("ok") is True and "_receipt" in completed, {
+            "initial_ok": original.get("ok"), "initial_error": original.get("error"),
+            "completed_ok": completed.get("ok"), "completed_error": completed.get("error"),
+            "completed_reason": completed.get("reason"), "receipt_present": "_receipt" in completed,
+        }
+        verify_receipt(completed)
+        return completed
+    return commit
+
+
+def test_timed_out_duplicate_polls_keep_one_worker_and_later_read_fresh_receipt(
+        store, monkeypatch, completed_status_setup):
     sid, arguments = prepared(store)
     started, release = threading.Event(), threading.Event()
     calls = []
 
     async def scenario():
         harness = ToolHarness(store, status_timeout_seconds=.04)
-        committed = await harness.run(sid, "confirm_action", arguments, "commit")
+        committed = await completed_status_setup(harness, sid, arguments)
         opid = committed["_receipt"]["operation_id"]
         original = harness._lookup_status
 
@@ -92,7 +111,8 @@ def test_timed_out_duplicate_polls_keep_one_worker_and_later_read_fresh_receipt(
     asyncio.run(scenario())
 
 
-def test_canceled_status_waiter_does_not_release_running_capacity_or_starve_effects(store, monkeypatch):
+def test_canceled_status_waiter_does_not_release_running_capacity_or_starve_effects(
+        store, monkeypatch, completed_status_setup):
     sid, arguments = prepared(store)
     release, both_started = threading.Event(), threading.Event()
     calls = []
@@ -100,7 +120,7 @@ def test_canceled_status_waiter_does_not_release_running_capacity_or_starve_effe
 
     async def scenario():
         harness = ToolHarness(store, status_timeout_seconds=1, max_status_reads=2)
-        committed = await harness.run(sid, "confirm_action", arguments, "commit")
+        committed = await completed_status_setup(harness, sid, arguments)
         opid = committed["_receipt"]["operation_id"]
         original = harness._lookup_status
 
@@ -150,12 +170,12 @@ def test_canceled_status_waiter_does_not_release_running_capacity_or_starve_effe
     asyncio.run(scenario())
 
 
-def test_actual_exclusive_database_lock_yields_unavailable_then_the_same_receipt(store):
+def test_actual_exclusive_database_lock_yields_unavailable_then_the_same_receipt(store, completed_status_setup):
     sid, arguments = prepared(store)
 
     async def scenario():
         harness = ToolHarness(store)
-        committed = await harness.run(sid, "confirm_action", arguments, "commit")
+        committed = await completed_status_setup(harness, sid, arguments)
         opid = committed["_receipt"]["operation_id"]
         await harness.drain()
         blocker = sqlite3.connect(store.path, isolation_level=None, timeout=.2)
@@ -244,7 +264,7 @@ def test_exception_after_commit_and_unavailable_status_never_marks_failed(store,
     asyncio.run(scenario())
 
 
-def test_status_singleflight_key_preserves_session_ownership(store, monkeypatch):
+def test_status_singleflight_key_preserves_session_ownership(store, monkeypatch, completed_status_setup):
     sid, arguments = prepared(store)
     other = store.create_session()["id"]
     release, started = threading.Event(), threading.Event()
@@ -253,7 +273,7 @@ def test_status_singleflight_key_preserves_session_ownership(store, monkeypatch)
 
     async def scenario():
         harness = ToolHarness(store, status_timeout_seconds=1, max_status_reads=2)
-        committed = await harness.run(sid, "confirm_action", arguments, "commit")
+        committed = await completed_status_setup(harness, sid, arguments)
         opid = committed["_receipt"]["operation_id"]
         original = harness._lookup_status
 
@@ -279,6 +299,50 @@ def test_status_singleflight_key_preserves_session_ownership(store, monkeypatch)
         finally:
             release.set()
             await settle_reads(harness)
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_status_setup_reconciles_the_same_pending_commit_without_resubmission(
+        store, monkeypatch, complete_pending_tool_results_async):
+    sid, arguments = prepared(store)
+    release = threading.Event()
+
+    async def scenario():
+        harness = ToolHarness(store)
+        original_execute = harness._execute_registered
+
+        def gated(*args, **kwargs):
+            assert release.wait(30), "Only the test may release accepted setup work."
+            return original_execute(*args, **kwargs)
+
+        monkeypatch.setattr(harness, "_execute_registered", gated)
+        try:
+            initial = await harness.run(sid, "confirm_action", arguments, "commit")
+            assert initial.get("error") == "operation_pending", {
+                "ok": initial.get("ok"), "error": initial.get("error"), "receipt_present": "_receipt" in initial,
+            }
+            preserved = json.dumps(initial, sort_keys=True)
+            with store.connect() as db:
+                assert db.execute("SELECT count(*) FROM tool_invocations").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM appointments").fetchone()[0] == 0
+            release.set()
+            [committed] = await complete_pending_tool_results_async(harness, sid, [initial])
+            assert committed.get("ok") is True and "_receipt" in committed, {
+                "ok": committed.get("ok"), "error": committed.get("error"), "reason": committed.get("reason"),
+                "receipt_present": "_receipt" in committed,
+            }
+            verify_receipt(committed)
+            assert committed["_receipt"]["operation_id"] == initial["operation_id"]
+            assert json.dumps(initial, sort_keys=True) == preserved
+            assert await harness.run(sid, "confirm_action", arguments, "commit") == committed
+            with store.connect() as db:
+                assert db.execute("SELECT count(*) FROM tool_invocations").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM appointments").fetchone()[0] == 1
+                assert db.execute("SELECT count(*) FROM tool_results WHERE call_id='commit'").fetchone()[0] == 1
+        finally:
+            release.set()
             await harness.close()
 
     asyncio.run(scenario())

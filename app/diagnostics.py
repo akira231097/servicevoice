@@ -53,12 +53,16 @@ COMPONENTS = {
     "evaluator": _component("ServiceVoice reviewer; Gemini and LangSmith", "Final transcript, trusted facts and scheduler evidence", "Advisory grades, component coverage and numeric timing", ["missing_evidence", "judge_unavailable", "budget_exhausted", "export_failure"], "Review status, model attempts, queue lag, grade evidence and export readback", "evaluation"),
 }
 
-EVENTS = frozenset({"request", "response", "admission", "validation", "generation", "classification", "narration", "execution", "commit", "status", "transcript", "call_started", "call_ended", "synthesis", "review", "export", "reconciliation",
+EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.suppressed", "tts.cache_hit", "request", "response", "admission", "validation", "generation", "classification", "narration", "execution", "commit", "status", "transcript", "call_started", "call_ended", "synthesis", "review", "export", "reconciliation",
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
 _ENUM_ATTRIBUTES = {
+    "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),
+    "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment"}),
+    "backchannel_reason": frozenset({"emitted","primary_ready","policy_not_ready","context_unavailable","turn_already_acknowledged","cooldown","call_budget","budget_capacity","not_eligible","sensitive_context","sensitive_utterance","sensitive_prior_turn","cached_language_unverified","short_or_ambiguous","urgent_or_safety","untrusted_control_content","classifier_timeout","classifier_unavailable","low_confidence","selected","silence","invalid_context","turn_not_allowed","invalid_messages","not_final_user_turn","input_bounds","prior_context_bounds","credential_missing","classification_capacity","provider_unavailable","invalid_response","response_bounds","model_mismatch","policy_closed","classification_deadline","classifier_silence","classification_uncertain","eligible_classification","classification_unavailable"}),
+    "synthesis_source": frozenset({"pregenerated_cache","live_google"}),
     "error_code": frozenset({"none", "unknown", "invalid_arguments", "unauthorized", "authentication_rejected", "capacity_rejected", "invalid_history", "invalid_event", "deadline_exceeded", "timeout", "upstream_unavailable", "state_unavailable", "operation_pending", "operation_unknown", "operation_missing", "operation_failed", "idempotency_conflict", "harness_overloaded", "harness_closed", "session_ended", "slot_unavailable", "receipt_missing", "receipt_mismatch", "validation_error", "internal_error", "cancelled", "waiter_interrupted", "budget_exhausted", "missing_evidence", "export_failure", "quota_exhausted", "invalid_audio", "transport_error",
         "tts_resampler_unavailable", "tts_resampling_failed", "tts_upstream_missing_sample_rate", "tts_upstream_wrong_channel_count", "tts_upstream_sample_rate_changed", "tts_upstream_audio_after_completion",
         "classifier_timeout", "classifier_unavailable", "classifier_rate_limited", "classification_deadline",
@@ -81,10 +85,10 @@ _ENUM_ATTRIBUTES = {
     "resampler": frozenset({"soxr_hq", "none"}),
     "tool_name": frozenset({"get_dealership_info", "begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "confirm_action", "dismiss_proposal", "get_appointment", "get_session_context", "get_operation", "prepare_reschedule", "prepare_cancellation", "request_handoff", "withdraw_handoff", "unknown_tool"}),
 }
-_COUNTS = frozenset({"input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
-_FLAGS = frozenset({"ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
-_DURATIONS = frozenset({"queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
-_HASHES = frozenset({"input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
+_COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
+_FLAGS = frozenset({"cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
+_DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
+_HASHES = frozenset({"cache_asset_id","cache_request_sha256","cache_manifest_sha256","input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
 
 
 def canonical(value):
@@ -119,6 +123,9 @@ def safe_attributes(attributes):
     if not isinstance(attributes, Mapping):
         return {}
     result = {}
+    for key in ("backchannel_probability","backchannel_confidence","backchannel_language_probability","backchannel_language_confidence"):
+        value=attributes.get(key)
+        if type(value) in (int,float) and math.isfinite(value) and 0<=value<=1:result[key]=value
     for key, choices in _ENUM_ATTRIBUTES.items():
         value = attributes.get(key)
         if type(value) is str and value in choices:
@@ -184,7 +191,7 @@ def configuration_manifest(settings=None, source_root=None):
         elif value is not None:
             values[key] = "unknown"
             issues.append("unrecognized_" + key.lower())
-    for key in ("SERVICEVOICE_RECEIPT_NARRATION", "SERVICEVOICE_JEV_FAQ", "SERVICEVOICE_TELEPHONY_ENABLED", "SERVICEVOICE_TIMING_PERSISTENCE", "SERVICEVOICE_NATIVE_END_CALL", "SERVICEVOICE_DIAGNOSTICS_ENABLED"):
+    for key in ("SERVICEVOICE_RECEIPT_NARRATION", "SERVICEVOICE_JEV_FAQ", "SERVICEVOICE_TELEPHONY_ENABLED", "SERVICEVOICE_TIMING_PERSISTENCE", "SERVICEVOICE_NATIVE_END_CALL", "SERVICEVOICE_DIAGNOSTICS_ENABLED", "SERVICEVOICE_BACKCHANNELS"):
         value = settings.get(key)
         if value is not None:
             values[key] = value if isinstance(value,str) and value in {"on", "off"} else "unknown"

@@ -1,0 +1,6 @@
+# Add only after isolated Unix ingress is healthy; preserve existing routes.
+handle /phone-bridge/ingress {
+    @not_post not method POST
+    respond @not_post 405
+    reverse_proxy unix//data/phone-bridge/ingress.sock
+}
