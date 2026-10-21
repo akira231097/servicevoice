@@ -19,6 +19,24 @@ receive neutral pauses. Information requests can receive prospective phrases
 such as "Let me check that." Names are not inserted into prerecorded audio.
 "Working on it" and verbal agreement are not part of this waiting-cue selection.
 
+The first production phone review exposed missed cues on ordinary capability
+questions, initial booking requests and casual "yeah" replies. The policy now
+recognizes those conversational forms. Standalone approval, cancellation and
+booking-context checks remain separate; "Yeah, it is a 2016 sedan" does not
+authorize an action. Explicit thinking pauses and unfinished conjunctions stay
+silent so the caller can continue.
+
+A routine utterance with fit probability at least 0.90 and margin at least 0.80
+may receive only a neutral pause when the independent subject classification is
+also strong (probability at least 0.95 and confidence at least 0.93). Lookup-style
+phrases and confirmation holds retain the stricter 0.98 fit requirement; language
+compatibility still requires 0.99. This separates phrase-selection risk from
+business authority, following TypeSafe's guidance to
+[validate thresholds for the consequences of each action](https://docs.typesafe.ai/confidence).
+The reproducible synthetic corpus in `scripts/benchmark_phone_waiting.py` covers
+47 ordinary and excluded examples, including the phone review's failure patterns
+without retaining caller contact details.
+
 The cue can never confirm a booking or authorize a tool. Conditional approval,
 stop requests, urgent situations, unsupported language, stale context, and failed
 classification suppress it. Any allowed confirmation hold is restricted to a

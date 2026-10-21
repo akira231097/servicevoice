@@ -40,6 +40,9 @@ def answer(kind="information_question"):
     ("My car is not starting.", "How can I help?", "ordinary_detail"),
     ("How long is the waiting time?", "Anything else?", "information_question"),
     ("Ten AM works for me.", "Which time would you prefer?", "ordinary_detail"),
+    ("Yeah, it's a 2016 sedan.", "Which vehicle do you drive?", "ordinary_detail"),
+    ("Yep, the battery keeps dying.", "What is happening?", "ordinary_detail"),
+    ("My car, yeah, the blue Toyota, needs an oil change.", "How can I help?", "scheduling_request"),
 ])
 def test_native_waiting_classifies_content_language_and_subject_independently(text, prior, kind):
     requests = []
@@ -72,6 +75,11 @@ def test_native_waiting_classifies_content_language_and_subject_independently(te
     ("Alex Morgan", "What is your passcode?"),
     ("My name is Alex Morgan and my phone is 555 555 0123.", "How can I help with your service?"),
     ("My name is Alex Morgan and my email is alex@example.com.", "How can I help with your service?"),
+    ("Yeah, please.", "How can I help?"), ("Yeah, book it.", "Which time would you prefer?"),
+    ("Yes, schedule that.", "Which time would you prefer?"),
+    ("Um, let me think about that.", "Which time would you prefer?"),
+    ("I am still thinking.", "Which time would you prefer?"),
+    ("My name is A L E X and", "May I have your name?"),
 ])
 def test_native_hard_exclusions_do_not_send_content_to_classifier(text, prior):
     async def scenario():
@@ -91,10 +99,10 @@ def test_only_safe_details_proposal_can_receive_neutral_hold(context, allowed):
 
 @pytest.mark.parametrize("mutation,expected", [("fit", "classification_uncertain"),
     ("language", "cached_language_unverified"), ("excluded", "classifier_silence"), ("malformed_style", "invalid_response")])
-def test_independent_vetoes_and_thresholds_remain_unchanged(mutation, expected):
+def test_low_fit_language_and_excluded_content_still_veto_cues(mutation, expected):
     value = answer()
     if mutation == "fit":
-        value["answers"]["acknowledgment"].update(probabilities={"ordinary_content": .97, "excluded_content": .03}, confidence=.94)
+        value["answers"]["acknowledgment"].update(probabilities={"ordinary_content": .89, "excluded_content": .11}, confidence=.78)
     if mutation == "language":
         value["answers"]["delivery_language"].update(probabilities={"cache_compatible": .98, "not_compatible": .02, "uncertain": 0}, confidence=.97)
     if mutation == "excluded":value["answers"]["acknowledgment"] = choice("excluded_content", WAITING_LABELS)
@@ -107,7 +115,7 @@ def test_independent_vetoes_and_thresholds_remain_unchanged(mutation, expected):
 
 
 def test_variety_uses_semantics_without_competing_synonyms_or_work_claims():
-    neutral = BackchannelDecision(content_kind="factual_correction", content_probability=1., content_confidence=1.)
+    neutral = BackchannelDecision(probability=1., content_kind="factual_correction", content_probability=1., content_confidence=1.)
     inquiry = replace(neutral, content_kind="information_question")
     assert {waiting_phrase(neutral, turn) for turn in range(1, 7)} == {"moment", "one_sec", "just_a_sec"}
     assert {waiting_phrase(inquiry, turn) for turn in range(1, 7)} == {"checking", "taking_a_look", "let_me_see"}
@@ -144,11 +152,47 @@ def test_new_phrase_and_semantic_evidence_survive_content_free_projection():
     assert safe["phrase_id"] == "taking_a_look" and safe["content_kind"] == "information_question"
     assert safe["content_probability"] == .99 and safe["content_confidence"] == .98
     assert "PRIVATE" not in repr(safe) and safe_backchannel_timing(safe) == safe
+    assert safe_backchannel_timing({"reason": "caller_still_formulating"})["reason"] == "caller_still_formulating"
+
+
+@pytest.mark.parametrize("probability,kind,subject_probability,expected", [
+    (.93, "scheduling_request", 1., "moment"),
+    (.97, "information_question", 1., "moment"),
+    (.93, "other", 1., "silence"),
+    (.93, "scheduling_request", .94, "silence"),
+])
+def test_moderate_fit_needs_independent_routine_subject_and_only_permits_neutral_pause(probability, kind, subject_probability, expected):
+    value = answer(kind)
+    value["answers"]["acknowledgment"].update(
+        probabilities={"ordinary_content": probability, "excluded_content": 1-probability}, confidence=2*probability-1)
+    value["answers"]["content_kind"].update(
+        probabilities={label: subject_probability if label == kind else (1-subject_probability)/4 for label in CONTENT_LABELS},
+        confidence=(subject_probability-.2)/.8)
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=value))) as client:
+            decision = await BackchannelPolicy(client=client).choose(messages("Can you book an oil change for me?"),
+                "test", context=SAFE, native_waiting=True)
+            assert decision.phrase_id == expected
+            if expected != "silence":
+                assert {waiting_phrase(decision, turn) for turn in range(1,7)} == {"moment","one_sec","just_a_sec"}
+    asyncio.run(scenario())
 
 
 CONFIRM = {**SAFE, "stage": "confirmation", "active_confirmation": True,
            "has_pending_proposal": True, "booking_confirmation_context": True}
 READBACK = "Please confirm this booking: oil service at ten AM for Jamie, phone 555 555 0123."
+
+
+def test_confirmed_booking_context_does_not_use_lower_neutral_routine_threshold():
+    value = answer("ordinary_detail")
+    value["answers"]["acknowledgment"].update(
+        probabilities={"ordinary_content": .97, "excluded_content": .03}, confidence=.94)
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=value))) as client:
+            decision = await BackchannelPolicy(client=client).choose(messages("Yes", READBACK),
+                "test", context=CONFIRM, native_waiting=True)
+            assert decision.phrase_id == "silence" and decision.reason == "classification_uncertain"
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("text", ["Book it.", "Yes, please book it.", "Yes", "Please confirm the booking."])
