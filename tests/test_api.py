@@ -36,6 +36,11 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(domain, "now", lambda: datetime(2026, 10, 17, 18, tzinfo=timezone.utc))
     module = importlib.import_module("app.main")
     app = module.create_app(tmp_path / "test.sqlite3")
+    # These offline HTTP contract tests verify receipts and authorization,
+    # not hosted-runner disk speed. Production keeps its 1.5-second tool wait;
+    # the dedicated pending-response test below exercises that boundary.
+    app.state.harness.timeout_seconds = 30
+    app.state.harness.status_timeout_seconds = 5
     with TestClient(app) as test_client:
         yield test_client
 
@@ -79,7 +84,9 @@ def webhook_tool(client, name, arguments, call_id="tool-1", session=None):
     assert response.status_code == 200, response.text
     item = response.json()["results"][0]
     assert item["toolCallId"] == call_id
-    return json.loads(item["result"])
+    result = json.loads(item["result"])
+    assert result.get("error") != "operation_pending", result
+    return result
 
 
 def test_session_requires_its_own_token_for_reads_and_mutations(client):
@@ -191,6 +198,49 @@ def test_changed_arguments_on_duplicate_webhook_tool_id_conflict(client):
     assert webhook_tool(client, "search_availability", {"service": "oil_change"}, "availability-1", session)["ok"]
     changed = webhook_tool(client, "search_availability", {"service": "brakes"}, "availability-1")
     assert changed["error"] == "idempotency_conflict"
+
+
+def test_webhook_pending_wait_preserves_original_action_and_exact_receipt(client, monkeypatch):
+    session = new_session(client, "live")
+    harness = client.app.state.harness
+    harness.timeout_seconds = 0.03
+    entered, release = threading.Event(), threading.Event()
+    original_register = harness._register
+
+    def contended_registration(*args):
+        entered.set()
+        assert release.wait(30), "controlled registration worker was never released"
+        return original_register(*args)
+
+    monkeypatch.setattr(harness, "_register", contended_registration)
+    body = payload(session, event_type="tool-calls", toolCallList=[{
+        "id": "one-slow-search", "function": {
+            "name": "search_availability", "arguments": {"service": "oil_change"},
+        },
+    }])
+    try:
+        first = webhook(client, body)
+        assert first.status_code == 200, first.text
+        pending = json.loads(first.json()["results"][0]["result"])
+        assert entered.wait(5), "controlled registration worker was not scheduled"
+        assert pending["error"] == "operation_pending", pending
+        assert "slots" not in pending and "_receipt" not in pending
+    finally:
+        release.set()
+        # Await the accepted task without sending another tool request.
+        client.portal.call(harness.drain)
+
+    # Restore the functional wait before reading the exact durable replay.
+    harness.timeout_seconds = 30
+    # Retry the same identity only after completion; no second action is allowed.
+    replay = webhook_tool(client, "search_availability", {"service": "oil_change"},
+                          "one-slow-search")
+    assert replay["ok"] is True and replay["slots"], replay
+    assert replay["_receipt"]["operation_id"] == pending["operation_id"]
+    with client.app.state.store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM tool_invocations WHERE session_id=?", (session["id"],)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM tool_results WHERE session_id=?", (session["id"],)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM events WHERE session_id=?", (session["id"],)).fetchone()[0] == 1
 
 
 def test_webhook_booking_duplicate_and_after_end_retry_do_not_create_another(client):

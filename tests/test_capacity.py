@@ -195,7 +195,62 @@ def test_phone_read_then_write_keeps_original_worker_budget(tmp_path,config,monk
 def test_offline_caller_scenario_preserves_end_to_end_invariants(tmp_path,callers):
     import asyncio
     from scripts.stress_ten_callers import exercise
-    result=asyncio.run(exercise(tmp_path,callers=callers))
+    # This tests concurrent correctness, not hosted-runner disk performance.
+    # Dedicated ingress tests retain the unchanged one-second default budget.
+    result=asyncio.run(exercise(tmp_path,callers=callers,offline_fixture_deadline=5))
     assert result['passed'] and result['peak_fake_upstream_header_requests']==callers
     assert result['confirmed_appointments']==1 and result['losing_capacity_conflicts']==callers-1
+    assert result['exercise_scope']=='offline_correctness_fixture_not_default_deadline_performance'
+    assert result['offline_fixture_deadline_seconds']==5
+    assert result['production_default_ingress_deadline_seconds']==IngressLimits().deadline_seconds==1
+    assert result['admission_event_retries']==0
     assert all(result['checks'].values())
+
+
+def test_contended_admission_keeps_default_deadline_failure_visible_but_isolates_correctness_fixture(tmp_path,monkeypatch):
+    import asyncio
+    from scripts.stress_ten_callers import exercise
+    original=TelephonyIngress._insert_binding
+    def contended_insert(self,*args,**kwargs):
+        # Ten serialized fixture writes exceed one second deterministically,
+        # reproducing a slow hosted disk without changing a production timer.
+        time.sleep(.14)
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(TelephonyIngress,'_insert_binding',contended_insert)
+    strict={}
+    with pytest.raises(AssertionError,match='statuses=.*504.*telephony_deadline'):
+        asyncio.run(exercise(tmp_path/'strict',strict,callers=10))
+    assert strict['exercise_scope']=='strict_default_deadline_offline_stress'
+    assert strict['offline_fixture_deadline_seconds'] is None
+    assert strict['production_default_ingress_deadline_seconds']==1
+    assert 504 in strict['admission_statuses'] and 'telephony_deadline' in strict['admission_errors']
+    fixture=asyncio.run(exercise(tmp_path/'fixture',callers=10,offline_fixture_deadline=5))
+    assert fixture['admission_statuses']=={'200':10} and fixture['admission_event_retries']==0
+    assert fixture['confirmed_appointments']==1 and fixture['losing_capacity_conflicts']==9
+    assert fixture['peak_fake_upstream_header_requests']==10 and all(fixture['checks'].values())
+    assert IngressLimits().deadline_seconds==1
+
+
+def test_fixture_budget_does_not_retry_or_mask_admission_failure(tmp_path,monkeypatch):
+    import asyncio
+    from scripts.stress_ten_callers import exercise
+    calls=[]
+    def unavailable(self,*args,**kwargs):
+        calls.append(1)
+        raise IngressError('telephony_busy',503)
+    monkeypatch.setattr(TelephonyIngress,'_insert_binding',unavailable)
+    progress={}
+    with pytest.raises(AssertionError,match='statuses=.*503.*telephony_busy'):
+        asyncio.run(exercise(tmp_path,progress,callers=10,offline_fixture_deadline=5))
+    assert len(calls)==10 and progress['admission_statuses']==[503]*10
+    with Store(tmp_path/'exercise.sqlite3').read_connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('deadline',[True,0,-1,6,float('nan'),float('inf'),'5'])
+def test_offline_fixture_deadline_is_explicit_and_bounded(tmp_path,deadline):
+    import asyncio
+    from scripts.stress_ten_callers import exercise
+    with pytest.raises(ValueError,match='Offline fixture deadline'):
+        asyncio.run(exercise(tmp_path,offline_fixture_deadline=deadline))

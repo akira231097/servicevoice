@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -63,8 +64,17 @@ def check(value,message):
     if not value:raise AssertionError(message)
 
 
-async def exercise(directory,progress=None,*,callers=4):
+async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=None):
+    """Keep CLI admission strict; optionally decouple a pytest correctness fixture.
+
+    A supplied fixture deadline applies only to this disposable app's ingress,
+    within IngressLimits' five-second maximum. It is not a production setting,
+    latency result or evidence that the one-second default admits every burst.
+    Admission events are never retried here, in either mode.
+    """
     if type(callers) is not int or callers not in (4,10):raise ValueError('Callers must be4 or10.')
+    if offline_fixture_deadline is not None and (type(offline_fixture_deadline) not in (int,float)
+        or not 0<offline_fixture_deadline<=5):raise ValueError('Offline fixture deadline must be positive and at most five seconds.')
     progress=progress if progress is not None else {}
     progress.update(passed=False,last_phase='setup')
     env={'SERVICEVOICE_DB':str(directory/'import.sqlite3'),'SERVICEVOICE_CAPACITY_PROFILE':'demo10' if callers==10 else 'default',
@@ -77,6 +87,14 @@ async def exercise(directory,progress=None,*,callers=4):
     with patch.dict(os.environ,env,clear=True),patch.object(dotenv,'load_dotenv',return_value=False),patch.object(dotenv,'dotenv_values',return_value={}):
         module=importlib.import_module('app.main')
         app=module.create_app(directory/'exercise.sqlite3');public=module.create_public_app(app)
+        default_ingress_deadline=app.state.telephony_ingress.limits.deadline_seconds
+        if offline_fixture_deadline is not None:
+            app.state.telephony_ingress.limits=replace(app.state.telephony_ingress.limits,
+                deadline_seconds=offline_fixture_deadline)
+        progress.update(offline_fixture_deadline_seconds=offline_fixture_deadline,
+            production_default_ingress_deadline_seconds=default_ingress_deadline,
+            exercise_scope='offline_correctness_fixture_not_default_deadline_performance' if offline_fixture_deadline is not None
+                else 'strict_default_deadline_offline_stress')
         gateway=app.state.gemini_gateway
         await gateway.client.aclose()
         active=0;peak=0;entered=0;barrier=asyncio.Event();hold_entered=0;hold_ready=asyncio.Event();closed=0
@@ -131,7 +149,9 @@ async def exercise(directory,progress=None,*,callers=4):
                 stages['admission_ms']=round((time.perf_counter()-began)*1000,3)
                 progress['admission_statuses']=[r.status_code for r in admissions]
                 progress['admission_errors']=[r.json().get('error') for r in admissions if r.status_code!=200]
-                check(all(r.status_code==200 for r in admissions),'All configured simultaneous phone admissions must succeed')
+                check(all(r.status_code==200 for r in admissions),
+                      'All configured simultaneous phone admissions must succeed; statuses='+json.dumps(progress['admission_statuses'])+
+                      '; errors='+json.dumps(progress['admission_errors']))
                 calls=[{**message['call'],**response.json()} for message,response in zip(admission_messages,admissions)]
                 sids=[c['assistantOverrides']['variableValues']['session_id'] for c in calls]
                 check(len(set(sids))==callers,'Every caller needs an isolated session')
@@ -230,6 +250,10 @@ async def exercise(directory,progress=None,*,callers=4):
                         'confirmed_appointments':1,'losing_capacity_conflicts':callers-1,'closed_canceled_streams':closed,
                         'gateway_outcomes':dict(Counter(r['outcome'] for r in gateway.timings)),
                         'configured_limits':app.state.capacity.public_limits(),
+                        'offline_fixture_deadline_seconds':offline_fixture_deadline,
+                        'production_default_ingress_deadline_seconds':default_ingress_deadline,
+                        'exercise_scope':progress['exercise_scope'],
+                        'admission_event_retries':0,
                         'terminal_event_attempt_statuses':terminal_attempts}
             finally:
                 await app.state.shutdown_resources()
