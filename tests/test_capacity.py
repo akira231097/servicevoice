@@ -35,7 +35,13 @@ def test_invalid_configuration_fails_closed(key,value):
 def test_combined_browser_phone_race_admits_exactly_ten_and_replay_uses_no_slot(tmp_path,config):
     store=Store(tmp_path/'mixed.sqlite3');limits=CapacityConfig.from_mapping({'SERVICEVOICE_CAPACITY_PROFILE':'demo10'})
     live=LiveAdmission(store,limits)
-    phone=TelephonyIngress(store,config,live_admission=live,limits=IngressLimits(active_calls=10,workers=16,busy_seconds=.5))
+    # Keep all16 requests concurrent: this proves the shared atomic ceiling,
+    # not16 fsync operations within a hosted Windows runner's one-second limit.
+    # Dedicated deadline tests below retain and exercise the production1s bound.
+    assert live.deadline_seconds==IngressLimits().deadline_seconds==1
+    live.deadline_seconds=5
+    phone=TelephonyIngress(store,config,live_admission=live,
+        limits=IngressLimits(active_calls=10,workers=16,busy_seconds=.5,deadline_seconds=5))
     barrier=threading.Barrier(16);requests=[message() for _ in range(8)]
     def compete(index):
         barrier.wait(timeout=5)
@@ -45,7 +51,8 @@ def test_combined_browser_phone_race_admits_exactly_ten_and_replay_uses_no_slot(
         except (CapacityError,IngressError) as exc:return index,exc.code
     with ThreadPoolExecutor(max_workers=16) as pool:outcomes=list(pool.map(compete,range(16)))
     accepted=[item for item in outcomes if isinstance(item[1],dict)]
-    assert len(accepted)==10
+    assert len(accepted)==10, {'accepted':len(accepted),
+        'rejected':[result for _,result in outcomes if isinstance(result,str)]}
     assert all(result=='live_call_capacity' for _,result in outcomes if isinstance(result,str))
     with store.read_connection() as db:assert live.count(db)==10
     for index,result in accepted:

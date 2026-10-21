@@ -112,11 +112,16 @@ def test_factual_comparison_utterances_reach_jev_eligibility_without_forcing_int
 
 
 def test_all_scenarios_use_actual_gateway_receipts_and_preserve_corrections(monkeypatch):
-    from app import domain
+    from app import domain, harness
     monkeypatch.setattr(domain, "now", lambda: datetime(2026, 10, 18, 18, tzinfo=timezone.utc))
+    # This mocked-provider test checks receipt/correction correctness, not disk
+    # speed. Wait for its disposable accepted tools; keep the live benchmark's
+    # production harness and all deadline-specific tests unchanged.
+    real_harness = harness.ToolHarness
+    monkeypatch.setattr(harness, "ToolHarness", lambda store: real_harness(store, timeout_seconds=30))
     transport, count = mock_provider()
     report = asyncio.run(evaluation.run(args(), "synthetic-private-model-api-key", provider_transport=transport))
-    assert report["passed"] is True
+    assert report["passed"] is True, [(case["scenario"], case.get("checks")) for case in report["cases"]]
     assert report["source_stable"] and report["metrics"]["requests_consumed"] == count[0]
     assert count[0] <= 30
     by_case = {case["scenario"]: case for case in report["cases"]}

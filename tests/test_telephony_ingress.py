@@ -307,7 +307,11 @@ def test_terminal_provider_metadata_rejects_new_resolution_before_stored_end(sto
 
 
 def test_atomic_active_quota_and_exact_replay_before_quota(store, config):
-    ingress = TelephonyIngress(store, config, limits=IngressLimits(active_calls=1, workers=10, busy_seconds=.5))
+    # Keep the actual eight-way race, with an explicit correctness-fixture
+    # budget. Separate deadline tests cover the unchanged one-second default.
+    assert IngressLimits().deadline_seconds == 1
+    ingress = TelephonyIngress(store, config,
+        limits=IngressLimits(active_calls=1, workers=10, busy_seconds=.5, deadline_seconds=5))
     requests = [message() for _ in range(8)]
     def run(req):
         try:
