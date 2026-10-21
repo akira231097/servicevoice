@@ -194,7 +194,7 @@ class PhoneBridgeAdmissions:
             if (row["closed"] is not None or row["outer_ended"] or row["inner_ended"]
                     or row["expires_at"] <= self.ingress.clock()):
                 raise IngressError("phone_bridge_call_ended", 409)
-            if call_type != "webCall" or not _uuid(call_id) or call_id == row["outer_call_id"] or row["allocation_requested"] is None:
+            if call_type != "vapi.websocketCall" or not _uuid(call_id) or call_id == row["outer_call_id"] or row["allocation_requested"] is None:
                 raise IngressError("phone_bridge_inner_conflict", 403)
             if row["inner_call_id"] not in (None, call_id):
                 raise IngressError("phone_bridge_inner_conflict", 403)
@@ -237,7 +237,7 @@ def install_phone_bridge_api(app, ingress, settings, *, client=None):
             raise IngressError("phone_bridge_provider_read_unavailable", 503) from None
 
     def inner_identity(row, link):
-        if (row.get("type") != "webCall" or row.get("orgId") != ingress.config.organization_id
+        if (row.get("type") != "vapi.websocketCall" or row.get("orgId") != ingress.config.organization_id
                 or row.get("assistantId") != control.inner_assistant_id):
             raise IngressError("phone_bridge_provider_identity", 403)
         overrides = row.get("assistantOverrides")

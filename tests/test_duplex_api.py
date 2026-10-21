@@ -615,7 +615,8 @@ def test_interrupting_event_cancels_an_inflight_selection_without_waiting_for_th
             evidence = await h.client.get(path(h.first, "evidence"), headers=headers(h.first))
             assert evidence.status_code == 200 and evidence.json()["events"][-1] == {**body,
                 "epoch": 2, "at_ms": 100.0, "phrase_id": None, "phase": None,
-                "blocked": None, "retry_after_ms": None, **({"reason": None} if "reason" not in body else {})}
+                "blocked": None, "retry_after_ms": None, "progress_turn_key": None,
+                **({"reason": None} if "reason" not in body else {})}
             assert not h.calls
     asyncio.run(run())
 

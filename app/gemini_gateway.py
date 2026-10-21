@@ -237,6 +237,7 @@ def configured_tool_policy(config):
 class SignatureStore:
     def __init__(self, path, limits):
         self.path, self.limits = str(path), limits
+        self.duplex_generations = {}
         with closing(self.connect()) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS gemini_tool_signatures (
                 provider_call_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
@@ -247,6 +248,8 @@ class SignatureStore:
             db.execute("""CREATE TABLE IF NOT EXISTS provider_tool_policies (
                 provider_call_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,
                 assistant_id TEXT NOT NULL, policy TEXT NOT NULL)""")
+            from .duplex_progress import initialize as initialize_duplex_progress
+            initialize_duplex_progress(db)
             db.commit()
 
     def connect(self):
@@ -259,6 +262,23 @@ class SignatureStore:
             session = db.execute("SELECT ended,created,provider_call_id FROM sessions WHERE id=? AND tenant='cedar-demo'", (sid,)).fetchone()
         if not session or session["ended"] or session["provider_call_id"] != call_id or time.time() - session["created"] > 4 * 3600:
             raise GatewayError("inactive_session", 409)
+
+    def begin_duplex_generation(self, sid, generation_id):
+        """Fence old optional evidence before any asynchronous metadata write."""
+        if sid not in self.duplex_generations and len(self.duplex_generations) >= 128:
+            self.duplex_generations.pop(next(iter(self.duplex_generations)))
+        self.duplex_generations[sid] = generation_id
+
+    def note_duplex_turn(self, sid, call_id, generation_id, messages, context):
+        """Optional speech evidence: never delay the main path on a busy writer."""
+        from .duplex_progress import record_turn
+        with closing(sqlite3.connect(self.path,timeout=.02)) as db:
+            db.row_factory=sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            if self.duplex_generations.get(sid) != generation_id:
+                return
+            record_turn(db,sid,call_id,generation_id,messages,context)
+            db.commit()
 
     def diagnostic_tool_context(self,sid,call_id,tool_id):
         """A best-effort join to existing issuance evidence, never authorization."""
@@ -364,7 +384,7 @@ class SignatureStore:
                 AND r.call_id IS NULL LIMIT 1""",(sid,)).fetchone()
         return unresolved is None
 
-    def save_group(self, sid, call_id, calls, context=None, *, allow_end_call=False):
+    def save_group(self, sid, call_id, calls, context=None, *, allow_end_call=False, progress_generation=None):
         from .issuance_context import encode_extras
         group_id, expires = uuid4().hex, time.time() + self.limits.signature_ttl
         records = []
@@ -394,6 +414,15 @@ class SignatureStore:
                     if db.execute("SELECT 1 FROM gemini_tool_signatures WHERE provider_call_id=? AND tool_call_id=?", record[:2]).fetchone():
                         raise GatewayError("tool_id_reused", 409)
                 db.executemany("INSERT INTO gemini_tool_signatures VALUES (?,?,?,?,?,?,?,?,?)", records)
+                if progress_generation is not None:
+                    from .duplex_progress import record_issued
+                    db.execute("SAVEPOINT optional_duplex_progress")
+                    try:
+                        record_issued(db,sid,call_id,calls,context,progress_generation,expires)
+                    except (sqlite3.Error,ValueError,TypeError):
+                        db.execute("ROLLBACK TO optional_duplex_progress")
+                    finally:
+                        db.execute("RELEASE optional_duplex_progress")
                 db.commit()
             except BaseException:
                 db.rollback()
@@ -1213,6 +1242,16 @@ class GeminiGateway:
             # A terminal event may have won while this successor waited.
             await run_in_threadpool(self.store.check_live,sid,call_id)
             self._checkpoint(timing)
+            if diagnostic_context.get("browser_owned_duplex"):
+                self.store.begin_duplex_generation(sid,timing.row["generation_id"])
+                try:
+                    await run_in_threadpool(self.store.note_duplex_turn,sid,call_id,
+                        timing.row["generation_id"],upstream["messages"],context)
+                except sqlite3.Error:
+                    pass  # Missing progress evidence can only leave the cue silent.
+                self._checkpoint(timing)
+            else:
+                self.store.duplex_generations.pop(sid,None)
             return await self._generate(request,config,key,upstream,sid,call_id,received_at,timing)
         except (asyncio.CancelledError,GenerationSuperseded):
             if self._obsolete(timing) and not timing.generation.disconnected:
@@ -1555,7 +1594,9 @@ class GeminiGateway:
                                 self._checkpoint(timing)
                             persistence_started = time.monotonic()
                             await run_in_threadpool(self.store.save_group, sid, call_id, pending_calls, context=issuance_context,
-                                                    allow_end_call=allow_end_call)
+                                                    allow_end_call=allow_end_call,
+                                                    **({"progress_generation":timing.row["generation_id"]}
+                                                       if timing.diagnostic_context.get("browser_owned_duplex") else {}))
                             self._checkpoint(timing)
                             timing.row["durations_ms"]["tool_signature_persist"] = round((time.monotonic() - persistence_started) * 1000, 3)
                             timing.row["counts"]["tool_calls"] = len(pending_calls)
@@ -1678,5 +1719,6 @@ class OwnedStream(StreamingResponse):
 def install_gateway(app, config_loader, bind_call, **kwargs):
     gateway = GeminiGateway(app, config_loader, bind_call, **kwargs)
     app.state.gemini_gateway = gateway
+    app.state.store.duplex_progress_generations = gateway.store.duplex_generations
     app.add_api_route("/llm/chat/completions", gateway.handle, methods=["POST"])
     return gateway

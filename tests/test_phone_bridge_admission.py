@@ -267,7 +267,7 @@ def test_bridge_http_uses_existing_shared_phone_capacity_before_provider_or_db(s
 def test_api_bind_requires_exact_model_session_and_close_preserves_outer_terminal_if_inner_read_fails(setup):
     s = setup; outer = message()["call"]; session = admit(s, outer); inner = str(uuid4())
     s.bridge.allocation(outer["id"])
-    inner_row = {"id": inner, "type": "webCall", "orgId": ORG, "assistantId": BROWSER, "status": "in-progress",
+    inner_row = {"id": inner, "type": "vapi.websocketCall", "orgId": ORG, "assistantId": BROWSER, "status": "in-progress",
                  "assistantOverrides": {"variableValues": {"session_id": "wrong", "servicevoice_duplex_playback": "browser-owned-v1"}}}
     fail_inner = [False]
     def provider(request):
@@ -284,6 +284,10 @@ def test_api_bind_requires_exact_model_session_and_close_preserves_outer_termina
         inner_row["assistantOverrides"]["variableValues"]["session_token"] = "wrong capability"
         assert client.post(path+"/bind", json={"inner_call_id": inner}, headers=headers).status_code == 403
         inner_row["assistantOverrides"]["variableValues"]["session_token"] = session["token"]
+        inner_row["type"] = "webCall"
+        assert client.post(path+"/bind", json={"inner_call_id": inner}, headers=headers).status_code == 403
+        assert s.bridge.lookup(outer["id"])["inner_call_id"] is None
+        inner_row["type"] = "vapi.websocketCall"
         assert client.post(path+"/bind", json={"inner_call_id": inner}, headers=headers).json() == {"bound": True}
         fail_inner[0] = True
         assert client.post(path+"/close", json={}, headers=headers).status_code == 503
@@ -306,7 +310,7 @@ def bridge_app(factory, monkeypatch):
     outer = message()["call"]
     session = control.admit(outer, control.ingress.clock() + 300)
     inner = str(uuid4())
-    call = {"id": inner, "type": "webCall", "assistantId": BROWSER,
+    call = {"id": inner, "type": "vapi.websocketCall", "assistantId": BROWSER,
             "assistantOverrides": {"variableValues": {"session_id": session["id"], "session_token": session["token"],
                                                        "servicevoice_duplex_playback": "browser-owned-v1"}}}
     return app, public, control, outer, session, call
@@ -320,6 +324,9 @@ def test_early_authenticated_provider_event_binds_same_inner_before_create_respo
         early = event(call, "status-update", status="in-progress")
         assert client.post("/webhooks/vapi", headers=BROWSER_HEADERS, json=early).status_code == 403
         control.allocation(outer["id"])
+        wrong_type={**call,"type":"webCall"}
+        assert client.post("/webhooks/vapi",headers=BROWSER_HEADERS,json=event(wrong_type,"status-update",status="in-progress")).status_code==403
+        assert control.lookup(outer["id"])["inner_call_id"] is None
         assert client.post("/webhooks/vapi", headers=BROWSER_HEADERS, json=early).status_code == 200
         assert control.lookup(outer["id"])["inner_call_id"] == call["id"]
         assert control.bind(outer["id"], call["id"]) == {"bound": True}

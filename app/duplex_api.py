@@ -11,6 +11,7 @@ from dataclasses import asdict
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from pathlib import Path
 import time
@@ -40,7 +41,8 @@ DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "in
     "invalid_revision", "stale_revision", "phase_already_acknowledged", "call_budget", "cooldown",
     "cue_spacing", "classification_budget", "utterance_classification_budget", "classification_throttled",
     "superseded", "phase_mismatch", "decision_expired", "scheduler_changed", "request_expired",
-    "waiting_prepared", "request_disconnected", "utterance_preparation_budget", "followup_without_initial", "no_fresh_phrase"})
+    "waiting_prepared", "request_disconnected", "utterance_preparation_budget", "followup_without_initial", "no_fresh_phrase",
+    "accepted_progress_revoked"})
 OUTPUT_FAILURE_REASONS = frozenset({"output_queue_bound", "output_geometry", "output_context_unavailable",
     "output_handoff_bound", "output_playback_failed"})
 EVENT_REASONS = DECISION_REASONS | OUTPUT_FAILURE_REASONS | frozenset({"classifier_deadline", "classifier_unavailable",
@@ -82,6 +84,7 @@ class PlaybackEvent(BaseModel):
     reason: str | None = Field(default=None, pattern="^(?:" + "|".join(sorted(EVENT_REASONS)) + ")$")
     blocked: bool | None = Field(default=None, strict=True)
     retry_after_ms: int | None = Field(default=None, ge=1, le=1000, strict=True)
+    progress_turn_key: str | None = Field(default=None, pattern="^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def bounded_pacing_retry(self):
@@ -101,7 +104,7 @@ def cue_context(snapshot):
     pending = snapshot.get("pending_operations")
     accepted_work = (isinstance(pending, list) and bool(pending)
                      and all(isinstance(row, dict) and row.get("status") in {"queued", "running"} for row in pending))
-    return {
+    result = {
         "stage": snapshot.get("stage"),
         "active_confirmation": snapshot.get("stage") == "confirmation",
         "has_pending_proposal": bool(snapshot.get("proposal")),
@@ -109,6 +112,21 @@ def cue_context(snapshot):
         "accepted_work_pending": accepted_work,
         "ended": snapshot.get("ended") is not False,
     }
+    value=snapshot.get("accepted_operation_progress");turn=snapshot.get("duplex_canonical_turn")
+    if (isinstance(value,dict) and isinstance(turn,dict) and result["ended"] is False
+            and result["active_confirmation"] is True and result["accepted_work_pending"] is True
+            and len(pending)==1 and pending[0].get("id")==value.get("operation_id")
+            and pending[0].get("status")==value.get("status") and value.get("status") in {"queued","running"}
+            and isinstance(snapshot.get("proposal"),dict) and snapshot["proposal"].get("kind")=="book"
+            and value.get("source")=="canonical_queued_operation" and value.get("kind")=="booking_commit"
+            and re.fullmatch(r"op_[0-9a-f]{24}",str(value.get("operation_id","")))
+            and all(re.fullmatch(r"[0-9a-f]{64}",str(value.get(key,"")))
+                    and value.get(key)==turn.get(key) for key in ("turn_key","caller_text_sha256"))
+            and re.fullmatch(r"[0-9a-f-]{36}",str(value.get("generation_id","")))
+            and value.get("generation_id")==turn.get("generation_id")):
+        result["accepted_operation_progress"]={key:value[key] for key in ("source","kind","operation_id","status",
+            "turn_key","caller_text_sha256","generation_id")}
+    return result
 
 
 class DuplexControl:
@@ -429,8 +447,15 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
 
     @app.post("/api/sessions/{sid}/duplex/event")
     async def event(sid: str, body: PlaybackEvent, x_session_token: str = Header(default="")):
-        await control.authenticated(sid, x_session_token)
+        row=await control.authenticated(sid, x_session_token)
         session = await control.session(sid)
+        if body.event in ("caller_started","caller_resumed","barge_in","main_started","ended","muted","playback_failed"):
+            key=body.progress_turn_key
+            if key is None and body.event not in ("caller_started","caller_resumed"):
+                fresh=row if control.authorize is control.snapshot else await run_in_threadpool(control.snapshot,sid,x_session_token)
+                turn=fresh.get("duplex_canonical_turn")
+                key=turn.get("turn_key") if isinstance(turn,dict) else None
+            session.revoke_progress(key)
         if body.event in ("barge_in", "main_started", "ended", "muted", "playback_failed"):
             session.invalidate(reason=body.event)
         rows = control.events[sid]
