@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 from unittest.mock import patch
 from uuid import uuid4
@@ -67,10 +68,12 @@ def check(value,message):
 async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=None):
     """Keep CLI admission strict; optionally decouple a pytest correctness fixture.
 
-    A supplied fixture deadline applies only to this disposable app's ingress,
-    within IngressLimits' five-second maximum. It is not a production setting,
-    latency result or evidence that the one-second default admits every burst.
-    Admission events are never retried here, in either mode.
+    A supplied fixture deadline bounds only this disposable app's ingress,
+    within IngressLimits' five-second maximum. Correctness mode also queues
+    signature persistence through a fixture-local lock and waits up to30s for
+    accepted tools, so incidental disk contention is not a latency assertion.
+    Strict CLI mode retains every production default and concurrent DB writer.
+    No mode retries admission or signed tools, or changes a production timer.
     """
     if type(callers) is not int or callers not in (4,10):raise ValueError('Callers must be4 or10.')
     if offline_fixture_deadline is not None and (type(offline_fixture_deadline) not in (int,float)
@@ -88,14 +91,28 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
         module=importlib.import_module('app.main')
         app=module.create_app(directory/'exercise.sqlite3');public=module.create_public_app(app)
         default_ingress_deadline=app.state.telephony_ingress.limits.deadline_seconds
+        default_tool_wait=app.state.harness.timeout_seconds
         if offline_fixture_deadline is not None:
             app.state.telephony_ingress.limits=replace(app.state.telephony_ingress.limits,
                 deadline_seconds=offline_fixture_deadline)
+            app.state.harness.timeout_seconds=30
         progress.update(offline_fixture_deadline_seconds=offline_fixture_deadline,
             production_default_ingress_deadline_seconds=default_ingress_deadline,
+            production_default_tool_wait_seconds=default_tool_wait,
+            fixture_tool_wait_seconds=30 if offline_fixture_deadline is not None else None,
+            fixture_signature_writes_serialized=offline_fixture_deadline is not None,
             exercise_scope='offline_correctness_fixture_not_default_deadline_performance' if offline_fixture_deadline is not None
                 else 'strict_default_deadline_offline_stress')
         gateway=app.state.gemini_gateway
+        if offline_fixture_deadline is not None:
+            # The last-slot race still uses the real concurrent domain tools.
+            # Only fake-model command issuance is serialized, retaining real
+            # signature transactions and all downstream authorization checks.
+            signature_writer=threading.Lock()
+            save_group=gateway.store.save_group
+            def fixture_save_group(*args,**kwargs):
+                with signature_writer:return save_group(*args,**kwargs)
+            gateway.store.save_group=fixture_save_group
         await gateway.client.aclose()
         active=0;peak=0;entered=0;barrier=asyncio.Event();hold_entered=0;hold_ready=asyncio.Event();closed=0
         requests=Counter();stages={};checks={}
@@ -135,6 +152,7 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=public),base_url='http://offline') as client:
             calls=[];histories=[[] for _ in range(callers)];saved_commands={}
             progress['checks']=checks;progress['stage_durations_ms']=stages;progress['http_errors']=[]
+            progress['gateway_command_failures']=[]
             async def inbound(message):
                 response=await client.post('/webhooks/vapi/inbound',json={'message':message},headers={'authorization':'Bearer '+PHONE_SECRET})
                 if response.status_code!=200:
@@ -176,8 +194,15 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
 
                 async def tool(index,phase,name,arguments):
                     response=await generation(index,phase,name,arguments)
-                    items=[call for event in parsed_events(response) for call in event.get('choices',[{'delta':{}}])[0]['delta'].get('tool_calls',[])]
-                    check(len(items)==1,'Exactly one signed synthetic command is expected')
+                    events=parsed_events(response)
+                    items=[call for event in events for call in event.get('choices',[{'delta':{}}])[0]['delta'].get('tool_calls',[])]
+                    if len(items)!=1:
+                        failure={'phase':phase,'caller_index':index,'http_status':response.status_code,
+                            'public_errors':[event['error']['code'] for event in events
+                                if isinstance(event.get('error'),dict) and event['error'].get('code')=='generation_unavailable'],
+                            'gateway_outcomes':dict(Counter(row['outcome'] for row in gateway.timings))}
+                        progress['gateway_command_failures'].append(failure)
+                        check(False,'Exactly one signed synthetic command is expected; '+json.dumps(failure,sort_keys=True))
                     command=items[0];saved_commands[(index,phase)]=command
                     result=await inbound({'type':'tool-calls','call':calls[index],'toolCallList':[command]})
                     check(result.status_code==200,'Signed command webhook was rejected')
@@ -252,6 +277,9 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                         'configured_limits':app.state.capacity.public_limits(),
                         'offline_fixture_deadline_seconds':offline_fixture_deadline,
                         'production_default_ingress_deadline_seconds':default_ingress_deadline,
+                        'production_default_tool_wait_seconds':default_tool_wait,
+                        'fixture_tool_wait_seconds':progress['fixture_tool_wait_seconds'],
+                        'fixture_signature_writes_serialized':progress['fixture_signature_writes_serialized'],
                         'exercise_scope':progress['exercise_scope'],
                         'admission_event_retries':0,
                         'terminal_event_attempt_statuses':terminal_attempts}

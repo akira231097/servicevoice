@@ -203,6 +203,8 @@ def test_offline_caller_scenario_preserves_end_to_end_invariants(tmp_path,caller
     assert result['exercise_scope']=='offline_correctness_fixture_not_default_deadline_performance'
     assert result['offline_fixture_deadline_seconds']==5
     assert result['production_default_ingress_deadline_seconds']==IngressLimits().deadline_seconds==1
+    assert result['production_default_tool_wait_seconds']==1.5
+    assert result['fixture_tool_wait_seconds']==30 and result['fixture_signature_writes_serialized'] is True
     assert result['admission_event_retries']==0
     assert all(result['checks'].values())
 
@@ -223,12 +225,39 @@ def test_contended_admission_keeps_default_deadline_failure_visible_but_isolates
     assert strict['exercise_scope']=='strict_default_deadline_offline_stress'
     assert strict['offline_fixture_deadline_seconds'] is None
     assert strict['production_default_ingress_deadline_seconds']==1
+    assert strict['production_default_tool_wait_seconds']==1.5
+    assert strict['fixture_tool_wait_seconds'] is None and strict['fixture_signature_writes_serialized'] is False
     assert 504 in strict['admission_statuses'] and 'telephony_deadline' in strict['admission_errors']
     fixture=asyncio.run(exercise(tmp_path/'fixture',callers=10,offline_fixture_deadline=5))
     assert fixture['admission_statuses']=={'200':10} and fixture['admission_event_retries']==0
     assert fixture['confirmed_appointments']==1 and fixture['losing_capacity_conflicts']==9
     assert fixture['peak_fake_upstream_header_requests']==10 and all(fixture['checks'].values())
+    assert fixture['production_default_tool_wait_seconds']==1.5
+    assert fixture['fixture_tool_wait_seconds']==30 and fixture['fixture_signature_writes_serialized'] is True
     assert IngressLimits().deadline_seconds==1
+
+
+def test_fixture_signature_storage_failure_remains_visible_without_replay(tmp_path,monkeypatch):
+    """The CI missing-command symptom must never be treated as tool success."""
+    import asyncio
+    import sqlite3
+    from app.gemini_gateway import SignatureStore
+    from scripts.stress_ten_callers import exercise
+    calls=[]
+    def unavailable(self,*args,**kwargs):
+        calls.append(args[1])
+        raise sqlite3.OperationalError('synthetic signature writer unavailable')
+    monkeypatch.setattr(SignatureStore,'save_group',unavailable)
+    progress={}
+    with pytest.raises(AssertionError,match='signed synthetic command.*generation_unavailable'):
+        asyncio.run(exercise(tmp_path,progress,callers=4,offline_fixture_deadline=5))
+    assert 1<=len(calls)<=4 and len(set(calls))==len(calls), 'A failed signed command must never be regenerated or replayed'
+    assert progress['last_phase']=='synchronized_gateway'
+    assert progress['gateway_command_failures']
+    assert all(row['public_errors']==['generation_unavailable'] for row in progress['gateway_command_failures'])
+    with Store(tmp_path/'exercise.sqlite3').read_connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM tool_results').fetchone()[0]==0
 
 
 def test_fixture_budget_does_not_retry_or_mask_admission_failure(tmp_path,monkeypatch):

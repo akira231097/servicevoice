@@ -2,6 +2,7 @@
 import asyncio
 from datetime import datetime, timezone
 import importlib
+import inspect
 import json
 import threading
 from types import SimpleNamespace
@@ -50,9 +51,10 @@ def store(tmp_path, monkeypatch):
 
 async def booking(harness, sid):
     options = await harness.run(sid, "search_availability", {"service": "oil_change"}, "search-private-id")
+    assert options.get("ok") is True, {"stage": "search", "error": options.get("error")}
     proposal = await harness.run(sid, "prepare_booking", {"service": "oil_change", "slot_id": options["slots"][0]["id"],
         "customer_name": "Private Test Customer", "phone": "2025550146", "vehicle": "2022 Test Vehicle"}, "prepare-private-id")
-    assert proposal["ok"] is True
+    assert proposal["ok"] is True, {"stage": "prepare", "error": proposal.get("error")}
     arguments = {"proposal_id": proposal["proposal_id"], "confirmed": True}
     result = await harness.run(sid, "confirm_action", arguments, "commit-private-id")
     return result, arguments
@@ -297,7 +299,11 @@ def test_actual_booking_hook_to_otel_pipeline_exports_no_private_values(store, t
     assert sink.status()["reason"] == "ready"
     sid = store.create_session()["id"]
     async def run():
-        harness = ToolHarness(store)
+        # This checks the real hook/export privacy boundary, not how quickly a
+        # hosted Windows disk settles an accepted write. Pending-effect and
+        # caller-deadline behavior have dedicated controlled tests below.
+        assert inspect.signature(ToolHarness).parameters["timeout_seconds"].default == 1.5
+        harness = ToolHarness(store, timeout_seconds=30)
         harness.telemetry = sink
         try:
             result, _ = await booking(harness, sid)
@@ -315,3 +321,39 @@ def test_actual_booking_hook_to_otel_pipeline_exports_no_private_values(store, t
         assert value not in text
     assert all(span.name == "tool.execution" for span in spans)
     assert all(span.attributes["langsmith.metadata.capture_policy"] == "content-free-v1" for span in spans)
+
+
+def test_tool_deadline_still_reports_pending_without_repeating_accepted_effect(store, monkeypatch):
+    """Reproduce the privacy fixture's old failure shape without disk timing."""
+    sid = store.create_session()["id"]
+    sink = Spy()
+    entered, release = threading.Event(), threading.Event()
+    original = harness_module.execute
+    executions = []
+    def held(store, session_id, name, arguments, call_id):
+        executions.append(name)
+        entered.set()
+        assert release.wait(5), "Accepted fixture effect was never released"
+        return original(store, session_id, name, arguments, call_id)
+    monkeypatch.setattr(harness_module, "execute", held)
+    async def run():
+        assert inspect.signature(ToolHarness).parameters["timeout_seconds"].default == 1.5
+        harness = ToolHarness(store, timeout_seconds=.02)
+        harness.telemetry = sink
+        try:
+            waiter = asyncio.create_task(harness.run(sid, "get_dealership_info", {}, "held-synthetic-tool"))
+            assert await asyncio.to_thread(entered.wait, 5)
+            pending = await waiter
+            assert pending["ok"] is False and pending["error"] == "operation_pending"
+            assert sink.events[-1][1]["error_code"] == "operation_pending"
+            assert sink.events[-1][1]["receipt_present"] is False
+            release.set()
+            await harness.drain()
+            settled = await harness.operation(sid, pending["operation_id"])
+            assert settled["ok"] is True and "_receipt" in settled
+            assert executions == ["get_dealership_info"]
+            assert active_count(store) == 0
+        finally:
+            release.set()
+            await harness.close()
+    asyncio.run(run())
