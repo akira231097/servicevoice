@@ -56,8 +56,12 @@ function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen 
       phrases: ['neutral_ack', 'moment'].map(phrase_id => ({ phrase_id, sample_rate: 16000, pcm_bytes: audio.byteLength, sha256: hash })) });
     if (url.includes('/duplex/audio/')) return { ok: true, arrayBuffer: async () => audio.slice().buffer };
     if (url.endsWith('/duplex/call')) return reply({ call_id: 'fixture-call', websocket_url: 'wss://backend.vapi.ai/fixture', sample_rate: 16000 });
+    if (url.endsWith('/duplex/cue') && request.body.prepare_only) return reply({ phrase_id: 'silence', prepared: true,
+      reason: 'waiting_prepared', expires_in_ms: 0, prepared_expires_in_ms: 2000,
+      epoch: request.body.epoch, revision: request.body.revision, requests: 1 });
     if (url.endsWith('/duplex/cue')) return reply({ phrase_id: request.body.phase === 'listening' ? 'neutral_ack' : 'moment',
-      confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 });
+      confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800,
+      prepared_reused: Boolean(request.body.prepared_revision), requests: request.body.prepared_revision ? 0 : 1 });
     if (url.endsWith('/duplex/stop')) return reply({ ok: true });
     if (url === '/api/sessions/fixture-session') return reply({ ended: false, stage: 'service', proposal: null, pending_operations: [] });
     return reply({ ok: true });
@@ -74,11 +78,230 @@ function fixture({ handler = null, resume = null, getUserMedia = null, autoOpen 
     },
   } });
   return { session, time, requests, sockets, contexts, microphones, output, tracks, stream, events,
-    get mediaRequests() { return mediaRequests; }, cues: () => requests.filter(row => row.url.endsWith('/duplex/cue')) };
+    get mediaRequests() { return mediaRequests; },
+    cues: () => requests.filter(row => row.url.endsWith('/duplex/cue') && !row.body.prepare_only),
+    preparations: () => requests.filter(row => row.url.endsWith('/duplex/cue') && row.body.prepare_only) };
 }
 function message(session, body) { session.receive(JSON.stringify(body)); }
 function speech(session, role, status) { message(session, { type: 'speech-update', role, status }); }
 function transcript(session, text, final = false) { message(session, { type: 'transcript', role: 'user', transcript: text, transcriptType: final ? 'final' : 'partial' }); }
+
+test('exact full short partial is prepared without audio and activated only after fresh confirmed yield', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Alex Morgan'); await f.time.advance(249);
+  assert.equal(f.preparations().length, 0); await f.time.advance(1);
+  const preparation = f.preparations()[0];
+  assert.equal(preparation.body.text, 'Alex Morgan'); assert.equal(preparation.body.phase, 'waiting');
+  assert.equal(f.output.cues.length, 0); assert.equal(f.cues().length, 0);
+  await f.time.advance(400); assert.equal(f.output.cues.length, 0, 'Prediction is nonplaying while caller owns input');
+  transcript(f.session, 'Alex Morgan', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  const activation = f.cues()[0];
+  assert.equal(activation.body.prepared_revision, preparation.body.revision);
+  assert.ok(activation.body.revision > preparation.body.revision);
+  assert.equal(activation.body.text, preparation.body.text); assert.equal(activation.body.epoch, preparation.body.epoch);
+  assert.equal(Object.hasOwn(activation.body, 'prepare_only'), false);
+  await f.time.advance(549); assert.equal(f.output.cues.length, 0);
+  await f.time.advance(1); assert.equal(f.output.cues[0].phrase, 'moment');
+  assert.equal(f.session.metrics().waiting_preparation_requests, 1);
+  assert.equal(f.session.metrics().waiting_preparation_reuses, 1); await f.session.stop();
+});
+
+test('a fast voiced answer revokes an exact prepared waiting result before its playback guard', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours'); await f.time.advance(650);
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.ok(f.cues()[0].body.prepared_revision);
+  speech(f.session, 'assistant', 'started'); await f.time.advance(400); f.session.receive(pcm(2000).buffer);
+  await f.time.advance(300); assert.equal(f.output.cues.length, 0); assert.equal(f.output.main.length, 1);
+  assert.equal(f.session.waitingPrepared, null); await f.session.stop();
+});
+
+test('ordinary partial rewrites immediately abort prediction and its ignored-abort response never becomes playable', async () => {
+  const held = deferred(); const f = fixture({ handler: request =>
+    request.body?.prepare_only ? held.promise : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(250); const old = f.preparations()[0];
+  transcript(f.session, 'Service prices'); assert.equal(old.options.signal.aborted, true);
+  held.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+    prepared_expires_in_ms: 2000, revision: old.body.revision, epoch: old.body.epoch })); await flush();
+  assert.equal(f.session.waitingPrepared, null); assert.equal(f.output.cues.length, 0);
+  transcript(f.session, 'Service prices', true); speech(f.session, 'user', 'stopped'); await f.time.advance(710);
+  assert.equal(Object.hasOwn(f.cues()[0].body, 'prepared_revision'), false);
+  assert.equal(f.cues()[0].body.text, 'Service prices'); await f.session.stop();
+});
+
+for (const control of ['Yes', 'No, change that', 'Only if I confirm', 'Please reply in Spanish']) {
+  test(`raw ${JSON.stringify(control)} immediately invalidates a completed prediction without activation`, async () => {
+    const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+    transcript(f.session, 'Opening hours'); await f.time.advance(250); assert.ok(f.session.waitingPrepared);
+    transcript(f.session, control); assert.equal(f.session.waitingPrepared, null);
+    transcript(f.session, control, true); speech(f.session, 'user', 'stopped'); await f.time.advance(1200);
+    assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0); assert.equal(f.preparations().length, 1);
+    await f.session.stop();
+  });
+}
+
+test('a confirmed caller resume discards a completed receipt even if the same words are repeated', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours'); await f.time.advance(250);
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(f.cues().length, 0, 'The shared request cadence has not elapsed');
+  speech(f.session, 'user', 'started'); assert.equal(f.session.waitingPrepared, null);
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(710);
+  assert.equal(f.cues().length, 1); assert.equal(Object.hasOwn(f.cues()[0].body, 'prepared_revision'), false);
+  await f.session.stop();
+});
+
+test('a changed assistant question cannot activate an earlier completed preparation receipt', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours'); await f.time.advance(650); assert.ok(f.session.waitingPrepared);
+  message(f.session, { type: 'transcript', role: 'assistant', transcript: 'Should I save this appointment?', transcriptType: 'final' });
+  assert.equal(f.session.waitingPrepared, null);
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(Object.hasOwn(f.cues()[0].body, 'prepared_revision'), false); await f.session.stop();
+});
+
+test('a malformed playable prediction response never reaches output or binds a reuse receipt', async () => {
+  const f = fixture({ handler: request => request.body?.prepare_only
+    ? reply({ phrase_id: 'moment', confidence: .99, expires_in_ms: 800, prepared: true,
+      reason: 'waiting_prepared', epoch: request.body.epoch, revision: request.body.revision, prepared_expires_in_ms: 2000 }) : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(1000); assert.equal(f.output.cues.length, 0); assert.equal(f.session.waitingPrepared, null);
+  await f.session.stop();
+});
+
+test('a listening classification has priority and preparation cannot send a concurrent newer server revision', async () => {
+  const held = deferred(); const f = fixture({ handler: request => request.body?.phase === 'listening' ? held.promise : null });
+  await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Please explain all the service options'); await f.time.advance(700);
+  assert.equal(f.cues().length, 1); assert.equal(f.preparations().length, 0); assert.equal(f.cues()[0].options.signal.aborted, false);
+  held.resolve(reply({ phrase_id: 'neutral_ack', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 }));
+  await flush(); await f.time.advance(350);
+  assert.equal(f.output.cues.length, 1); assert.equal(f.preparations().length, 1);
+  assert.equal(f.preparations()[0].body.text, 'Please explain all the service options');
+  await f.session.stop();
+});
+
+test('preparation is capped twice per utterance and stop cancels every owned timer and request', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours'); await f.time.advance(400);
+  transcript(f.session, 'Service prices', true); await f.time.advance(1000);
+  for (const text of ['Vehicle inspections', 'Diagnostic options']) {
+    transcript(f.session, text); await f.time.advance(400);
+  }
+  assert.equal(f.preparations().length, 2); assert.equal(f.session.coordinator.preparationRequests, 2);
+  for (const cue of f.output.cues) cue.finish(); await flush();
+  transcript(f.session, 'Diagnostic options', true); speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(f.cues().filter(row => row.body.phase === 'waiting').length, 1, 'A fresh actual waiting attempt remains available without any cache');
+  await f.session.stop(); assert.equal(f.time.pending, 0); assert.equal(f.session.waitingPrepared, null);
+});
+
+test('an exact in-flight prediction joins the original waiting deadline then activates with a completed receipt', async () => {
+  const held = deferred(); const f = fixture({ handler: request => request.body?.prepare_only ? held.promise : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(250); const preparation = f.preparations()[0];
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(350);
+  assert.equal(f.session.callerSpeaking, false); assert.equal(preparation.options.signal.aborted, false);
+  assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0);
+  await f.time.advance(50);
+  held.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+    prepared_expires_in_ms: 2000, epoch: preparation.body.epoch, revision: preparation.body.revision })); await flush();
+  assert.equal(f.cues().length, 1); assert.equal(f.cues()[0].body.prepared_revision, preparation.body.revision);
+  assert.equal(f.events.find(row => row.kind === 'waiting_preparation_joined').join_ms, 50);
+  await f.time.advance(309); assert.equal(f.output.cues.length, 0); await f.time.advance(1);
+  assert.equal(f.output.cues[0].phrase, 'moment'); await f.session.stop();
+});
+
+test('a provider-final snapshot can prepare inside the160ms endpoint tail but still cannot play before fresh yield', async () => {
+  const held = deferred(); const f = fixture({ handler: request => request.body?.prepare_only ? held.promise : null });
+  await f.session.start(); transcript(f.session, 'Alex Morgan', true); await f.time.advance(0);
+  assert.equal(f.preparations().length, 1, 'Final bypasses only the250ms partial stability delay');
+  const preparation = f.preparations()[0];
+  await f.time.advance(159); assert.equal(f.session.callerSpeaking, true); assert.equal(f.output.cues.length, 0);
+  await f.time.advance(1); assert.equal(f.session.callerSpeaking, false); assert.equal(f.output.cues.length, 0);
+  await f.time.advance(290); assert.equal(f.cues().length, 0);
+  held.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+    prepared_expires_in_ms: 2000, epoch: preparation.body.epoch, revision: preparation.body.revision })); await flush();
+  assert.equal(f.cues()[0].body.prepared_revision, preparation.body.revision);
+  assert.equal(f.events.find(row => row.kind === 'waiting_preparation_joined').join_ms, 100);
+  await f.time.advance(259); assert.equal(f.output.cues.length, 0); await f.time.advance(1);
+  assert.equal(f.output.cues[0].phrase, 'moment'); await f.session.stop();
+});
+
+test('actual main during a prediction join aborts prediction immediately without waiting for HTTP or playing a cue', async () => {
+  const held = deferred(); const f = fixture({ handler: request => request.body?.prepare_only ? held.promise : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(250); const preparation = f.preparations()[0];
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(350);
+  speech(f.session, 'assistant', 'started'); f.session.receive(pcm(2000).buffer);
+  assert.equal(preparation.options.signal.aborted, true); assert.equal(f.output.main.length, 1);
+  held.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+    prepared_expires_in_ms: 2000, epoch: preparation.body.epoch, revision: preparation.body.revision }));
+  await flush(); await f.time.advance(1000);
+  assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0); assert.equal(f.session.waitingPrepared, null);
+  await f.session.stop();
+});
+
+test('joining prediction cannot restart or extend the original850ms selection deadline', async () => {
+  const preparation = deferred(), activation = deferred(); const f = fixture({ handler: request =>
+    request.url.endsWith('/duplex/cue') ? request.body.prepare_only ? preparation.promise : activation.promise : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(250); const request = f.preparations()[0];
+  transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(800);
+  preparation.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+    prepared_expires_in_ms: 2000, epoch: request.body.epoch, revision: request.body.revision })); await flush();
+  assert.equal(f.time.now(), 1050); assert.equal(f.cues().length, 1);
+  await f.time.advance(399); assert.equal(f.cues()[0].options.signal.aborted, false);
+  await f.time.advance(1); assert.equal(f.cues()[0].options.signal.aborted, true);
+  activation.resolve(reply({ phrase_id: 'moment', confidence: .99, language_choice: 'cache_compatible', expires_in_ms: 800 }));
+  await flush(); assert.equal(f.output.cues.length, 0); await f.session.stop();
+});
+
+test('a long ordinary stream keeps its second preparation opportunity for a final stable tail', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started');
+  transcript(f.session, 'Opening hours'); await f.time.advance(400);
+  for (const text of ['Service prices', 'Vehicle inspections', 'Diagnostic options', 'Maintenance options']) {
+    transcript(f.session, text); await f.time.advance(700);
+  }
+  assert.equal(f.preparations().length, 1, 'An actively growing long turn cannot spend both early predictions');
+  transcript(f.session, 'Maintenance options', true); await f.time.advance(250);
+  assert.equal(f.preparations().length, 2); assert.equal(f.preparations()[1].body.text, 'Maintenance options');
+  speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+  assert.equal(f.cues().findLast(row => row.body.phase === 'waiting').body.prepared_revision, f.preparations()[1].body.revision);
+  await f.session.stop();
+});
+
+test('an expired completed preparation receipt causes ordinary fresh selection without rolling its lifetime', async () => {
+  const f = fixture({ handler: request => request.body?.prepare_only ? reply({ phrase_id: 'silence', prepared: true,
+    reason: 'waiting_prepared', expires_in_ms: 0, prepared_expires_in_ms: 100,
+    epoch: request.body.epoch, revision: request.body.revision }) : null });
+  await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+  await f.time.advance(650); transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped');
+  await f.time.advance(160); assert.equal(f.cues().length, 1);
+  assert.equal(Object.hasOwn(f.cues()[0].body, 'prepared_revision'), false); await f.session.stop();
+});
+
+for (const action of ['hard_context', 'stop']) {
+  test(`a ${action} change cancels an in-flight preparation join and cannot activate its late receipt`, async () => {
+    const held = deferred(); let blocked = false;
+    const f = fixture({ handler: request => {
+      if (request.body?.prepare_only) return held.promise;
+      if (request.url === '/api/sessions/fixture-session' && blocked)
+        return reply({ ended: false, stage: 'confirmation', proposal: {}, pending_operations: [] });
+      return null;
+    } });
+    await f.session.start(); speech(f.session, 'user', 'started'); transcript(f.session, 'Opening hours');
+    await f.time.advance(250); const preparation = f.preparations()[0];
+    transcript(f.session, 'Opening hours', true); speech(f.session, 'user', 'stopped'); await f.time.advance(350);
+    if (action === 'stop') await f.session.stop();
+    else { blocked = true; await f.session.refreshSnapshot(); }
+    assert.equal(preparation.options.signal.aborted, true);
+    held.resolve(reply({ phrase_id: 'silence', prepared: true, reason: 'waiting_prepared', expires_in_ms: 0,
+      prepared_expires_in_ms: 2000, epoch: preparation.body.epoch, revision: preparation.body.revision })); await flush();
+    assert.equal(f.cues().length, 0); assert.equal(f.output.cues.length, 0); assert.equal(f.session.waitingPrepared, null);
+    await f.session.stop(); assert.equal(f.time.pending, 0);
+  });
+}
 
 test('an early provider main announcement cannot erase a waiting cue during a silent TTS gap', async () => {
   const f = fixture(); await f.session.start(); transcript(f.session, 'What services are available?', true);
@@ -348,10 +571,11 @@ test('an older snapshot response cannot reapply a hard block after the turn-yiel
     return reply({ ended: false, stage: 'details', proposal: { id: 'fixture-proposal' }, pending_operations: [] });
   } });
   await f.session.start(); transcript(f.session, 'Alex', true); await f.time.advance(160);
-  assert.equal(f.cues().length, 1); assert.equal(f.session.coordinator.sensitive, false);
+  assert.equal(f.preparations().length, 1); assert.equal(f.session.coordinator.sensitive, false);
   old.resolve(reply({ ended: false, stage: 'confirmation', proposal: { id: 'fixture-proposal' }, pending_operations: [] }));
-  await flush(); assert.equal(f.session.coordinator.sensitive, false); assert.equal(f.cues()[0].options.signal.aborted, false);
-  await f.time.advance(550); assert.equal(f.output.cues.length, 1); await f.session.stop();
+  await flush(); assert.equal(f.session.coordinator.sensitive, false);
+  await f.time.advance(190); assert.equal(f.cues().length, 1); assert.equal(f.cues()[0].options.signal.aborted, false);
+  await f.time.advance(360); assert.equal(f.output.cues.length, 1); await f.session.stop();
 });
 
 test('a raw one-word consent remains blocked even in otherwise eligible details context', async () => {
@@ -601,7 +825,7 @@ for (const phrase of ['not ready', "don't book it", 'never do that', 'only if it
 
 test('assistant stopped cancels a pending waiting cue even when its start or audio was unavailable', async () => {
   const f = fixture(); await f.session.start(); transcript(f.session, 'Please explain the available service options', true);
-  await f.time.advance(160); assert.equal(f.session.coordinator.generating, true);
+  await f.time.advance(350); assert.equal(f.session.coordinator.generating, true);
   speech(f.session, 'assistant', 'stopped'); await f.time.advance(1000);
   assert.equal(f.session.coordinator.generating, false); assert.equal(f.cues().length, 1);
   assert.equal(f.cues()[0].options.signal.aborted, true, 'Stop revokes the overlapped waiting request before audio');

@@ -695,3 +695,160 @@ def test_invalid_ownership_tokens_do_not_start_classification(epoch, revision):
         result = await DuplexCueSession(policy).choose(**args(epoch=epoch, revision=revision))
         assert result.reason == "invalid_revision" and result.phrase_id == "silence" and policy.calls == 0
     asyncio.run(scenario())
+
+
+def test_waiting_preparation_is_nonplaying_unreserved_until_fresh_activation():
+    async def run():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        prepared = await session.choose(**args(phase="waiting"), prepare_only=True)
+        assert prepared.phrase_id == "silence" and prepared.expires_in_ms == 0
+        assert prepared.prepared and prepared.reason == "waiting_prepared"
+        assert prepared.requests == 1 and 0 < prepared.prepared_expires_in_ms <= 2000
+        assert session.count == 0 and not session.reservations
+        assert session.last_phase_at["waiting"] == session.last_cue_at == float("-inf")
+        assert session.confirm_prepared(1, 1)
+        clock.now = .4
+        activated = await session.choose(**args(revision=2, phase="waiting"), prepared_revision=1)
+        assert activated.phrase_id == "moment" and activated.prepared_reused
+        assert activated.requests == 0 and activated.classification_ms is None
+        assert activated.prepared_age_ms == 400 and activated.expires_in_ms == 800
+        assert session.count == policy.calls == session.classifications == 1
+        assert session.reservations == {(1, "waiting")} and session.prepared is None
+        assert (await session.choose(**args(revision=3, phase="waiting"), prepared_revision=1)).reason == "phase_already_acknowledged"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["missing_receipt", "wrong_receipt", "unconfirmed", "text", "prior", "context", "new_epoch", "invalidated"])
+def test_preparation_reuse_requires_exact_completed_receipt_text_prior_and_state(change):
+    async def run():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        await session.choose(**args(phase="waiting"), prepare_only=True)
+        if change != "unconfirmed":
+            assert session.confirm_prepared(1, 1)
+        clock.now = .4
+        options = args(revision=2, phase="waiting")
+        options["prepared_revision"] = None if change == "missing_receipt" else 99 if change == "wrong_receipt" else 1
+        if change == "text":options["text"] += " today"
+        if change == "prior":options["previous_assistant"] = "Which routine service do you need?"
+        if change == "context":options["context"] = {**SAFE, "stage": "slot"}
+        if change == "new_epoch":options["epoch"] = 2
+        if change == "invalidated":session.invalidate(reason="main_started")
+        result = await session.choose(**options)
+        assert result.phrase_id == "moment" and not result.prepared_reused and result.requests == 1
+        assert policy.calls == session.classifications == 2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("age,reused", [(1.999, True), (2., False), (2.001, False)])
+def test_preparation_semantic_age_has_an_exact_two_second_boundary(age, reused):
+    async def run():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        await session.choose(**args(phase="waiting"), prepare_only=True)
+        assert session.confirm_prepared(1, 1)
+        clock.now = age
+        value = await session.choose(**args(revision=2, phase="waiting"), prepared_revision=1)
+        assert value.prepared_reused is reused and value.phrase_id == "moment"
+        assert policy.calls == (1 if reused else 2)
+    asyncio.run(run())
+
+
+def test_preparation_is_latest_only_bounded_and_reserves_the_final_classification_slot():
+    async def run():
+        class SelectivePolicy(ImmediatePolicy):
+            async def choose(self, *a, phase, **kw):
+                value = await super().choose(*a, phase=phase, **kw)
+                return value if phase == "waiting" else BackchannelDecision(reason="classifier_silence", requests=1)
+        clock, policy = Clock(), SelectivePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        for revision in (1, 2):
+            options = {**args(revision=revision, phase="waiting"), "text": TEXT + " " * revision}
+            assert (await session.choose(**options, prepare_only=True)).prepared
+            session.confirm_prepared(1, revision)
+            clock.now += .31
+        blocked = await session.choose(**{**args(revision=3, phase="waiting"), "text": TEXT + " today"}, prepare_only=True)
+        assert blocked.reason == "utterance_preparation_budget" and blocked.requests == 0
+        for revision in range(4, 9):
+            assert (await session.choose(**args(revision=revision))).reason == "classifier_silence"
+            clock.now += .31
+        assert session.classifications == 7 and session.count == 0
+        assert (await session.choose(**args(revision=9))).reason == "utterance_classification_budget"
+        clock.now += .31
+        final = await session.choose(**args(revision=10, phase="waiting"))
+        assert final.phrase_id == "moment" and final.requests == 1
+        assert session.classifications == policy.calls == 8
+    asyncio.run(run())
+
+
+def test_reuse_spends_no_new_classification_even_at_the_window_classification_cap():
+    async def run():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, max_classifications=1, clock=clock)
+        await session.choose(**args(phase="waiting"), prepare_only=True)
+        session.confirm_prepared(1, 1)
+        clock.now = .4
+        result = await session.choose(**args(revision=2, phase="waiting"), prepared_revision=1)
+        assert result.phrase_id == "moment" and result.prepared_reused
+        assert session.classifications == policy.calls == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("text", ["Yes I confirm", "Actually I need another day", "Reply in Spanish please", "My phone number is 3125550142"])
+def test_sensitive_tail_cannot_activate_an_ordinary_prepared_prefix(text):
+    async def run():
+        clock, policy = Clock(), ImmediatePolicy()
+        session = DuplexCueSession(policy, clock=clock)
+        await session.choose(**args(phase="waiting"), prepare_only=True)
+        session.confirm_prepared(1, 1)
+        clock.now = .4
+        result = await session.choose(**{**args(revision=2, phase="waiting"), "text": TEXT + " " + text}, prepared_revision=1)
+        assert result.phrase_id == "silence" and not result.prepared_reused
+        assert session.prepared is None and session.count == 0 and policy.calls == 1
+    asyncio.run(run())
+
+
+def test_canceled_preparation_cannot_publish_even_when_provider_swallows_cancellation():
+    async def run():
+        entered = asyncio.Event()
+        class UncooperativePolicy(ImmediatePolicy):
+            async def choose(self, *a, **kw):
+                entered.set()
+                try:await asyncio.Event().wait()
+                except asyncio.CancelledError:pass
+                return await super().choose(*a, **kw)
+        session = DuplexCueSession(UncooperativePolicy())
+        task = asyncio.create_task(session.choose(**args(phase="waiting"), prepare_only=True))
+        await entered.wait();task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        assert session.prepared is None and session.count == 0
+    asyncio.run(run())
+
+
+def test_old_request_cleanup_cannot_clear_a_newer_confirmed_preparation():
+    async def run():
+        clock = Clock()
+        session = DuplexCueSession(ImmediatePolicy(), clock=clock)
+        await session.choose(**args(phase="waiting"), prepare_only=True)
+        clock.now = .4
+        await session.choose(**{**args(revision=2, phase="waiting"), "text": TEXT + " today"}, prepare_only=True)
+        assert session.confirm_prepared(1, 2)
+        version = session.version
+        session.invalidate_if_current(1, 1, reason="request_disconnected")
+        assert session.version == version and session.prepared.revision == 2
+        clock.now = .5
+        result = await session.choose(**{**args(revision=3, phase="waiting"), "text": TEXT + " today"}, prepared_revision=2)
+        assert result.prepared_reused and result.phrase_id == "moment"
+    asyncio.run(run())
+
+
+def test_waiting_prompt_distinguishes_a_time_preference_from_booking_approval():
+    ordinary = cue_state("Ten thirty works for me", "waiting", "Which offered time works for you?", SAFE)
+    assert ordinary[1] == "eligible"
+    payload = cue_payload(ordinary[0])["questions"]
+    assert "expressing an ordinary scheduling preference, not approving a booking" in payload["cue"]["instructions"]
+    assert "Approval after a complete booking readback remains excluded." in payload["cue"]["instructions"]
+    assert set(payload["cue"]["criteria"]) == {"ordinary_content", "excluded_content"}
+    assert cue_state("Yes book it", "waiting", "Please confirm the appointment readback.", SAFE)[0] is None
+    assert cue_state("Ten thirty works for me", "waiting", "Please confirm the appointment readback.", SAFE)[0] is None

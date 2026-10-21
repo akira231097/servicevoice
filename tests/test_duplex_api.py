@@ -722,3 +722,176 @@ def test_durable_allocation_reservation_survives_lost_inmemory_state_after_unkno
             repeated = await h.client.post(path(h.first, "call"), headers=headers(h.first))
             assert repeated.status_code == 409 and len(h.calls) == 1
     asyncio.run(run())
+
+
+def test_prepared_waiting_response_cannot_play_and_receipt_activation_reuses_without_a_model_call(tmp_path):
+    from test_duplex_cues import Clock
+    async def run():
+        async with harness(tmp_path) as h:
+            clock = Clock();h.control.clock = clock
+            prepared = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting", prepare_only=True))
+            value = prepared.json()
+            assert prepared.status_code == 200 and value["prepared"]
+            assert value["phrase_id"] == "silence" and value["expires_in_ms"] == 0
+            assert value["reason"] == "waiting_prepared" and value["requests"] == 1
+            assert 0 < value["prepared_expires_in_ms"] <= 2000
+            session = h.control.sessions[h.first["id"]]
+            assert session.count == 0 and session.prepared.validated
+            clock.now = .4
+            activated = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting", revision=2, prepared_revision=1))
+            final = activated.json()
+            assert final["phrase_id"] == "moment" and final["prepared_reused"]
+            assert final["requests"] == 0 and final["expires_in_ms"] == 800
+            assert len(h.policy.calls) == session.classifications == session.count == 1
+            evidence = (await h.client.get(path(h.first, "evidence"), headers=headers(h.first))).json()["cue_decisions"]
+            assert [(row["prepare_only"], row["prepared_reused"], row["requests"]) for row in evidence] == [(True, False, 1), (False, True, 0)]
+            assert not h.calls and h.first["token"] not in json.dumps(evidence)
+            assert cue()["text"] not in json.dumps(evidence)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["prior_question", "confirmation", "pending_operation"])
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_fresh_prior_and_context_changes_withhold_preparation_and_playback(tmp_path, change, prepare_only):
+    async def run():
+        async with harness(tmp_path) as h:
+            changed = []
+            original_snapshot = h.control.snapshot
+            def snapshot(sid, token):
+                row = original_snapshot(sid, token)
+                if changed:
+                    if change == "prior_question":row["transcript"] = [{"role":"assistant", "text":"Please confirm the appointment readback."}]
+                    elif change == "confirmation":row["stage"] = "confirmation"
+                    else:row["pending_operations"] = [{"name":"unknown-operation"}]
+                return row
+            h.control.snapshot = snapshot
+            h.policy.callback = lambda *_:changed.append(True)
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting", prepare_only=prepare_only))
+            value = response.json()
+            assert value["phrase_id"] == "silence" and value["reason"] == "scheduler_changed"
+            assert not value["prepared"] and value["prepared_expires_in_ms"] == 0
+            assert h.control.sessions[h.first["id"]].prepared is None
+            assert len(h.policy.calls) == 1 and not h.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("body", [cue(prepare_only=True), cue(phase="waiting", prepare_only=1),
+    cue(phase="waiting", prepare_only="true"), cue(phase="waiting", prepared_revision=0),
+    cue(phase="waiting", prepare_only=True, prepared_revision=1), cue(prepared_revision=1)])
+def test_preparation_contract_rejects_invalid_modes_before_classifier(tmp_path, body):
+    async def run():
+        async with harness(tmp_path) as h:
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=body)
+            assert response.status_code == 422 and not h.policy.calls and not h.calls
+    asyncio.run(run())
+
+
+def test_disconnected_preparation_is_never_published_or_reused(tmp_path, monkeypatch):
+    from fastapi import Request
+    from test_duplex_cues import Clock
+    reads = []
+    async def disconnected(request):
+        reads.append(True)
+        return len(reads) == 2
+    monkeypatch.setattr(Request, "is_disconnected", disconnected)
+    async def run():
+        async with harness(tmp_path) as h:
+            clock = Clock();h.control.clock = clock
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", prepare_only=True))
+            assert response.json()["reason"] == "request_disconnected"
+            session = h.control.sessions[h.first["id"]]
+            assert not response.json()["prepared"] and session.prepared is None
+            clock.now = .4
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first), json=cue(phase="waiting", revision=2, prepared_revision=1))
+            assert not response.json()["prepared_reused"] and response.json()["requests"] == 1
+            assert len(h.policy.calls) == 2
+    asyncio.run(run())
+
+
+def test_post_read_cannot_extend_the_two_second_preparation_age(tmp_path):
+    from test_duplex_cues import Clock
+    async def run():
+        async with harness(tmp_path) as h:
+            clock = Clock();h.control.clock = clock
+            first = await h.client.post(path(h.first,"cue"), headers=headers(h.first), json=cue(phase="waiting", prepare_only=True))
+            assert first.json()["prepared"]
+            original_snapshot, reads = h.control.snapshot, []
+            def snapshot(sid, token):
+                reads.append(True)
+                if len(reads)==2:clock.now += .15
+                return original_snapshot(sid, token)
+            h.control.snapshot = snapshot;clock.now = 1.9
+            response = await h.client.post(path(h.first,"cue"), headers=headers(h.first), json=cue(phase="waiting", revision=2, prepared_revision=1))
+            value = response.json()
+            assert value["phrase_id"] == "silence" and value["reason"] == "decision_expired"
+            assert value["prepared_age_ms"] >= 2000 and value["expires_in_ms"] == 0
+            assert value["requests"] == 0 and len(h.policy.calls)==1
+            assert h.control.sessions[h.first["id"]].count == 1  # No ambiguous reservation refund.
+    asyncio.run(run())
+
+
+def test_old_disconnected_preparation_cleanup_does_not_cancel_new_waiting_request(tmp_path, monkeypatch):
+    from fastapi import Request
+    import threading
+    async def run():
+        post_entered, release_post = threading.Event(), threading.Event()
+        new_entered, release_new = asyncio.Event(), asyncio.Event()
+        async with harness(tmp_path) as h:
+            original_snapshot, reads = h.control.snapshot, []
+            def snapshot(sid, token):
+                reads.append(True)
+                row = original_snapshot(sid, token)
+                if len(reads)==2:
+                    post_entered.set()
+                    assert release_post.wait(4)
+                return row
+            h.control.snapshot = snapshot
+            async def disconnected(request):
+                return request.headers.get("x-old-preparation") == "1" and release_post.is_set()
+            monkeypatch.setattr(Request,"is_disconnected",disconnected)
+            async def callback(*_):
+                if len(h.policy.calls)==2:
+                    new_entered.set();await release_new.wait()
+            h.policy.callback = callback
+            old = asyncio.create_task(h.client.post(path(h.first,"cue"),headers={**headers(h.first),"x-old-preparation":"1"},json=cue(phase="waiting",prepare_only=True)))
+            assert await asyncio.to_thread(post_entered.wait, 4)
+            # Bypass only request pacing so this test can hold the newer model
+            # request open and target ownership cleanup rather than timing.
+            h.control.sessions[h.first["id"]].last_attempt_at = float("-inf")
+            newer = asyncio.create_task(h.client.post(path(h.first,"cue"),headers=headers(h.first),json=cue(phase="waiting",revision=2)))
+            await asyncio.wait_for(new_entered.wait(),4)
+            release_post.set()
+            assert (await old).json()["reason"] == "request_disconnected"
+            assert not newer.done()
+            release_new.set()
+            result = (await newer).json()
+            assert result["phrase_id"] == "moment" and result["requests"] == 1
+            assert len(h.policy.calls)==2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("event", ["main_started", "barge_in", "muted", "ended"])
+def test_post_read_invalidation_with_unchanged_revision_cannot_return_playable_cached_decision(tmp_path, event):
+    from test_duplex_cues import Clock
+    async def run():
+        async with harness(tmp_path) as h:
+            clock = Clock();h.control.clock = clock
+            first = await h.client.post(path(h.first,"cue"), headers=headers(h.first), json=cue(phase="waiting",prepare_only=True))
+            assert first.json()["prepared"]
+            session = h.control.sessions[h.first["id"]]
+            clock.now = .4
+            original_snapshot, reads = h.control.snapshot, []
+            def snapshot(sid, token):
+                row = original_snapshot(sid, token);reads.append(True)
+                if len(reads)==2:session.invalidate(reason=event)
+                return row
+            h.control.snapshot = snapshot
+            response = await h.client.post(path(h.first,"cue"),headers=headers(h.first),json=cue(phase="waiting",revision=2,prepared_revision=1))
+            value = response.json()
+            assert value["phrase_id"]=="silence" and value["reason"]=="superseded" and value["expires_in_ms"]==0
+            assert not value["prepared_reused"] and session.prepared is None
+            assert session.count==1 and len(h.policy.calls)==1
+    asyncio.run(run())

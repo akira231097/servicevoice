@@ -229,6 +229,36 @@ been switched. Equivalent phone listening cues would need an owned media bridge
 and its own acceptance evidence. Promotion requires representative audio
 comparison, not just a fast first sound or a green unit test.
 
+### Partial waiting preparation
+
+The next waiting candidate can be classified from stable partial speech without
+playing audio or spending a cue reservation. Preparation remains bounded by the
+same classification budget, with at most two preparations per caller utterance.
+A prepared result is explicitly nonplaying. After the caller yields, activation
+requires its matching receipt, exact text, prior assistant question and scheduler
+context, fresh authoritative checks, and a preparation age below two seconds.
+Changed content or context falls back to a new classification. Preparation does
+not authorize booking or weaken the content and language thresholds. Main audio,
+resumed caller speech, corrections and closure retain cancellation priority.
+
+A later real microphone call ended normally with a confirmed appointment and
+five successful booking-tool events. Its ten main-response gaps after browser
+turn release averaged 2.95 seconds, with eight exceeding two seconds and a
+maximum of 4.95 seconds. One listening and one waiting cue were recorded. The
+waiting cue began 0.56 seconds after final browser yield; another 2.41 seconds
+elapsed between its end event and main audio. These browser events establish
+remaining coverage and continuity problems, not sample-level acoustic quality.
+The classifier itself took 108–227 ms, while whole selection requests took
+287–586 ms. Silence, uncertain content and language decisions caused most misses;
+no main-arrival cancellation or cooldown rejection was recorded in that call.
+
+A frozen 24-case synthetic comparison tested a narrow clarification that an
+offered-time selection is a scheduling preference, while approval after a full
+booking readback remains excluded. It selected 12 of 12 ordinary examples versus
+10 of 12 for the baseline, with all 12 excluded examples remaining silent. A
+broader prompt rewrite regressed to 8 of 12 and was rejected. This development
+comparison does not establish production accuracy, naturalness or phone support.
+
 Primary references: [Vapi WebSocket transport](https://docs.vapi.ai/calls/websocket-transport),
 [Vapi API keys](https://docs.vapi.ai/security-and-privacy/api-keys),
 [Vapi server authentication](https://docs.vapi.ai/server-url/server-authentication),

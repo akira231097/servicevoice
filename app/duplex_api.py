@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .backchannel_audio import BackchannelAudioCache
 from .backchannel_catalog import PHRASES
-from .duplex_cues import DuplexCuePolicy, DuplexCueSession, cue_state
+from .duplex_cues import PREPARATION_MAX_AGE_MS, DuplexCueDecision, DuplexCuePolicy, DuplexCueSession, cue_state
 
 REQUEST_MAX_AGE_MS = 800
 DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "invalid_phase",
@@ -37,7 +37,8 @@ DECISION_REASONS = frozenset({"eligible_listening_ack", "eligible_hold_ack", "in
     "classifier_silence", "classification_uncertain", "classification_unavailable", "session_closed",
     "invalid_revision", "stale_revision", "phase_already_acknowledged", "call_budget", "cooldown",
     "cue_spacing", "classification_budget", "utterance_classification_budget", "classification_throttled",
-    "superseded", "phase_mismatch", "decision_expired", "scheduler_changed", "request_expired"})
+    "superseded", "phase_mismatch", "decision_expired", "scheduler_changed", "request_expired",
+    "waiting_prepared", "request_disconnected", "utterance_preparation_budget"})
 EVENT_REASONS = DECISION_REASONS | frozenset({"classifier_deadline", "classifier_unavailable",
     "selection_phase_mismatch", "selection_confidence", "selection_language", "selection_expired_on_arrival",
     "selection_expired_before_playback", "clip_unavailable", "caller_resumed", "caller_started", "partial_revised",
@@ -51,6 +52,16 @@ class CueRequest(BaseModel):
     epoch: int = Field(ge=1, le=10000, strict=True)
     revision: int = Field(ge=1, le=100000, strict=True)
     phase: str = Field(pattern="^(listening|waiting)$")
+    prepare_only: bool = Field(default=False, strict=True)
+    prepared_revision: int | None = Field(default=None, ge=1, le=100000, strict=True)
+
+    @model_validator(mode="after")
+    def waiting_preparation_only(self):
+        if (self.prepare_only or self.prepared_revision is not None) and self.phase != "waiting":
+            raise ValueError("Only a waiting cue supports nonplaying preparation.")
+        if self.prepare_only and self.prepared_revision is not None:
+            raise ValueError("A preparation receipt can only activate a completed preparation.")
+        return self
 
 
 class PlaybackEvent(BaseModel):
@@ -276,7 +287,7 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
             return {"ok": False, "call_known": True}
 
     @app.post("/api/sessions/{sid}/duplex/cue")
-    async def cue(sid: str, body: CueRequest, x_session_token: str = Header(default="")):
+    async def cue(sid: str, body: CueRequest, request: Request, x_session_token: str = Header(default="")):
         received_at = control.clock()
         row = await control.authenticated(sid, x_session_token)
         session = await control.session(sid)
@@ -289,11 +300,25 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
         context = cue_context(before)
         previous = next((item.get("text", "") for item in reversed(before.get("transcript", []))
                          if item.get("role") == "assistant"), "")[-1600:]
-        decision = await session.choose(epoch=body.epoch, revision=body.revision, text=body.text,
-            phase=body.phase, key=control.config().get("TYPESAFE_API_KEY"), context=context,
-            previous_assistant=previous)
-        selected_at = control.clock()
-        after = await run_in_threadpool(control.snapshot, sid, x_session_token)
+        try:
+            if await request.is_disconnected():
+                session.invalidate_if_current(body.epoch, body.revision, reason="request_disconnected")
+                decision = DuplexCueDecision(reason="request_disconnected", phase=body.phase,
+                    epoch=body.epoch, revision=body.revision)
+            else:
+                decision = await session.choose(epoch=body.epoch, revision=body.revision, text=body.text,
+                    phase=body.phase, key=control.config().get("TYPESAFE_API_KEY"), context=context,
+                    previous_assistant=previous, prepare_only=body.prepare_only,
+                    prepared_revision=body.prepared_revision)
+            selected_version = session.version
+            selected_at = control.clock()
+            after = await run_in_threadpool(control.snapshot, sid, x_session_token)
+            disconnected = await request.is_disconnected()
+        except BaseException:
+            # A staged prediction is never published by a canceled/failed HTTP
+            # request. Accepted playback reservations remain conservatively spent.
+            session.invalidate_if_current(body.epoch, body.revision, reason="request_interrupted")
+            raise
         after_context = cue_context(after)
         after_previous = next((item.get("text", "") for item in reversed(after.get("transcript", []))
                                if item.get("role") == "assistant"), "")[-1600:]
@@ -310,13 +335,38 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
         remaining = min(decision.expires_in_ms - math.ceil((control.clock() - selected_at) * 1000),
                         REQUEST_MAX_AGE_MS - elapsed_ms)
         result["max_request_age_ms"] = REQUEST_MAX_AGE_MS
-        if after_context != context and not stage_only_change:
-            session.invalidate(reason="scheduler_changed")
-            result.update(phrase_id="silence", reason="scheduler_changed", confidence=0, expires_in_ms=0)
+        if decision.prepared_reused:
+            result["prepared_age_ms"] = decision.prepared_age_ms + max(0,
+                math.ceil((control.clock() - selected_at) * 1000))
+        if disconnected:
+            session.invalidate_if_current(body.epoch, body.revision, reason="request_disconnected")
+            result.update(phrase_id="silence", reason="request_disconnected", confidence=0,
+                expires_in_ms=0, prepared=False, prepared_reused=False, prepared_expires_in_ms=0)
+        elif (session.closed or session.version != selected_version
+                or (session.epoch, session.revision) != (body.epoch, body.revision)):
+            result.update(phrase_id="silence", reason="superseded", confidence=0,
+                expires_in_ms=0, prepared=False, prepared_reused=False, prepared_expires_in_ms=0)
+        elif after_previous != previous or (after_context != context and (body.prepare_only or not stage_only_change)):
+            session.invalidate_if_current(body.epoch, body.revision, reason="scheduler_changed")
+            result.update(phrase_id="silence", reason="scheduler_changed", confidence=0,
+                expires_in_ms=0, prepared=False, prepared_reused=False, prepared_expires_in_ms=0)
+        elif decision.prepared:
+            preparation_remaining = decision.prepared_expires_in_ms - math.ceil((control.clock() - selected_at) * 1000)
+            if elapsed_ms >= REQUEST_MAX_AGE_MS or preparation_remaining <= 0:
+                session.invalidate(reason="request_expired")
+                result.update(reason="request_expired", prepared=False, prepared_expires_in_ms=0)
+            elif not session.confirm_prepared(body.epoch, body.revision):
+                result.update(reason="superseded", prepared=False, prepared_expires_in_ms=0)
+            else:
+                result["prepared_expires_in_ms"] = preparation_remaining
+        elif decision.prepared_reused and result["prepared_age_ms"] >= PREPARATION_MAX_AGE_MS:
+            result.update(phrase_id="silence", reason="decision_expired", expires_in_ms=0)
         elif decision.phrase_id != "silence" and remaining <= 0:
             result.update(phrase_id="silence", reason="request_expired", expires_in_ms=0)
         else:
             result["expires_in_ms"] = max(0, remaining) if decision.phrase_id != "silence" else 0
+        if result["phrase_id"] == "silence":
+            result["prepared_reused"] = False
         retry_after = result.get("retry_after_ms")
         if (result["phrase_id"] == "silence" and result["reason"] in
                 ("classification_throttled", "cue_spacing") and type(retry_after) is int
@@ -341,6 +391,11 @@ def install_duplex_api(app, settings, authorize, snapshot, *, client=None, polic
                 and decision.classification_ms >= 0 else None),
             "expires_in_ms": result["expires_in_ms"], "max_request_age_ms": REQUEST_MAX_AGE_MS,
             "retry_after_ms": result.get("retry_after_ms"),
+            "prepare_only": body.prepare_only, "prepared": result["prepared"],
+            "prepared_reused": result["prepared_reused"],
+            "prepared_expires_in_ms": result["prepared_expires_in_ms"],
+            "prepared_age_ms": result["prepared_age_ms"],
+            "requests": result["requests"],
             "budget": session.budget_state()})
         return result
 

@@ -45,6 +45,7 @@ export class DuplexCoordinator {
     this.pendingTimer = null; this.pendingPhase = null; this.request = null; this.cue = null;
     this.cuesPlayed = 0; this.requests = 0; this.lastCueAt = -Infinity; this.lastRequestAt = -Infinity;
     this.cueTimes = []; this.requestTimes = []; this.utteranceRequests = { listening: 0, waiting: 0 };
+    this.preparationRequests = 0;
     this.retryableWaitingUtteranceId = -1;
     this.waitingPacingRetryUsed = false; this.waitingSelectionNotBefore = -Infinity;
   }
@@ -83,6 +84,7 @@ export class DuplexCoordinator {
     this.utteranceId += 1;
     this.userSpeaking = true; this.text = ''; this.revision = null; this.finalReceived = false; this.turnYieldedAt = null;
     this.utteranceRequests = { listening: 0, waiting: 0 };
+    this.preparationRequests = 0;
     this.retryableWaitingUtteranceId = -1;
     this.waitingPacingRetryUsed = false; this.waitingSelectionNotBefore = -Infinity;
     // Old generation IDs remain invalid even if late PCM arrives after speech ends.
@@ -193,6 +195,21 @@ export class DuplexCoordinator {
     while (this.requestTimes.length && this.requestTimes[0] <= cutoff) this.requestTimes.shift();
   }
 
+  utteranceRequestCount() {
+    return this.utteranceRequests.listening + this.utteranceRequests.waiting + this.preparationRequests;
+  }
+
+  reservePreparationBudget() {
+    // Nonplaying preparation shares the actual classification budget. Keep one
+    // final waiting attempt available; it must never depend on a cache hit.
+    if (this.closed || !this.userSpeaking || this.sensitive || this.mainHasAudio || this.request
+      || this.preparationRequests >= 2 || this.utteranceRequestCount() >= this.maxRequestsPerUtterance - 1
+      || this.budgetWait() > 0 || this.now() - this.lastRequestAt < this.minimumRequestIntervalMs) return false;
+    this.preparationRequests += 1; this.requests += 1;
+    this.lastRequestAt = this.now(); this.requestTimes.push(this.lastRequestAt);
+    return true;
+  }
+
   budgetWait(includeRequests = true) {
     this.pruneBudget();
     if (!this.maxCues || !this.maxRequests) return Infinity;
@@ -224,8 +241,8 @@ export class DuplexCoordinator {
     const epoch = this.epoch;
     if (!this.canCue(phase, epoch) || this.cue || !this.text.trim()
       || this.text.split(/\s+/).length < (phase === 'waiting' ? 1 : 3)
-      || this.utteranceRequests.listening + this.utteranceRequests.waiting >= this.maxRequestsPerUtterance
-      || (phase === 'listening' && this.utteranceRequests.listening >= this.maxRequestsPerUtterance - 1)
+      || this.utteranceRequestCount() >= this.maxRequestsPerUtterance
+      || (phase === 'listening' && this.utteranceRequests.listening + this.preparationRequests >= this.maxRequestsPerUtterance - 1)
       || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId)
       || this.pendingTimer !== null || this.request) return;
     const wait = Math.max(phase === 'waiting' ? 0 : delay, this.selectionWait(phase), this.budgetWait(),
@@ -248,8 +265,8 @@ export class DuplexCoordinator {
     if (!this.canCue(phase, epoch) || this.cue || (phase !== 'waiting' && !this.eligible(phase, epoch))
       || (phase === 'waiting' && this.waitingAttemptUtteranceId === this.utteranceId)
       || this.selectionWait(phase) > 0 || this.budgetWait() > 0 || this.request
-      || this.utteranceRequests.listening + this.utteranceRequests.waiting >= this.maxRequestsPerUtterance
-      || (phase === 'listening' && this.utteranceRequests.listening >= this.maxRequestsPerUtterance - 1)) return;
+      || this.utteranceRequestCount() >= this.maxRequestsPerUtterance
+      || (phase === 'listening' && this.utteranceRequests.listening + this.preparationRequests >= this.maxRequestsPerUtterance - 1)) return;
     const began = this.now(), controller = new AbortController();
     // ASR commonly revises its current last word. Keep that uncommitted word
     // outside a listening snapshot, while checking ALL raw words for sensitivity
@@ -313,7 +330,7 @@ export class DuplexCoordinator {
         && ['classification_throttled', 'cue_spacing'].includes(rejected)
         && Number.isInteger(decision.retry_after_ms) && decision.retry_after_ms >= 1 && decision.retry_after_ms <= 1000
         && !this.waitingPacingRetryUsed && this.canCue(phase, epoch)
-        && this.utteranceRequests.listening + this.utteranceRequests.waiting < this.maxRequestsPerUtterance) {
+        && this.utteranceRequestCount() < this.maxRequestsPerUtterance) {
         this.waitingPacingRetryUsed = true; this.waitingAttemptUtteranceId = -1;
         this.waitingSelectionNotBefore = this.now() + decision.retry_after_ms;
         this.emit('cue_retry_scheduled', { phase, reason: rejected, retry_after_ms: decision.retry_after_ms });

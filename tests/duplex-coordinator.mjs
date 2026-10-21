@@ -66,6 +66,36 @@ function waiting(coordinator, id = 'main-1') {
   caller(coordinator); coordinator.userSpeechStopped(); coordinator.beginGeneration(id);
 }
 
+test('nonplaying preparation shares8-attempt ownership and retains one fresh final waiting slot', async () => {
+  const { coordinator, time, requests } = setup({ listeningDelayMs: 0,
+    selectCue: async request => { requests.push(request); return { phrase_id: 'silence', reason: 'uncertain' }; } });
+  coordinator.userSpeechStarted();
+  assert.equal(coordinator.reservePreparationBudget(), true);
+  assert.equal(coordinator.reservePreparationBudget(), false, 'Preparation also respects350ms request cadence');
+  await time.advance(350); assert.equal(coordinator.reservePreparationBudget(), true);
+  await time.advance(350); assert.equal(coordinator.reservePreparationBudget(), false, 'Only two preparations per utterance');
+  for (let index = 0; index < 6; index++) {
+    coordinator.updatePartial(`Please explain the vehicle service option ${index}`, { revision: index + 1 });
+    await time.advance(350);
+  }
+  assert.equal(requests.filter(row => row.phase === 'listening').length, 5);
+  assert.equal(coordinator.utteranceRequestCount(), 7);
+  coordinator.userSpeechStopped(); coordinator.beginGeneration('prepared-main'); await time.advance(0);
+  assert.equal(requests.filter(row => row.phase === 'waiting').length, 1);
+  assert.equal(coordinator.utteranceRequestCount(), 8); assert.equal(coordinator.requests, 8);
+  coordinator.close();
+});
+
+test('preparation cannot bypass a sensitive gate or the rolling request window by starting a new utterance', async () => {
+  const { coordinator, time } = setup({ maxRequests: 2 }); coordinator.userSpeechStarted();
+  coordinator.setSensitive(true); assert.equal(coordinator.reservePreparationBudget(), false);
+  coordinator.setSensitive(false); assert.equal(coordinator.reservePreparationBudget(), true);
+  await time.advance(350); assert.equal(coordinator.reservePreparationBudget(), true);
+  coordinator.userSpeechStopped(); coordinator.userSpeechStarted();
+  assert.equal(coordinator.preparationRequests, 0); assert.equal(coordinator.reservePreparationBudget(), false);
+  await time.advance(15000); assert.equal(coordinator.reservePreparationBudget(), true); coordinator.close();
+});
+
 test('remaining server TTL is not subtracted twice from a delayed HTTP selection', async () => {
   const done = deferred(), { coordinator, time, output } = setup({ selectCue: () => done.promise });
   waiting(coordinator); await time.advance(500);
