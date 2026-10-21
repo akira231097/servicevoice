@@ -164,11 +164,14 @@ class BackchannelPolicy:
         if self.owns_client and self.client is not None:await self._close_client(self.client)
 
     async def choose(self, messages, key, *, context=None, on_request=None):
-        began = time.monotonic()
+        # Python 3.12 on Windows uses 15.625 ms ticks for monotonic(), which can
+        # undercount a short blocked-loop request. perf_counter() is monotonic
+        # with the highest available resolution and includes time spent asleep.
+        began = time.perf_counter()
         info = {}
         def result(reason, phrase="silence"):
             return BackchannelDecision(phrase_id=phrase, reason=reason,
-                elapsed_ms=round((time.monotonic()-began)*1000, 3), **info)
+                elapsed_ms=round((time.perf_counter()-began)*1000, 3), **info)
         state, reason = eligible_state(messages, context)
         if state is None:return result(reason)
         if not isinstance(key, str) or not key:return result("credential_missing")
@@ -195,12 +198,12 @@ class BackchannelPolicy:
                 if set(answers) != {"acknowledgment", "delivery_language"}:return result("invalid_response")
                 selection, probabilities, confidence = parse_choice(answers["acknowledgment"], SELECTION_LABELS)
                 language, languages, language_confidence = parse_choice(answers["delivery_language"], LANGUAGE_LABELS)
-                info.update(classification_ms=round((time.monotonic()-began)*1000, 3),
+                info.update(classification_ms=round((time.perf_counter()-began)*1000, 3),
                     probability=probabilities[selection], confidence=confidence,
                     language_choice=language, language_probability=languages["cache_compatible"],
                     language_confidence=language_confidence)
                 if self.closing:return result("policy_closed")
-                if time.monotonic()-began >= self.timeout:return result("classification_deadline")
+                if time.perf_counter()-began >= self.timeout:return result("classification_deadline")
                 if language != "cache_compatible" or languages["cache_compatible"] < .99:return result("cached_language_unverified")
                 scores = sorted(probabilities.values(), reverse=True)
                 if selection == "silence":return result("classifier_silence")
