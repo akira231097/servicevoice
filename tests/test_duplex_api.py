@@ -452,6 +452,40 @@ def test_request_ttl_includes_authorization_and_fresh_read_and_is_remaining_at_r
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("elapsed,accepted", [(.799, True), (.800, False), (.801, False)])
+def test_api_and_session_share_high_resolution_clock_and_exact_transport_age_boundary(tmp_path, monkeypatch, elapsed, accepted):
+    from types import SimpleNamespace
+    from app import duplex_api
+    from test_duplex_cues import Clock
+
+    clock, reads = Clock(), []
+    monkeypatch.setattr(duplex_api, "time", SimpleNamespace(perf_counter=clock))
+
+    async def run():
+        async with harness(tmp_path) as h:
+            def fresh_snapshot(sid, token):
+                h.store.authorize(sid, token, True)
+                if reads:
+                    clock.now = elapsed
+                reads.append(True)
+                return h.store.snapshot(sid)
+            h.control.authorize = h.control.snapshot = fresh_snapshot
+            response = await h.client.post(path(h.first, "cue"), headers=headers(h.first),
+                json=cue(phase="waiting"))
+            value = response.json()
+            assert h.control.clock is clock and h.control.sessions[h.first["id"]].clock is clock
+            assert len(reads) == 2 and value["max_request_age_ms"] == 800
+            if accepted:
+                assert value["phrase_id"] == "moment" and value["expires_in_ms"] == 1
+            else:
+                assert value["phrase_id"] == "silence" and value["reason"] == "request_expired"
+                assert value["expires_in_ms"] == 0
+            # Once released by the policy its conservative reservation remains
+            # spent, even if the fresh authoritative read exhausts transport TTL.
+            assert h.control.sessions[h.first["id"]].count == len(h.policy.calls) == 1
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("guard", ["classification_throttled", "cue_spacing"])
 def test_pacing_retry_hint_is_remaining_after_authoritative_read_and_requires_new_selection(tmp_path, guard):
     from test_duplex_cues import Clock

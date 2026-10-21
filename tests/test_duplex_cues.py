@@ -301,6 +301,37 @@ def test_provider_deadline_cancels_actual_request_and_frees_capacity():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("phase", ["listening", "waiting"])
+@pytest.mark.parametrize("elapsed,accepted", [(.349, True), (.350, False), (.360, False)])
+def test_high_resolution_deadline_rejects_late_result_even_when_loop_timer_cannot_run(monkeypatch, phase, elapsed, accepted):
+    from types import SimpleNamespace
+    from app import duplex_cues
+
+    ticks = [0.]
+    monkeypatch.setattr(duplex_cues, "time", SimpleNamespace(perf_counter=lambda: ticks[0]))
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        ticks[0] = elapsed
+        return httpx.Response(200, json=provider_value(
+            "acknowledge" if phase == "listening" else "ordinary_content", phase=phase))
+
+    async def scenario():
+        scheduled = []
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            asyncio.get_running_loop().call_soon(scheduled.append, True)
+            policy = DuplexCuePolicy(client=client)
+            result = await policy.choose(TEXT, "test-key", phase=phase, context=SAFE)
+            assert scheduled == [], "transport must not yield to the event-loop timeout"
+            expected = ("neutral_ack" if phase == "listening" else "moment") if accepted else "silence"
+            assert result.phrase_id == expected
+            assert (result.reason == "classification_deadline") is (not accepted)
+            assert result.elapsed_ms == result.classification_ms == elapsed * 1000
+            assert result.requests == len(calls) == 1 and policy.active == 0
+    asyncio.run(scenario())
+
+
 class Clock:
     now = 0.
 
@@ -516,6 +547,35 @@ def test_close_and_expiry_prevent_post_call_or_slow_cues():
         session.close()
         assert (await session.choose(**args(epoch=2))).reason == "session_closed"
         assert session.count == 0
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("elapsed,accepted", [(.799, True), (.800, False), (.801, False)])
+def test_session_absolute_expiry_keeps_exact_800ms_boundary(monkeypatch, elapsed, accepted):
+    from types import SimpleNamespace
+    from app import duplex_cues
+
+    clock = Clock()
+    monkeypatch.setattr(duplex_cues, "time", SimpleNamespace(perf_counter=clock))
+
+    class BoundaryPolicy(ImmediatePolicy):
+        async def choose(self, *args, **kwargs):
+            result = await super().choose(*args, **kwargs)
+            clock.now = elapsed
+            return result
+
+    async def scenario():
+        policy = BoundaryPolicy()
+        session = DuplexCueSession(policy)
+        result = await session.choose(**args(phase="waiting"))
+        assert session.clock is clock
+        assert result.max_request_age_ms == 800
+        if accepted:
+            assert result.phrase_id == "moment" and result.expires_in_ms == 1
+            assert session.count == 1
+        else:
+            assert result.phrase_id == "silence" and result.reason == "decision_expired"
+            assert result.expires_in_ms == 0 and session.count == 0
     asyncio.run(scenario())
 
 

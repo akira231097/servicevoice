@@ -185,12 +185,14 @@ class DuplexCuePolicy(BackchannelPolicy):
     """Reuse the warmed, bounded Jev pool; keep the existing turn policy intact."""
 
     async def choose(self, text, key, *, phase, previous_assistant="", context=None, on_request=None):
-        began = time.monotonic()
+        # On Python 3.12/Windows monotonic() can have 15.625 ms ticks. QPC-backed
+        # perf_counter() keeps a blocked event loop from undercounting deadlines.
+        began = time.perf_counter()
         info = {}
 
         def result(reason, phrase="silence"):
             return BackchannelDecision(phrase_id=phrase, reason=reason,
-                elapsed_ms=round((time.monotonic() - began) * 1000, 3), **info)
+                elapsed_ms=round((time.perf_counter() - began) * 1000, 3), **info)
 
         state, reason = cue_state(text, phase, previous_assistant, context)
         if state is None:
@@ -231,13 +233,13 @@ class DuplexCuePolicy(BackchannelPolicy):
                 labels = WAITING_LABELS if phase == "waiting" else CUE_LABELS
                 selection, probabilities, confidence = parse_choice(answers["cue"], labels)
                 language, languages, language_confidence = parse_choice(answers["delivery_language"], LANGUAGE_LABELS)
-                info.update(classification_ms=round((time.monotonic() - began) * 1000, 3),
+                info.update(classification_ms=round((time.perf_counter() - began) * 1000, 3),
                     probability=probabilities[selection], confidence=confidence,
                     language_choice=language, language_probability=languages["cache_compatible"],
                     language_confidence=language_confidence)
                 if self.closing:
                     return result("policy_closed")
-                if time.monotonic() - began >= self.timeout:
+                if time.perf_counter() - began >= self.timeout:
                     return result("classification_deadline")
                 if language != "cache_compatible" or languages["cache_compatible"] < .99:
                     return result("cached_language_unverified")
@@ -276,7 +278,7 @@ class DuplexCueSession:
     def __init__(self, policy, *, max_cues=4, max_classifications=64, cooldown_seconds=15,
                  minimum_interval_seconds=.30, minimum_cue_spacing_seconds=.30,
                  decision_ttl_ms=800, budget_window_seconds=15,
-                 max_classifications_per_turn=8, clock=time.monotonic):
+                 max_classifications_per_turn=8, clock=None):
         if type(max_cues) is not int or not 1 <= max_cues <= 8:
             raise ValueError("Duplex cue budget must be between one and eight.")
         if type(max_classifications) is not int or not 1 <= max_classifications <= 256:
@@ -291,7 +293,7 @@ class DuplexCueSession:
             raise ValueError("A bounded rolling budget window is required.")
         if type(decision_ttl_ms) is not int or not 100 <= decision_ttl_ms <= 1500:
             raise ValueError("Bounded cue expiry is required.")
-        self.policy, self.clock = policy, clock
+        self.policy, self.clock = policy, time.perf_counter if clock is None else clock
         self.max_cues, self.cooldown = max_cues, cooldown_seconds
         self.max_classifications, self.classifications = max_classifications, 0
         self.budget_window = budget_window_seconds

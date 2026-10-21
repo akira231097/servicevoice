@@ -95,7 +95,7 @@ class DuplexControl:
         self.audio = None
         self.events = {}
         self.decisions = {}
-        self.clock = time.monotonic
+        self.clock = time.perf_counter
         self.creating = set()
         self.created = set()
         self.calls = {}
@@ -133,7 +133,7 @@ class DuplexControl:
             if sid not in self.sessions:
                 if len(self.sessions) >= 64:
                     raise HTTPException(429, "Duplex session capacity reached.")
-                self.sessions[sid] = DuplexCueSession(self.policy)
+                self.sessions[sid] = DuplexCueSession(self.policy, clock=self.clock)
                 self.events[sid] = []
                 self.decisions[sid] = deque(maxlen=256)
             return self.sessions[sid]
