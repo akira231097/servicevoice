@@ -13,6 +13,7 @@
 !app/static/vendor/vapi.js
 !deploy/
 !deploy/server.py
+!deploy/tts_server.py
 !deploy/build_sqlite.py
 !deploy/runtime_health.py
 !deploy/label_sandbox.py

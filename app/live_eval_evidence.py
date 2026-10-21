@@ -375,6 +375,15 @@ def latency(call, timings=()):
     values = [r.get("milestones_ms",{}).get("first_text") for r in timings if r.get("outcome") == "completed"]
     values = [v for v in values if numeric(v) is not None]
     if values:result["server_first_text_p95_ms"] = percentile(values)
+    acknowledged=[r for r in timings if isinstance(r,dict) and isinstance(r.get("backchannel"),dict)
+                  and numeric(r["backchannel"].get("emitted_ms")) is not None]
+    if acknowledged:
+        ack_times=[r["backchannel"]["emitted_ms"] for r in acknowledged]
+        result["acknowledgment_observed"]=True
+        result["server_first_ack_p95_ms"]=percentile(ack_times)
+        result["server_acknowledgments_emitted"]=len(acknowledged)
+        if values:result["server_substantive_text_p95_ms"]=percentile(values)
+        result["provider_latency_scope"]="may_include_acknowledgments_not_substantive_answers"
     result["interpretation"] = "Vapi-reported milliseconds; server first text excludes speech and transport. No acoustic calibration."
     return result
 

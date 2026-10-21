@@ -411,6 +411,16 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
             if checks[dimension]["verdict"] in {"pass","not_applicable"}:
                 checks[dimension]=check("uncertain","incomplete_evidence_prevents_pass",["state"])
     metrics=latency(call,timings)
+    # A dropped timing row must not make an observed filler disappear from
+    # the latency guard. Only explicit events for this exact call qualify.
+    expected_key=hashlib.sha256(call["id"].encode()).hexdigest()
+    diagnostic_rows=diagnostics.get("events",[]) if isinstance(diagnostics,dict) else []
+    if isinstance(diagnostic_rows,list) and any(isinstance(row,dict) and row.get("call_key")==expected_key
+            and row.get("component")=="gateway" and row.get("event")=="backchannel.emitted"
+            and row.get("outcome")=="observed" for row in diagnostic_rows):
+        metrics["acknowledgment_observed"]=True
+        metrics["provider_latency_scope"]="may_include_acknowledgments_not_substantive_answers"
+        metrics["acknowledgment_evidence_basis"]="explicit_call_scoped_gateway_event"
     # The timing DB query is call-scoped; also reject inconsistent payload
     # stamps rather than attach a valid generation from a different call.
     try:
@@ -428,6 +438,9 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     checks["latency_within_target"] = check("uncertain" if turn is None else "pass" if turn<=config.latency_target_ms else "fail","vapi_turn_average_target")
     tail=metrics.get("turn_p95_ms")
     checks["latency_tail_within_target"] = check("uncertain" if tail is None else "pass" if tail<=config.latency_target_ms*1.5 else "fail","vapi_turn_p95_target")
+    if metrics.get("acknowledgment_observed"):
+        for metric in ("latency_within_target","latency_tail_within_target"):
+            checks[metric]=check("uncertain","acknowledgment_may_mask_substantive_answer_delay")
     state=package["evidence"]["state"]
     index={}
     for ref,item in package["evidence"].items():
@@ -512,7 +525,9 @@ def feedback_rows(run_id,report):
             "comment":"Coverage only: bounded provider log capture, not agent quality, audible interruption or phone playback proof."}
     for key,value in report["latency"].items():
         if type(value) in (int,float):
-            yield {"key":"latency_"+key,"score":value,"value":value,"comment":"Milliseconds, except measured_turns (count). Lower latency is better."}
+            comment=("Count of observed measurements, not a duration." if key in {"measured_turns","server_acknowledgments_emitted"}
+                     else "Milliseconds. Lower latency is better; server yield is not phone playback.")
+            yield {"key":"latency_"+key,"score":value,"value":value,"comment":comment}
 
 
 def upgrade_v1_metrics(report,call,timings,config):
@@ -528,6 +543,9 @@ def upgrade_v1_metrics(report,call,timings,config):
     for key,metric,multiplier in (("latency_within_target","turn_avg_ms",1),("latency_tail_within_target","turn_p95_ms",1.5)):
         value=report["latency"].get(metric)
         report["checks"][key]=check("uncertain" if value is None else "pass" if value<=config.latency_target_ms*multiplier else "fail","measured_voice_latency_target")
+    if report["latency"].get("acknowledgment_observed"):
+        for key in ("latency_within_target","latency_tail_within_target"):
+            report["checks"][key]=check("uncertain","acknowledgment_may_mask_substantive_answer_delay")
     report["needs_review"]=any(c["verdict"] in {"fail","uncertain"} for c in report["checks"].values())
     return report
 

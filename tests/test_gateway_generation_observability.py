@@ -83,9 +83,58 @@ def test_legacy_frozen_projection_keeps_absent_optional_codes_on_export_retry():
     cached=json.loads(json.dumps(projected))
     retried=build_gateway_generation_runs(cached,**target)
     assert retried==original
-    optional={'narration_reason','jev_reason','eof_drain_outcome'}
+    optional={'narration_reason','jev_reason','eof_drain_outcome','backchannel'}
     assert not optional.intersection(cached['generations'][0])
     assert not optional.intersection(retried['runs'][0]['outputs']['observed_generation'])
+
+
+def test_backchannel_evidence_survives_repeated_projection_and_langsmith_export():
+    source=row()
+    source['backchannel']={'phrase_id':'moment','reason':'emitted','emitted_ms':55,
+        'classification_ms':28.5,'probability':.999,'confidence':.99,'requests':1,
+        'policy_elapsed_ms':31.5,'language_choice':'cache_compatible',
+        'language_probability':1.0,'language_confidence':.999,'audible_playback':'unverified'}
+    projected=project_gateway_timings([source]);target=destination()
+    observed=projected['generations'][0]['backchannel']
+    assert observed['emitted_ms']==55
+    assert observed['classification_ms']==28.5
+    assert observed['requests']==1 and observed['probability']==.999
+    assert observed['language_choice']=='cache_compatible'
+    assert observed['evidence_scope']=='gateway_yield_not_audible_playback'
+    assert 'audible_playback' not in observed
+    assert project_gateway_timings(projected['generations'])==projected
+    child=build_gateway_generation_runs(projected,**target)['runs'][0]
+    assert child['outputs']['observed_generation']['backchannel']==observed
+    assert child['outputs']['phone_playback_verified'] is False
+
+
+def test_backchannel_projection_drops_unknown_text_and_invalid_typed_values():
+    source=row();private='PRIVATE CUSTOMER CREDENTIAL'
+    source['backchannel']={'phrase_id':private,'reason':private,'emitted_ms':True,
+        'classification_ms':float('inf'),'probability':1.1,'confidence':-1,
+        'requests':True,'language_choice':private,'text':private,'audio_url':private}
+    exported=build_gateway_generation_runs(project_gateway_timings([source]),**destination())
+    assert private not in json.dumps(exported)
+    cue=exported['runs'][0]['outputs']['observed_generation']['backchannel']
+    assert cue.get('phrase_id') is None and cue.get('emitted_ms') is None
+    assert 'text' not in cue and 'audio_url' not in cue
+
+
+@pytest.mark.parametrize('emitted',[350.501,-1,float('nan')])
+def test_backchannel_emission_outside_observed_generation_is_not_an_inferred_instant(emitted):
+    source=row();source['backchannel']={'phrase_id':'moment','reason':'emitted','emitted_ms':emitted}
+    projected=project_gateway_timings([source])
+    cue=projected['generations'][0]['backchannel']
+    assert cue.get('emitted_ms') is None
+    assert project_gateway_timings(projected['generations'])==projected
+
+
+def test_conflicting_backchannel_evidence_excludes_generation_instead_of_silent_overwrite():
+    source=row();source['backchannel']={'phrase_id':'moment','reason':'emitted','emitted_ms':55}
+    changed=copy.deepcopy(source);changed['backchannel']['emitted_ms']=60
+    result=project_gateway_timings([source,changed])
+    assert not result['generations']
+    assert result['coverage']['skipped_row_counts']=={'conflicting_generation_identity':1}
 
 
 def test_old_request_id_never_becomes_a_generation_identity():

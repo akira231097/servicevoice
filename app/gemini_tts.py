@@ -212,9 +212,21 @@ class GeminiTTS:
         self.capacity, self.timeout = asyncio.Semaphore(max_concurrency), timeout_seconds
         self.client_lock = asyncio.Lock()
         self.resampler_ready = False
+        self.backchannel_cache = None
 
     async def start(self):
         async with self.client_lock:
+            settings = self.settings()
+            if settings.get("SERVICEVOICE_BACKCHANNELS") == "on" and self.backchannel_cache is None:
+                def warm_cache():
+                    from pathlib import Path
+                    from .backchannel_audio import AudioSpec, BackchannelAudioCache
+                    path = Path(settings.get("SERVICEVOICE_BACKCHANNEL_AUDIO_MANIFEST", ""))
+                    cache = BackchannelAudioCache(path.parent, AudioSpec(
+                        model=settings.get("GEMINI_TTS_MODEL", DEFAULT_MODEL), voice=settings.get("GEMINI_TTS_VOICE", "Kore")))
+                    cache.load_manifest(path)
+                    return cache
+                self.backchannel_cache = await asyncio.to_thread(warm_cache)
             if not self.resampler_ready:
                 # Local imports/filter initialization belong in app readiness,
                 # before the first caller. Missing conversion dependencies fail
@@ -287,17 +299,27 @@ class GeminiTTS:
         try:
             async with asyncio.timeout(self.timeout):
                 await self.start()
-                request = self.client.build_request("POST", API_BASE+model+":streamGenerateContent?alt=sse",
-                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                    json=request_body(text, rate, voice))
-                upstream = await self.client.send(request, stream=True)
-                observe("tts.upstream_connected", upstream_http_status=upstream.status_code)
-                if upstream.status_code != 200:
-                    code = "tts_upstream_rate_limited" if upstream.status_code == 429 else "tts_upstream_rejected"
-                    raise TTSError(code, 503 if upstream.status_code == 429 else 502)
-                if "text/event-stream" not in upstream.headers.get("content-type", "").lower():
-                    raise TTSError("tts_upstream_wrong_content_type")
-                audio = pcm_chunks(upstream, rate, metadata=audio_metadata)
+                hit = (self.backchannel_cache.lookup_pcm(text, rate, model=model, voice=voice)
+                       if settings.get("SERVICEVOICE_BACKCHANNELS") == "on" and self.backchannel_cache is not None else None)
+                if hit is not None:
+                    pcm, metadata = hit
+                    audio_metadata.update(metadata, synthesis_source="pregenerated_cache")
+                    observe("tts.cache_hit", observation_scope="server_bytes_only_not_audible_playback")
+                    async def cached_audio():yield pcm
+                    audio = cached_audio()
+                else:
+                    audio_metadata["synthesis_source"] = "live_google"
+                    request = self.client.build_request("POST", API_BASE+model+":streamGenerateContent?alt=sse",
+                        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                        json=request_body(text, rate, voice))
+                    upstream = await self.client.send(request, stream=True)
+                    observe("tts.upstream_connected", upstream_http_status=upstream.status_code)
+                    if upstream.status_code != 200:
+                        code = "tts_upstream_rate_limited" if upstream.status_code == 429 else "tts_upstream_rejected"
+                        raise TTSError(code, 503 if upstream.status_code == 429 else 502)
+                    if "text/event-stream" not in upstream.headers.get("content-type", "").lower():
+                        raise TTSError("tts_upstream_wrong_content_type")
+                    audio = pcm_chunks(upstream, rate, metadata=audio_metadata)
                 first = await anext(audio)
                 first_ms = round((time.perf_counter()-started)*1000, 3)
                 observe("tts.first_audio_ready", first_audio_ms=first_ms)
