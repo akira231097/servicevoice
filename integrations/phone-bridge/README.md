@@ -38,12 +38,24 @@ reference for outbound Asterisk PCM. The second run preserved all48000 caller PC
 and its complete cue/main sequence matched the exact codec reference. Both
 legs drained. Its wrapper still exited1 because a Windows line ending remained
 on a shell command; that failure is retained separately from the media pass.
-Shell scripts now use LF explicitly; a clean wrapper rerun remains pending.
+The third run completed with exit0 and confirmed cleanup, preserving all caller
+bytes and the full cue/main output. All existing containers stayed unchanged.
+The fourth run repeated that media proof through the private Unix ingress,
+including directory/socket permissions and bearer rejection.
+The fifth run also released local speech259ms after the last real caller
+packet and continued encoded silence for999ms without a zero RTP packet;
+all48000 original bytes and the complete assistant sequence remained intact.
+These are digital loopback results; provider SIP/TLS/SRTP remains unverified.
 
 ## Runtime boundaries
 
-- The webhook and AudioSocket listeners bind only `127.0.0.1`, ports8790 and9019.
-  A reverse proxy may expose only `POST /phone-bridge/ingress` over existing TLS.
+- The default webhook and AudioSocket listeners bind only `127.0.0.1`, ports8790
+  and9019. For the existing Docker edge, the approved optional ingress uses only
+  `/run/servicevoice-phone/ingress.sock`, in a same-owner0700 directory, with a
+  0600 socket. No HTTP TCP port opens in that mode. Mount that dedicated directory
+  into the edge's existing writable data volume as `/data/phone-bridge/`; its
+  reverse proxy exposes only `POST /phone-bridge/ingress` over existing TLS.
+  AudioSocket remains loopback-only in the shared host network namespace.
 - A separate phone webhook bearer authenticates admission. The bridge checks
   the configured organization and exact number, then reads that exact live call
   from Vapi before issuing a15-second random, one-use UUID. Caller ID grants no
@@ -55,12 +67,19 @@ Shell scripts now use LF explicitly; a clean wrapper rerun remains pending.
   and continuous input encoder are ready. Outer and inner call IDs are bound
   once; telemetry contains hashes. No PCM is sent before media attaches. An
   unclaimed prewarm is stopped at the original15-second admission expiry.
-  One active call is the default. The256-entry ledger fails closed when full;
-  restart only after all calls have ended. A restart invalidates unused grants.
+  One active call is the default. The256-entry admission ledger fails closed
+  when full. Only exact provider-ended ownership can retire an ended row after
+  its original grant expires. Every later webhook still verifies the provider
+  call's live state, and retired UUIDs remain unusable.
 - Asterisk `AudioSocket()` supplies8kHz mono signed PCM16LE. Input uses the
   existing streaming16kHz encoder and energy detector. Output uses a stateful
   anti-alias lowpass before8kHz decimation. The optional16kHz channel-driver
   mode is not the default and needs an Asterisk version/module check.
+- Input advances on the owned10ms clock. It preserves queued caller bytes in
+  order, allows at most120ms of pending jitter, and supplies silence on a
+  missing-input interval. Carrier DTX therefore advances the ASR tail and local
+  speech release without requiring a zero RTP packet. A burst is paced rather
+  than compressed into immediate callbacks; excess input fails explicitly.
 - Output is paced in10ms frames. Complete cached cues must be at most1100ms.
   First main PCM fixes a cue-end barrier, later packets do not extend it, and
   one queue prevents simultaneous cue/main samples. Confirmed interruption
@@ -70,18 +89,30 @@ Shell scripts now use LF explicitly; a clean wrapper rerun remains pending.
   Prewarming holds the complete greeting in the bounded3-second output queue.
   Overflow fails and stops both legs rather than discarding greeting audio.
   The provider receives its SIP destination only when the input path is ready,
-  so the first attached caller bytes reach the streaming encoder immediately.
+  so the first attached caller bytes reach the next owned input clock tick.
   A late allocation response remains owned and is observed for exact cleanup.
+- The Linux launcher requires a private durable ownership journal. It records
+  the original leg before prewarm and allocation intent before the paid API
+  request, binds a returned inner ID once, and clears a row only after both
+  exact legs read back ended. A200 stop acknowledgment is insufficient.
+  Unknown allocation or cleanup keeps admission closed and survives restart;
+  scoped provider reconciliation is required before the process can reopen.
 - Caller hangup, provider end or shutdown closes owned media and the inner
   session, then verifies/stops the exact outer call if it remains active.
   A control acknowledgment is not proof that a remote carrier leg ended.
+- Health counts ending and unclaimed owners until late allocation cleanup has
+  settled. Certificate rotation uses bearer-authenticated Unix-only drain and
+  resume controls, bound to one random token, before checking complete idleness.
+  The public proxy exposes neither control. Failed or unconfirmed rotation
+  retains closed admission; it must not treat removed local sessions as idle.
 - DTMF is currently validated and ignored. It cannot authorize any action.
 
 ## Deployment preparation
 
 Use existing server capacity. Do not purchase a number or new infrastructure as
-part of these files. Run the existing isolated console against its disposable
-candidate database, never the production booking database. Node22+ is required.
+part of these files. The default isolated console uses its disposable candidate
+database. Production admission is a separate default-off mode described below;
+it has not yet established live phone acceptance. Node22+ is required.
 
 The private environment must provide `SERVICEVOICE_PHONE_BRIDGE=on`,
 `VAPI_API_KEY`, a separate `VAPI_PHONE_WEBHOOK_SECRET` of at least32 characters,
@@ -91,7 +122,7 @@ The private environment must provide `SERVICEVOICE_PHONE_BRIDGE=on`,
 Start the foreground process with:
 
 ```sh
-node scripts/serve_phone_bridge.mjs --env-file /run/secrets/phone-bridge.env --console-url http://127.0.0.1:8785
+node scripts/serve_phone_bridge.mjs --env-file /run/secrets/phone-bridge.env --ownership-file /run/phone-state/ownership.json --console-url http://127.0.0.1:8785
 ```
 
 The Asterisk template needs a public hostname with a valid certificate/private
@@ -121,6 +152,11 @@ PCM ingress. It does not invoke the external Vapi transport or policy model.
 The lab image uses Ubuntu's packaged Node for the injected session only; the
 real provider bridge requires Node22+ with its native WebSocket.
 
+The retained final network-isolated lab also verifies Unix ingress, exact first
+caller PCM, microphone release during a no-RTP pause, continued encoder tail,
+admission drain controls and durable ownership cleanup against injected terminal
+provider responses. Actual encrypted provider/carrier acceptance is separate.
+
 A temporary random Vapi SIP-URI resource can supply a provider test entrypoint
 without changing the main saved number. An owned SIP client calls that URI,
 whose authenticated assistant-request forwards to the isolated secure bridge.
@@ -129,6 +165,16 @@ is created by these files. Vapi-managed numbers cannot originate outbound calls
 without an imported number or trunk, so a direct outbound test cannot be assumed
 from the currently available account. SIP ingress alone does not establish PSTN
 carrier ingress behavior.
+
+For the existing short-lived IP certificate, mount its entire owned certificate
+DIRECTORY read-only into Asterisk, so atomic renewal does not leave a stale file
+bind. A transport reload strategy must validate certificate/key matching, SAN,
+expiry and the newly served fingerprint. Reload only the owned isolated Asterisk
+when it and the bridge are idle; reject new admissions/stop the isolated service
+if renewal cannot be confirmed before the expiry safety window. The short-lived
+certificate is not a reason to ship a static long-running configuration. Public
+activation remains separate from the candidate image upgrade and requires a
+reviewed rollback for the edge fragment, signaling firewall and owned containers.
 
 ## Required acceptance before main routing
 
@@ -151,6 +197,29 @@ carrier ingress behavior.
    intelligibility and actual media cancellation. Digital loopback evidence
    cannot establish physical room echo or every handset acoustic condition;
    report that limit without presenting browser evidence as phone acceptance.
+
+The exact accepted main assistant explicitly permits300 seconds, matching this
+isolated bridge's duration. Its account concurrency is not exposed by the
+assistant readback. Capacity1 and a256-entry admission ledger remain bounded
+limits. Verified-ended retirement is implemented; account capacity still needs
+matching before broader main routing.
+
+## Canonical backend admission (default off)
+
+Setting `SERVICEVOICE_PHONE_BRIDGE_ADMISSION=on` additionally requires a private
+loopback `SERVICEVOICE_PHONE_BRIDGE_ADMISSION_URL` and a distinct
+`SERVICEVOICE_PHONE_BRIDGE_CONTROL_SECRET`. The matching backend flag must also
+be enabled. The bridge then obtains one canonical live session from the shared
+phone admission and booking database, marks allocation once before its paid
+provider request, and binds the exact returned inner call. It retains the outer
+call's original300-second limit, subtracting admission network time.
+
+Local journal retirement requires independent terminal readbacks for both legs
+and confirmed backend closure. Delayed known terminal states are reconciled
+with bounded read-only retries. Unknown allocation outcomes are never replayed
+and keep admission closed. A marker request whose outcome is unknown can
+conservatively retain ownership even when no provider allocation is observed;
+scoped reconciliation is required rather than assuming free capacity.
 
 ## Primary contracts
 

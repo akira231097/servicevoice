@@ -5,7 +5,7 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin
     && rm -rf /var/lib/apt/lists/*
 COPY integrations/phone-bridge/lab/config/ /etc/asterisk/
 COPY app/static/duplex-session.js app/static/duplex-coordinator.js app/static/duplex-microphone.js /repo/app/static/
-COPY integrations/phone-bridge/media.mjs integrations/phone-bridge/server.mjs /repo/integrations/phone-bridge/
+COPY integrations/phone-bridge/media.mjs integrations/phone-bridge/server.mjs integrations/phone-bridge/ownership.mjs /repo/integrations/phone-bridge/
 COPY integrations/phone-bridge/lab/ /lab/
 RUN printf '{"type":"module"}\n' > /repo/package.json && chmod -R a+rX /etc/asterisk /repo /lab
 WORKDIR /out

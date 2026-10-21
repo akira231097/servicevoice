@@ -6,6 +6,7 @@ endpoint_identifier_order=ip
 [transport-phone-bridge-tls]
 type=transport
 protocol=tls
+allow_reload=yes
 bind=0.0.0.0:5061
 method=tlsv1_2
 cert_file=@TLS_CERTIFICATE_FILE@

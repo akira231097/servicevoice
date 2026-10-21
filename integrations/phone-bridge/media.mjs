@@ -59,11 +59,17 @@ export class PhoneAdmissions {
       || !Number.isInteger(lifetimeMs) || lifetimeMs < 1000 || lifetimeMs > 30000) throw new Error('phone_admission_configuration');
     this.organizationId = organizationId; this.phoneNumberId = phoneNumberId; this.now = now;
     this.lifetimeMs = lifetimeMs; this.capacity = capacity; this.calls = new Map(); this.tokens = new Map();
+    this.retired = 0;
   }
   issue(call) {
     // The HTTP boundary authenticates the separate provider webhook before here.
     if (call?.type !== 'inboundPhoneCall' || !uuid.test(call.id || '') || call.orgId !== this.organizationId
       || call.phoneNumberId !== this.phoneNumberId || call.status === 'ended' || call.endedAt) throw new Error('phone_identity_rejected');
+    // Only terminal provider readback grants retirement. Old grants expire
+    // first; every new HTTP admission independently rechecks the provider call.
+    for (const row of this.calls.values()) if (row.providerEnded && row.expiresAt <= this.now()) {
+      this.calls.delete(row.outerCallId); this.tokens.delete(row.token); this.retired++;
+    }
     const existing = this.calls.get(call.id);
     if (existing) {
       if (existing.state === 'issued' && this.now() < existing.expiresAt) return existing;
@@ -85,6 +91,10 @@ export class PhoneAdmissions {
     row.innerCallId = innerCallId;
   }
   end(row) { if (this.calls.get(row?.outerCallId) === row) row.state = 'ended'; }
+  confirmEnded(row) {
+    if (this.calls.get(row?.outerCallId) !== row || row.state !== 'ended') throw new Error('phone_end_confirmation');
+    row.providerEnded = true;
+  }
 }
 
 // Use the tested speech-turn adapter with a server clock and a private PCM input.
@@ -171,23 +181,46 @@ export class PhonePlayback {
 }
 
 export class PhoneMicrophone {
-  constructor({ inputSampleRate = 8000, onFrame, onSpeech = () => {}, onLevel = () => {} } = {}) {
+  constructor({ inputSampleRate = 8000, onFrame, onSpeech = () => {}, onLevel = () => {}, onOverflow = () => {} } = {}) {
     this.encoder = new StreamingPcmEncoder({ inputSampleRate });
     this.detector = new EnergySpeechDetector({ onActivity: onSpeech });
     this.onFrame = onFrame; this.onLevel = onLevel; this.closed = false; this.muted = false;
+    this.inputSampleRate = inputSampleRate; this.queue = []; this.queuedBytes = 0;
+    this.maxBytes = inputSampleRate * 2 * .12; this.onOverflow = onOverflow;
+    this.silenceSamples = 0;
   }
   async start() { if (this.closed) throw new Error('phone_input_closed'); }
   push(bytes) {
     if (this.closed) return;
-    const data = pcm(bytes), input = new Float32Array(data.length / 2);
+    const data = pcm(bytes);
+    if (this.queuedBytes + data.length > this.maxBytes) {
+      this.onOverflow(); throw new Error('phone_input_jitter_bound');
+    }
+    this.queue.push({ data, offset: 0 }); this.queuedBytes += data.length;
+  }
+  tick() {
+    if (this.closed) return;
+    // AudioSocket has no timestamps. Advance one real10ms interval per owned
+    // media tick, never a burst backlog. DTX/pause becomes explicit silence so
+    // the ASR and local release detector keep advancing after the last packet.
+    const data = Buffer.alloc(this.inputSampleRate / 100 * 2);
+    let written = 0;
+    while (written < data.length && this.queue.length) {
+      const row = this.queue[0], count = Math.min(data.length - written, row.data.length - row.offset);
+      row.data.copy(data, written, row.offset, row.offset + count);
+      row.offset += count; written += count; this.queuedBytes -= count;
+      if (row.offset === row.data.length) this.queue.shift();
+    }
+    this.silenceSamples += (data.length - written) / 2;
+    const input = new Float32Array(data.length / 2);
     for (let i = 0; i < input.length; i++) input[i] = this.muted ? 0 : data.readInt16LE(i * 2) / 32768;
     for (const frame of this.encoder.push(input)) {
       if (!this.muted) this.detector.push(frame);
       this.onLevel(frame.rms); this.onFrame(frame); // Never gate caller input on output.
     }
   }
-  setMuted(value) { this.muted = Boolean(value); this.detector.reset(); this.encoder.reset({ preserveSequence: true }); }
-  async stop() { this.closed = true; this.detector.reset({ notify: false }); }
+  setMuted(value) { this.muted = Boolean(value); this.queue = []; this.queuedBytes = 0; this.detector.reset(); this.encoder.reset({ preserveSequence: true }); }
+  async stop() { this.closed = true; this.queue = []; this.queuedBytes = 0; this.detector.reset({ notify: false }); }
 }
 
 // Asterisk AudioSocket() uses8kHz. A stateful63tap lowpass precedes decimation;

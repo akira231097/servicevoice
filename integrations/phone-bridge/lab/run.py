@@ -104,8 +104,26 @@ def main():
                                      (OUT / 'bridge-input.pcm').read_bytes())
         if node.returncode != 0 or report['bridge']['outer_state'] != 'ended' or report['bridge']['remaining_owned'] != 0:
             raise RuntimeError('owned_bridge_did_not_drain')
+        if report['bridge']['ownership_cleanup'] != {'provider_ownership_verified': True, 'ownership_unknown': 0}:
+            raise RuntimeError('synthetic_owned_ledger_did_not_verify_and_release')
         if not report['bridge']['inner_bound'] or report['bridge']['input_frames'] < 100:
             raise RuntimeError('caller_media_not_continuous')
+        # SIPp emits3s RTP then pauses without zero RTP before BYE. The owned
+        # clock must continue the ASR tail and release local speech on that gap.
+        bridge_result = report['bridge']
+        releases = [e for e in bridge_result['speech_events'] if not e['active']]
+        if not any(e['active'] for e in bridge_result['speech_events']) or not releases:
+            raise RuntimeError('carrier_dtx_did_not_release_local_speech')
+        release_after_carrier_ms = releases[-1]['at_ms'] - bridge_result['last_carrier_at_ms']
+        if not 0 < release_after_carrier_ms < 500:
+            raise RuntimeError('carrier_dtx_release_outside_bound')
+        if bridge_result['last_encoded_at_ms'] - bridge_result['last_carrier_at_ms'] < 500 or bridge_result['input_silence_samples'] < 4000:
+            raise RuntimeError('carrier_dtx_asr_tail_did_not_advance')
+        report['carrier_dtx'] = {'no_zero_rtp_required': True, 'local_stop_after_last_carrier_ms': round(release_after_carrier_ms, 3),
+                                 'encoded_tail_ms': round(bridge_result['last_encoded_at_ms'] - bridge_result['last_carrier_at_ms'], 3),
+                                 'silence_samples': bridge_result['input_silence_samples'], 'passed': True}
+        if not bridge_result['drain_controls']:
+            raise RuntimeError('private_admission_drain_not_proven')
         report['passed'] = report['protocol']['passed']
     except Exception as error:
         report['failure'] = str(error)[:200]

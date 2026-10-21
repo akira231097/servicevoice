@@ -1,5 +1,6 @@
-# Include only after isolated TLS/SRTP carrier acceptance and review.
-# Does not expose the private operator UI, health or raw media listener.
+# Add only after isolated Unix ingress is healthy; preserve existing routes.
 handle /phone-bridge/ingress {
-    reverse_proxy 127.0.0.1:8790
+    @not_post not method POST
+    respond @not_post 405
+    reverse_proxy unix//data/phone-bridge/ingress.sock
 }
