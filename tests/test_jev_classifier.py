@@ -1,9 +1,11 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from app import jev_classifier
 from app.jev_classifier import (ClassificationUnavailable, JEV_MODEL, JevClassifier,
                                 request_payload, route_candidate, parse_choice, LANGUAGES)
 
@@ -48,6 +50,29 @@ def test_valid_decision_and_state_language_latency_gates():
             assert route_candidate(state(utterance="తెలుగు"),d)[0]=="gemini"
             assert route_candidate(state(),d,deadline_ms=-1)[0]=="gemini"
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("elapsed,allowed", [(.349, True), (.35, False), (.36, False)])
+def test_synchronous_provider_obeys_exact_high_resolution_deadline_without_timer(monkeypatch, elapsed, allowed):
+    ticks, calls = [0.], []
+    monkeypatch.setattr(jev_classifier, "time", SimpleNamespace(perf_counter=lambda: ticks[0]))
+    def handle(request):
+        calls.append(request)
+        ticks[0] = elapsed
+        return httpx.Response(200, json=result())
+    async def scenario():
+        scheduled = []
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            asyncio.get_running_loop().call_soon(scheduled.append, True)
+            classifier = JevClassifier("synthetic-key", client=client, timeout_seconds=.35)
+            if allowed:
+                decision = await classifier.classify(state())
+                assert decision.label == "hours" and decision.elapsed_ms == elapsed * 1000
+            else:
+                with pytest.raises(ClassificationUnavailable) as error:await classifier.classify(state())
+                assert error.value.code == "timeout"
+            assert not scheduled and len(calls) == 1
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("mutation",["wrong_model","missing_option","sum","nan","not_max","bool","confidence","no_language","mixed"])

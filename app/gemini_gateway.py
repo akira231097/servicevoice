@@ -1167,6 +1167,7 @@ class GeminiGateway:
                 and call["assistantOverrides"]["variableValues"].get("servicevoice_duplex_playback") == "browser-owned-v1"))
         diagnostic_context["browser_owned_duplex"] = (
             config.get("SERVICEVOICE_BACKCHANNELS") == "on"
+            and isinstance(expected_backchannel_assistant, str) and bool(expected_backchannel_assistant)
             and call.get("assistantId") == expected_backchannel_assistant
             and isinstance(call.get("assistantOverrides"), dict)
             and isinstance(call["assistantOverrides"].get("variableValues"), dict)
@@ -1260,7 +1261,8 @@ class GeminiGateway:
             watcher = asyncio.create_task(self._watch_disconnect(request, asyncio.current_task(), watch_stop,timing.generation))
             try:
                 def classifier_started():timing.row["counts"]["jev_requests"] = 1
-                decision = await self.faq.choose(sid, call_id, upstream["messages"], config.get("TYPESAFE_API_KEY"), classifier_started)
+                decision = await self.faq.choose(sid, call_id, upstream["messages"], config.get("TYPESAFE_API_KEY"), classifier_started,
+                    allow_followup_public_faq=timing.diagnostic_context.get("browser_owned_duplex") is True)
                 self._checkpoint(timing)
                 timing.row["jev_reason"] = decision.reason
                 timing.row["durations_ms"].update(jev_route=decision.elapsed_ms, jev_classification=decision.classification_ms)
