@@ -111,7 +111,7 @@ export function createPhoneBridge(input, { fetcher = fetch, Session = DuplexSess
         for (let attempt = 0; attempt < 2; attempt++) {
           try { outerEnded = await providerEnded(row.outerCallId, 'inboundPhoneCall', config, fetcher); } catch { /* Unknown stays owned. */ }
           if (owner.allocationAttempted && inner) {
-            try { innerEnded = await providerEnded(inner, 'webCall', config, fetcher); } catch { /* Unknown stays owned. */ }
+            try { innerEnded = await providerEnded(inner, 'vapi.websocketCall', config, fetcher); } catch { /* Unknown stays owned. */ }
           }
           if (outerEnded && innerEnded) break;
           if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 200));

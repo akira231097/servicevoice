@@ -439,7 +439,7 @@ for (const innerEnded of [true, false]) test(`allocated inner call must read bac
   }
   const fetcher = async (url, options) => {
     if (String(url).endsWith('/duplex/call')) return new Response(JSON.stringify({ call_id: inner }), { status: 200 });
-    if (String(url).endsWith('/call/' + inner)) return { ok: true, json: async () => ({ id: inner, type: 'webCall',
+    if (String(url).endsWith('/call/' + inner)) return { ok: true, json: async () => ({ id: inner, type: 'vapi.websocketCall',
       orgId: org, assistantId: inner, status: innerEnded ? 'ended' : 'in-progress' }) };
     return provider(url, options);
   };
@@ -470,7 +470,7 @@ test('natural session ended event joins its actual asynchronous cleanup before t
   }
   const fetcher = async (url, options) => {
     if (String(url).endsWith('/duplex/call')) return new Response(JSON.stringify({ call_id: inner }), { status: 200 });
-    if (String(url).endsWith('/call/' + inner)) return { ok: true, json: async () => ({ id: inner, type: 'webCall',
+    if (String(url).endsWith('/call/' + inner)) return { ok: true, json: async () => ({ id: inner, type: 'vapi.websocketCall',
       orgId: org, assistantId: inner, status: innerEnded ? 'ended' : 'in-progress' }) };
     return provider(url, options);
   };
@@ -573,7 +573,7 @@ async function productionFixture(options = {}) {
       if (options.unknownAllocation) throw new Error('synthetic allocation response lost');
       return Response.json({ call_id: inner, websocket_url: 'wss://owned.vapi.ai/transport' });
     }
-    if (parsed.pathname === '/call/' + inner) return Response.json({ id: inner, orgId: org, assistantId: inner, type: 'webCall', status: 'ended' });
+    if (parsed.pathname === '/call/' + inner) return Response.json({ id: inner, orgId: org, assistantId: inner, type: options.innerType || 'vapi.websocketCall', status: 'ended' });
     if (settings.method === 'POST') { outerEnded = true; return Response.json({}); }
     return Response.json(call({ status: outerEnded ? 'ended' : 'ringing', monitor: { controlUrl: 'https://control.vapi.ai/owned' } }));
   };
@@ -644,5 +644,16 @@ test('outer lifetime subtracts the whole admission roundtrip from remaining dura
     const admitted = fixture.events.find(x => x.kind === 'phone_backend_admitted');
     assert.ok(admitted.remaining_duration_ms > 0 && admitted.remaining_duration_ms <= 465,
       'Returned remaining lifetime is reduced by time already spent awaiting admission');
+  } finally { await fixture.close(); }
+});
+
+test('inner terminal proof accepts only the observed provider WebSocket type, never a generic webCall', async () => {
+  const fixture = await productionFixture({ innerType: 'webCall' });
+  try {
+    assert.equal((await ingress(fixture.bridge)).status, 200);
+    const owner = [...fixture.bridge.sessions.values()][0]; await owner.stop('synthetic_complete');
+    assert.equal(owner.unknown, true); assert.equal(owner.verified, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(fixture.ownershipFile)).pending.length, 1);
+    assert.equal(fixture.order.filter(x => x === 'close').length, 0, 'A wrong provider type cannot reach canonical closure');
   } finally { await fixture.close(); }
 });
