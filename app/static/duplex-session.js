@@ -64,6 +64,7 @@ export class DuplexSession {
     this.provisionalAttempts = 0;
     this.ignoredEnergyOnsets = { no_output: 0, cue_only: 0, cooldown: 0 };
     this.finalSegments = []; this.haveUserUtterance = false; this.userTurnHasMainAudio = false;
+    this.latestRawUserClause = null;
     this.userTurnClosed = false; this.generationAnnouncedAfterUser = false;
     this.waitingPreparationTimer = null; this.waitingPreparation = null; this.waitingPrepared = null;
     this.preparationTextChangedAt = -Infinity; this.preparationAttemptedTexts = new Set();
@@ -561,6 +562,7 @@ export class DuplexSession {
       if (!preserveFacts) { this.partial = ''; this.finalSegments = []; }
       else if (!this.finalSegments.length && this.partial) this.finalSegments = [this.partial];
       this.revision = 0;
+      this.latestRawUserClause = null;
       this.haveUserUtterance = true; this.userTurnHasMainAudio = false;
       this.userTurnClosed = false; this.generationAnnouncedAfterUser = false;
       this.preparationAttemptedTexts.clear();
@@ -707,7 +709,10 @@ export class DuplexSession {
         const quietTail = !this.callerSpeaking && !this.providerSpeaking && !this.localSpeaking && this.partial
           && !this.userTurnClosed && this.runtime.now() - this.lastUserStoppedAt <= 750;
         const normalized = speechText(rawText);
-        const knownTail = quietTail && [this.partial, this.finalSegments.at(-1)].some(value => value
+        const rawClause = this.latestRawUserClause;
+        const currentRawClause = rawClause && rawClause.utteranceId === this.coordinator.utteranceId
+          && rawClause.revision === this.revision ? rawClause.text : null;
+        const knownTail = quietTail && [this.partial, this.finalSegments.at(-1), currentRawClause].some(value => value
           && (speechText(value) === normalized || (!final && speechText(value).startsWith(normalized))));
         if (knownTail) {
           // Some providers replay partial prefixes after final yield. Detect
@@ -718,7 +723,12 @@ export class DuplexSession {
           this.coordinator.setSensitive(blocked);
           this.coordinator.setListeningBlocked(this.snapshotListeningBlocked || listeningSensitive(rawText) || listeningSensitive(this.partial));
           this.emit('transcript_refinement_ignored', { transcript_type: final ? 'final' : 'partial', reason: 'endpointing_tail_known_words' });
-          if (final) { this.lastUserTranscriptFinal = true; this.lastFinal = this.partial; }
+          if (final) {
+            // A repeated final can commit the current clause without changing
+            // the already-classified full text or restarting its expiry clock.
+            this.assembleTranscript(rawText, true);
+            this.lastUserTranscriptFinal = true; this.lastFinal = this.partial;
+          }
           return;
         }
         // Delayed ASR finals/refinements in the endpointing tail belong to the
@@ -751,6 +761,7 @@ export class DuplexSession {
           this.cancelWaitingPreparation('partial_revised'); this.preparationTextChangedAt = this.runtime.now();
         }
         this.partial = text; this.revision += 1;
+        this.latestRawUserClause = { text: rawText, revision: this.revision, utteranceId: this.coordinator.utteranceId };
         this.lastUserTranscriptFinal = final;
         this.coordinator.setSensitive(this.snapshotHardBlocked || sensitive(text));
         if (final && !this.providerSpeaking && !this.localSpeaking) this.coordinator.updateFinal(text, { revision: this.revision });

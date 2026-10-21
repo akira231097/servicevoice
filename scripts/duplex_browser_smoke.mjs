@@ -242,6 +242,39 @@ async function timingBoundaryReplay() {
     actual_selections: 1, same_epoch_revision_generation: true, events: tail.events, graph: tail.graph });
   report.checks.known_endpointing_tail_preserved_one_complete_wait = true;
 
+  await newFixtureSession({ snapshot: { stage: 'details', proposal: { kind: 'book' } }, decisionDelayMs: 100,
+    waitingPhrase: 'one_sec', predictionEnabled: false,
+    predictionControlReason: 'repeat_uncommitted_current_clause_after_multiclause_yield' });
+  const clauseSession = sessions;
+  await page.evaluate(() => window.duplexSession.refreshSnapshot());
+  const firstClause = 'I have a vehicle and would like to explain my routine maintenance needs.';
+  const secondClause = 'I drive mostly around town and would like to understand your services.';
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'started', turn: 1 });
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: firstClause, turn: 1 });
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript: secondClause, turn: 1 });
+  sendJson(provider, { type: 'speech-update', role: 'user', status: 'stopped', turn: 1 });
+  await until(async () => await eventCount('caller_stopped') > 0, 'multiclause_caller_did_not_yield');
+  const clauseYield = await page.evaluate(() => ({ origin: window.duplexSession.startAt,
+    released: window.duplexSession.events.findLast(row => row.kind === 'caller_stopped').at_ms,
+    revision: window.duplexSession.revision, generation: window.duplexSession.generation,
+    epoch: window.duplexSession.coordinator.epoch }));
+  await delay(Math.max(0, clauseYield.origin + clauseYield.released + 347 - await page.evaluate(() => performance.now())));
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'partial', transcript: secondClause, turn: 1 });
+  await delay(7);
+  sendJson(provider, { type: 'transcript', role: 'user', transcriptType: 'final', transcript: secondClause, turn: 1 });
+  await until(() => page.evaluate(() => window.duplexGraphEvidence.starts.some(row => row.samples === 8000
+    && row.ended_ms && !row.stopped)), 'repeated_uncommitted_clause_canceled_ready_wait');
+  const clause = await page.evaluate(() => ({ events: window.duplexSession.events, graph: window.duplexGraphEvidence,
+    revision: window.duplexSession.revision, generation: window.duplexSession.generation,
+    epoch: window.duplexSession.coordinator.epoch, committed_clauses: window.duplexSession.finalSegments.length }));
+  assert.equal(clause.epoch, clauseYield.epoch); assert.equal(clause.generation, clauseYield.generation);
+  assert.equal(clause.revision, clauseYield.revision); assert.equal(clause.committed_clauses, 2);
+  assert.equal(selections(clauseSession).length, 1); assert.equal(await eventCount('caller_resumed'), 0);
+  sendJson(provider, { type: 'speech-update', role: 'assistant', status: 'started', turn: 2 }); await streamMain(provider, .1);
+  report.timing_boundaries.push({ case: 'repeated_uncommitted_second_clause_at347ms', committed_clauses: 2,
+    actual_selections: 1, full_waiting_clip: true, events: clause.events, graph: clause.graph });
+  report.checks.repeated_uncommitted_second_clause_preserved_ready_wait_and_all_facts = true;
+
   await newFixtureSession({ decisionDelayMs: 500, waitingPhrase: 'just_a_sec', predictionEnabled: false,
     predictionControlReason: 'actual_caller_resume_during_reserved_waiting_request' });
   const resumeSession = sessions;

@@ -580,6 +580,49 @@ test('late partial-prefix replay228ms after yield keeps an approved waiting requ
   assert.equal(f.events.some(row => row.kind === 'caller_resumed'), false); await f.session.stop();
 });
 
+for (const fastMain of [false, true]) {
+  test(`an identical uncommitted second-clause tail347ms after yield preserves ${fastMain ? 'the fast main generation' : 'the ready waiting cue'}`, async () => {
+    const f = fixture({ handler: request => request.url === '/api/sessions/fixture-session'
+      ? reply({ ended: false, stage: 'details', proposal: { kind: 'book' }, pending_operations: [] }) : null });
+    await f.session.start(); await f.session.refreshSnapshot(); speech(f.session, 'user', 'started');
+    const first = 'I have a vehicle and would like to explain my routine maintenance needs.';
+    const second = 'I drive mostly around town and would like to understand your services.';
+    transcript(f.session, first, true); transcript(f.session, second);
+    speech(f.session, 'user', 'stopped'); await f.time.advance(160);
+    const generation = f.session.generation, revision = f.session.revision, epoch = f.session.coordinator.epoch;
+    await f.time.advance(300);
+    if (fastMain) { speech(f.session, 'assistant', 'started'); f.session.receive(pcm().buffer); }
+    const currentEpoch = f.session.coordinator.epoch;
+    await f.time.advance(47); transcript(f.session, second); await f.time.advance(7); transcript(f.session, second, true);
+    assert.equal(f.session.callerSpeaking, false); assert.equal(f.session.generation, generation);
+    assert.equal(f.session.revision, revision); assert.equal(f.session.coordinator.epoch, currentEpoch);
+    assert.equal(f.events.some(row => row.kind === 'caller_resumed'), false);
+    assert.equal(f.session.finalSegments.join(' '), first + ' ' + second, 'The matching final commits every existing fact');
+    await f.time.advance(300);
+    assert.equal(f.output.cues.length, fastMain ? 0 : 1);
+    if (!fastMain) {
+      assert.equal(f.session.coordinator.epoch, epoch); assert.equal(f.cues().length, 1);
+      speech(f.session, 'user', 'started'); transcript(f.session, 'The vehicle is a blue sedan.', true);
+      assert.ok(f.session.partial.includes(first) && f.session.partial.includes(second) && f.session.partial.includes('blue sedan'));
+    }
+    await f.session.stop();
+  });
+}
+
+for (const tail of ['I drive mostly around town and would like to understand your services only if the price is lower.', 'Actually I need a different service.', 'Stop.']) {
+  test(`a changed second-clause tail still revokes the earlier decision: ${tail}`, async () => {
+    const f = fixture({ handler: request => request.url === '/api/sessions/fixture-session'
+      ? reply({ ended: false, stage: 'details', proposal: { kind: 'book' }, pending_operations: [] }) : null });
+    await f.session.start(); await f.session.refreshSnapshot(); speech(f.session, 'user', 'started');
+    transcript(f.session, 'I have a vehicle and need routine maintenance.', true);
+    transcript(f.session, 'I drive mostly around town and would like to understand your services.');
+    speech(f.session, 'user', 'stopped'); await f.time.advance(507);
+    const oldRequest = f.cues().find(row => row.body.phase === 'waiting'); assert.ok(oldRequest); transcript(f.session, tail);
+    assert.equal(oldRequest.options.signal.aborted, true); assert.equal(f.output.cues.length, 0);
+    await f.session.stop();
+  });
+}
+
 for (const change of ['Actually explain tire repairs instead', 'Please stop', 'Please explain the regular service options for trucks']) {
   test(`a genuinely changed tail still cancels the old waiting request: ${change}`, async () => {
     const held = deferred(); const f = fixture({ handler: request => request.url.endsWith('/duplex/cue') && !request.body.prepare_only ? held.promise : null });
