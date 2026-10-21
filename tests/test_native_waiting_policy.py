@@ -31,6 +31,7 @@ def answer(kind="information_question"):
 @pytest.mark.parametrize("text,prior,kind", [
     ("What services do you offer?", "How can I help?", "information_question"),
     ("My name is Alex Morgan.", "May I have your name?", "ordinary_detail"),
+    ("My name is Alex Morgan.", "Hi, I'm Cedar. This is an AI demo for Cedar Service, a fictional dealership. How can I help with your service?", "ordinary_detail"),
     ("Alex", "May I have your name?", "ordinary_detail"),
     ("My name is Jamie", "May I have your name?", "ordinary_detail"),
     ("Jamie", "May I have your name?", "ordinary_detail"),
@@ -69,6 +70,8 @@ def test_native_waiting_classifies_content_language_and_subject_independently(te
     ("Quisiera una cita.", "Please confirm the booking readback."),
     ("Ten AM works for me.", "Please confirm the appointment readback."),
     ("Alex Morgan", "What is your passcode?"),
+    ("My name is Alex Morgan and my phone is 555 555 0123.", "How can I help with your service?"),
+    ("My name is Alex Morgan and my email is alex@example.com.", "How can I help with your service?"),
 ])
 def test_native_hard_exclusions_do_not_send_content_to_classifier(text, prior):
     async def scenario():
@@ -187,3 +190,20 @@ def test_verified_confirmation_uses_veto_only_question_without_contradictory_glo
     assert "availability lookup" in ordinary_question["criteria"]["ordinary_content"]
     assert approval_payload["questions"]["delivery_language"] == ordinary_payload["questions"]["delivery_language"]
     assert approval_payload["questions"]["content_kind"] == ordinary_payload["questions"]["content_kind"]
+
+
+def test_introduced_full_name_after_general_greeting_is_distinct_from_private_contact_and_requested_bare_name():
+    greeting = "Hi, I'm Cedar. This is an AI demo for Cedar Service, a fictional dealership. How can I help with your service?"
+    state, _ = waiting_state(messages("My name is Alex Morgan.", greeting), SAFE)
+    assert state and state["requested_name"] is False
+    payload = waiting_payload(state)
+    fit = payload["questions"]["acknowledgment"]
+    assert "first or full name" in fit["instructions"] and "general greeting" in fit["instructions"]
+    assert "including when supplied together with a name" in fit["instructions"]
+    assert "with or without a name" in fit["criteria"]["excluded_content"]
+    assert "English first/full-name self-introduction" in payload["questions"]["content_kind"]["criteria"]["ordinary_detail"]
+    # This change does not treat an unrequested bare name as English. It still
+    # reaches the independent language question with requested_name=False.
+    bare, _ = waiting_state(messages("Alex", greeting), SAFE)
+    assert bare and bare["requested_name"] is False
+    assert "only when requested_name is true" in payload["questions"]["delivery_language"]["instructions"]

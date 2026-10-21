@@ -38,6 +38,11 @@ CASES = (
     ("romanized_language", "Na peru Ravi, naku car service kavali.", "How can I help?", SAFE, True),
     ("mixed_language", "I need car service, Telugu lo cheppu.", "How can I help?", SAFE, True),
     ("unrelated", "What is the capital city of France?", "How can I help?", SAFE, True),
+    # Preserve the original20 cases above; these holdouts reproduce the actual
+    # synthetic short-name greeting context and retain bundled privacy vetoes.
+    ("name_after_general_greeting", "My name is Alex Morgan.", "Hi, I'm Cedar. This is an AI demo for Cedar Service, a fictional dealership. How can I help with your service?", SAFE, False),
+    ("name_with_phone", "My name is Alex Morgan and my phone is 555 555 0123.", "How can I help with your service?", SAFE, True),
+    ("name_with_email", "My name is Alex Morgan and my email is alex@example.com.", "How can I help with your service?", SAFE, True),
 )
 
 

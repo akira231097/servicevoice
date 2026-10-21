@@ -100,7 +100,8 @@ def test_ack_diagnostic_interval_ends_at_emission_not_in_future(tmp_path):
         "language_choice":"cache_compatible","language_probability":1,"language_confidence":1}},
         diagnostic_context={"call_id":"synthetic-call"})
     GeminiGateway._backchannel_observation(SimpleNamespace(diagnostics=sink),timing,"backchannel.emitted",550)
-    assert sink.close()
+    # This test checks timestamp geometry, not filesystem shutdown latency.
+    assert sink.close(2)
     event=sink.snapshot("synthetic-call")["events"][0]
     assert event["start_unix"]==started
     assert event["start_unix"]+event["duration_ms"]/1000<=time.time()
