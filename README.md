@@ -34,6 +34,7 @@ The v18 baseline uses Gemini `gemini-3.8-flash` with low reasoning, Soniox speec
 - Content-free runtime tracing, synthetic reference datasets, native LangSmith experiments and hallucination checks.
 - Automatic post-call reviews with separate mechanical booking checks, advisory semantic grades, evidence coverage, response-generation lineage and measured latency. See [component observability](docs/component-observability.md).
 - Docker and single-instance Lightsail deployment packages, backup/restore tools and fault/load tests.
+- An isolated [hybrid duplex browser experiment](docs/duplex-browser.md): continuous caller audio, cached Jev listening cues and locally coordinated interruption of the main reply.
 
 An advisor request is a saved local task. It does not send a callback or transfer a live call. There is no real dealership CRM/DMS integration. Generated speech can still be wrong; these safeguards and evaluations reduce risk without guaranteeing zero hallucinations. The scheduler remains the authority for committed appointments.
 

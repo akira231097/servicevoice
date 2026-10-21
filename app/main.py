@@ -241,6 +241,7 @@ def create_app(db_path=None):
                 "jev_faq_ready":app.state.gemini_gateway.faq.ready,
                 "jev_pool_initialization_ms":app.state.gemini_gateway.faq.initialization_ms,
                 "jev_faq_version":FAQ_VERSION,"jev_model":JEV_MODEL,
+                "duplex_browser_cue_control":"browser-owned-v1",
                 "services":list(SERVICES.values()),"voice_provider":"Vapi","live_voice_available":not missing,"voice_max_duration_seconds":300,
                 "live_voice_missing":missing,"vapi_public_key":values.get("VAPI_PUBLIC_KEY") or "",
                 "vapi_assistant_id":values.get("VAPI_ASSISTANT_ID") or "",

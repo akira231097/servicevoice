@@ -1161,7 +1161,16 @@ class GeminiGateway:
         diagnostic_context["backchannel_enabled"] = (
             config.get("SERVICEVOICE_BACKCHANNELS") == "on"
             and isinstance(expected_backchannel_assistant, str) and bool(expected_backchannel_assistant)
-            and call.get("assistantId") == expected_backchannel_assistant)
+            and call.get("assistantId") == expected_backchannel_assistant
+            and not (isinstance(call.get("assistantOverrides"), dict)
+                and isinstance(call["assistantOverrides"].get("variableValues"), dict)
+                and call["assistantOverrides"]["variableValues"].get("servicevoice_duplex_playback") == "browser-owned-v1"))
+        diagnostic_context["browser_owned_duplex"] = (
+            config.get("SERVICEVOICE_BACKCHANNELS") == "on"
+            and call.get("assistantId") == expected_backchannel_assistant
+            and isinstance(call.get("assistantOverrides"), dict)
+            and isinstance(call["assistantOverrides"].get("variableValues"), dict)
+            and call["assistantOverrides"]["variableValues"].get("servicevoice_duplex_playback") == "browser-owned-v1")
         timing = RequestTiming(call_id, received_at, self.timings,
             lambda row,session:self._observe_timing(row,session,diagnostic_context),sid)
         timing.row["generation_sequence"]=sequence

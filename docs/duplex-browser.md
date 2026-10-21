@@ -1,0 +1,133 @@
+# Hybrid duplex browser experiment
+
+This branch adds an isolated browser transport that can play a short cached
+listening cue while the caller is still speaking. Caller audio keeps streaming
+to Vapi/Soniox, and Gemini continues to own the main conversation and guarded
+booking tools. This is separate from the earlier after-turn acknowledgment.
+
+The operator opens a localhost console. A server-side allocator creates a
+WebSocket call for the existing isolated assistant; its administration key never
+enters the browser or the AWS business container. The browser sends continuous
+20 ms, mono PCM16 frames at 16 kHz, including silence. One WebAudio clock owns
+both cached cues and received main audio. Neither path mutes microphone capture.
+
+## Cue decisions and speaker priority
+
+Partial transcripts are data for a bounded Jev content decision: ordinary
+vehicle/service conversation or silence. Code maps an accepted listening
+decision to `Mm-hmm.` and an accepted waiting decision to `One moment.`. Jev
+classifies the content already present without predicting the next words or
+requiring the caller to finish a request. This binary question
+avoids splitting confidence between synonymous filler phrases. An independent
+language decision is required for these fixed English recordings. Other
+languages continue through the original model without fixed-language fillers.
+
+Jev runs alongside the conversation. The primary reasoner never waits for it.
+Selection is read-only and has no access to booking actions. Corrections,
+negation, sensitive details, confirmation, urgency, prompt instructions,
+unverified state, incompatible language and missed deadlines remain silent.
+The server reads authoritative scheduler state before and after classification.
+
+One caller utterance has one cue allowance across both listening and waiting
+phases. There is also a 15-second cooldown, four-cue call cap and bounded
+classification attempts. Listening decisions use a complete-word transcript
+prefix, leaving the current unstable word out. Compatible transcript extensions
+preserve that pending decision; a rewrite inside its prefix cancels it. A
+350 ms request cadence coalesces rapid updates instead of exhausting the request
+budget. Raw sensitive changes cancel immediately, including in the omitted tail.
+New caller onsets and actual main audio also cancel queued or playing cues.
+Normal transcript refinements and a caller yielding do not cut an
+already-started acknowledgment. Selection expiry is a deadline to start, not a
+timer that truncates a word. A separate duration guard bounds runaway playback.
+
+The first main audio cancels a cue before main samples enter the output graph.
+Local microphone energy can provisionally pause owned main playback before the
+provider's interruption event arrives. Pending audio and the already-scheduled
+word suffix are preserved for up to 350 ms. A provider speech event or partial
+transcript confirms the interruption and discards the old answer; unconfirmed
+noise resumes the same answer and buffered audio. The energy detector is a
+heuristic; echo, background noise and quiet speech still need representative
+listening evaluation.
+
+For browser-owned calls, the gateway recognizes the exact
+`servicevoice_duplex_playback=browser-owned-v1` variable and suppresses its older
+after-turn cue stream. It applies only to the explicitly isolated backchannel
+assistant. Other assistants and calls keep the existing behavior.
+
+## Run the private candidate
+
+The existing candidate console must be reachable through its loopback SSH
+forward at `http://127.0.0.1:8775`. Use the existing private credential file and
+reviewed immutable local audio manifest; never paste credentials into a command.
+
+```powershell
+python scripts/serve_duplex.py --env-file PRIVATE_ENV_FILE --candidate-id ISOLATED_ASSISTANT_ID --audio-manifest PRIVATE_MANIFEST_PATH
+```
+
+Open `http://127.0.0.1:8785/duplex` and choose **Start conversation**. The page
+requests microphone permission before allocating a paid call. The full call is
+limited to five minutes. Stop closes local output/capture and requests provider
+termination through its scoped control endpoint. A short owned WebSocket
+termination is the fallback; without an acknowledgment, the termination outcome
+remains unknown until provider readback. Allocation reservations survive
+operator-process restarts in an ignored local
+SQLite ledger. Unknown allocation outcomes cannot be retried with the same
+session. The call allocator never edits an assistant or phone number.
+
+## Evidence and acceptance
+
+`scripts/benchmark_duplex_cues.py` defaults to an offline plan. Live mode uses
+synthetic partial text and saves content-free decision results under `.local`.
+The first three-choice design selected no listening cues. Its retained rerun
+with the binary decision selected seven of eight ordinary listening clauses,
+four of eight waiting examples, and silence for all 34 sensitive examples.
+Live speech recognition exposed a second gap: completed short clause fragments
+were less useful than the benchmark's long descriptions. The current semantic
+classifier recognizes ordinary vehicle ownership and usage background without
+requiring a whole service request. With the same thresholds, its retained
+segmented-clause comparison selected all 12 ordinary examples and stayed silent
+on all 15 sensitive, unclear, unrelated or language-mismatched examples. A rescore
+of the original cases selected all 16 ordinary examples and stayed silent on all
+34 sensitive examples. These development samples are behavioral evidence, not a
+production accuracy estimate.
+
+`scripts/duplex_browser_smoke.mjs --run` uses the real browser modules,
+AudioContext and AudioWorklet with a local provider replay. It tests concurrent
+microphone capture/cue playback, full clip geometry, main audio priority,
+correction cancellation, local interruption and late work. The explicit
+`--run --live` mode uses an isolated paid Vapi call and prerecorded synthetic
+caller PCM. Replay success does not establish Jev quality or external service
+compatibility; both live checks are needed.
+
+An actual isolated WebSocket call subsequently passed the listening and
+interruption gates: the cached cue overlapped voiced synthetic caller input,
+34 microphone frames continued during that cue, and the main answer remained
+audible. A second synthetic utterance interrupted the main reply. Local output
+paused before the provider interruption event, the confirmed caller turn played
+no old main audio, and the agent answered the new question. Both answer gaps
+were recorded independently from the cue. These are browser graph and provider
+integration results, with synthetic input; they do not establish room acoustics
+or human preference.
+
+The page exports content-free browser events and aggregate counters, including
+microphone frames sent during cues and during main output. Cue timing and main
+answer timing stay separate. Browser-origin events are labeled as such, rather
+than being promoted to provider or human listening evidence. LangSmith's
+existing main-call review remains a separate source of booking/generation facts.
+
+The WebSocket audio stream has no documented per-frame generation IDs. Local
+playback epochs identify owned work; they do not prove the lineage or rejection
+of every late provider/carrier packet. Missing speaker-state evidence and
+unmatched output must remain visible. A recorded synthetic test does not prove
+that an arbitrary microphone, room or phone sounds natural.
+
+This implementation is a browser candidate. The main telephone route has not
+been switched. Equivalent phone listening cues would need an owned media bridge
+and its own acceptance evidence. Promotion requires representative audio
+comparison, not just a fast first sound or a green unit test.
+
+Primary references: [Vapi WebSocket transport](https://docs.vapi.ai/calls/websocket-transport),
+[Vapi API keys](https://docs.vapi.ai/security-and-privacy/api-keys),
+[Vapi server authentication](https://docs.vapi.ai/server-url/server-authentication),
+[TypeSafe choice](https://docs.typesafe.ai/primitives/choice),
+[TypeSafe confidence](https://docs.typesafe.ai/confidence).
