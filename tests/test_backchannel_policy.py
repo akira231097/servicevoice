@@ -1,11 +1,12 @@
 import asyncio
 import json
 import threading
-import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from app import backchannel_policy
 from app.backchannel_policy import BackchannelPolicy, CATALOG, LANGUAGE_LABELS, SELECTION_LABELS, eligible_state
 from app.jev_classifier import JEV_MODEL, JEV_URL
 
@@ -179,14 +180,32 @@ def test_provider_errors_never_retry_or_redirect_or_expose_body(status):
     asyncio.run(scenario())
 
 
-def test_late_provider_result_is_silent_even_if_event_loop_cannot_schedule_timer():
+@pytest.mark.parametrize("elapsed,phrase,reason", [
+    (.049, "moment", "eligible_classification"),
+    (.05, "silence", "classification_deadline"),
+    (.06, "silence", "classification_deadline"),
+])
+def test_late_provider_result_is_silent_even_if_event_loop_cannot_schedule_timer(monkeypatch, elapsed, phrase, reason):
+    # Replace only this module's elapsed clock, leaving asyncio's clock intact.
+    # A synchronous response advances it without yielding to the timeout timer;
+    # checking both sides and the exact boundary needs no real sleep tolerance.
+    ticks = [0.]
+    monkeypatch.setattr(backchannel_policy, "time", SimpleNamespace(perf_counter=lambda: ticks[0]))
+    calls = []
     def handle(request):
-        time.sleep(.06)
+        calls.append(request)
+        ticks[0] = elapsed
         return httpx.Response(200, json=provider_result())
     async def scenario():
+        scheduled = []
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            result = await BackchannelPolicy(client=client, timeout_seconds=.05).choose(MESSAGES, "test-key")
-            assert result.phrase_id == "silence" and result.reason == "classification_deadline"
+            asyncio.get_running_loop().call_soon(scheduled.append, True)
+            policy = BackchannelPolicy(client=client, timeout_seconds=.05)
+            result = await policy.choose(MESSAGES, "test-key")
+            assert scheduled == [], "the transport must not yield to the event-loop timer"
+            assert (result.phrase_id, result.reason) == (phrase, reason)
+            assert result.elapsed_ms == result.classification_ms == elapsed * 1000
+            assert result.requests == len(calls) == 1 and policy.active == 0
     asyncio.run(scenario())
 
 
