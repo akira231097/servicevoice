@@ -70,7 +70,7 @@ export class DuplexSession {
   emit(kind, detail = {}) {
     const event = { kind, at_ms: Math.max(0, this.runtime.now() - this.startAt), ...detail };
     if (this.events.length < 1500) this.events.push(event);
-    this.callbacks.event?.(event);
+    try { this.callbacks.event?.(event); } catch { /* Optional observers cannot interrupt owned audio or cleanup. */ }
     if (kind === 'cue_started') this.cuePlaying = true;
     if (['cue_ended', 'cue_stopped', 'ended'].includes(kind)) this.cuePlaying = false;
     if (['cue_started', 'cue_ended', 'cue_suppressed'].includes(kind)) this.queueWaitingPreparation();
@@ -254,8 +254,8 @@ export class DuplexSession {
       if (this.closed) return;
       this.playback = this.runtime.playbackFactory({ context: this.context, cueAssets, maxQueuedSeconds: 3,
         onFailure: reason => {
-          this.emit('playback_failed', { reason });
-          try { this.callbacks.error?.(reason); } finally { void this.stop(reason); }
+          try { this.emit('playback_failed', { reason }); this.callbacks.error?.(reason); }
+          finally { void this.stop(reason); }
         } });
       this.coordinator = new DuplexCoordinator({ playback: this.playback, listeningDelayMs: 0,
         now: this.runtime.now, setTimeout: this.runtime.setTimeout, clearTimeout: this.runtime.clearTimeout,

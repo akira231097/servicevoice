@@ -1004,3 +1004,16 @@ test('ordinary stale or caller-owned PCM rejection never raises a playback failu
   const f = fixture(); await f.session.start(); speech(f.session, 'user', 'started'); f.session.receive(pcm().buffer);
   assert.equal(f.session.closed, false); assert.equal(f.events.some(row => row.kind === 'playback_failed'), false); await f.session.stop();
 });
+
+test('throwing failure and ended observers cannot prevent owned playback and call cleanup', async () => {
+  const f = fixture(); await f.session.start(); speech(f.session, 'assistant', 'started');
+  f.session.callbacks.event = event => { if (['playback_failed', 'ended'].includes(event.kind)) throw new Error('observer'); };
+  f.session.callbacks.error = () => { throw new Error('error observer'); };
+  f.output.enqueueMain = () => { try { f.output.failure('output_queue_bound'); } catch {} return false; };
+  f.session.receive(pcm().buffer);
+  assert.equal(f.session.closed, true); assert.equal(f.output.closed, true);
+  await f.session.stopping; assert.equal(f.tracks[0].stopped, 1);
+  assert.equal(f.requests.filter(row => row.url.endsWith('/duplex/stop')).length, 1);
+  assert.ok(f.requests.some(row => row.body?.event === 'playback_failed' && row.body.reason === 'output_queue_bound'));
+  assert.ok(f.requests.some(row => row.body?.event === 'ended' && row.body.reason === 'output_queue_bound'));
+});

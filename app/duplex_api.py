@@ -86,7 +86,7 @@ class PlaybackEvent(BaseModel):
     @model_validator(mode="after")
     def bounded_pacing_retry(self):
         if self.event == "playback_failed" or self.reason in OUTPUT_FAILURE_REASONS:
-            if self.event != "playback_failed" or self.reason not in OUTPUT_FAILURE_REASONS:
+            if self.event not in {"playback_failed", "ended"} or self.reason not in OUTPUT_FAILURE_REASONS:
                 raise ValueError("Only a fixed output-failure code may describe playback failure.")
         if self.event == "cue_retry_scheduled" or self.retry_after_ms is not None:
             if (self.event != "cue_retry_scheduled" or self.phase != "waiting"

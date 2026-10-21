@@ -596,7 +596,7 @@ def test_decision_evidence_is_bounded_content_free_and_owner_scoped(tmp_path):
 
 
 @pytest.mark.parametrize("body", [{"event": "barge_in"}, *[
-    {"event": "playback_failed", "reason": reason} for reason in (
+    {"event": event, "reason": reason} for event in ("playback_failed", "ended") for reason in (
         "output_queue_bound", "output_geometry", "output_context_unavailable", "output_handoff_bound", "output_playback_failed")]])
 def test_interrupting_event_cancels_an_inflight_selection_without_waiting_for_the_classifier(tmp_path, body):
     async def run():
