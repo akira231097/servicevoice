@@ -238,4 +238,3 @@ class BackchannelAudioCache:
             return None
         pcm, metadata = item
         return pcm, {**metadata, "cache_manifest_sha256": self.manifest_sha256}
-

@@ -86,4 +86,3 @@ def trim_edge_silence(pcm, sample_rate=SAMPLE_RATE, *, rms_threshold=RMS_THRESHO
         "peak_threshold_pcm16": peak_threshold, "changed": bool(leading or trailing),
         "interior_samples": "unchanged", "audible_content_verification": "not_performed"}
     return processed, provenance
-
