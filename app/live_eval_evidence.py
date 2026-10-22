@@ -375,8 +375,11 @@ def latency(call, timings=()):
     values = [r.get("milestones_ms",{}).get("first_text") for r in timings if r.get("outcome") == "completed"]
     values = [v for v in values if numeric(v) is not None]
     if values:result["server_first_text_p95_ms"] = percentile(values)
+    # A refunded cue was emitted into a request Vapi discarded before any
+    # answer; it never reached speech and must not count as an acknowledgment.
     acknowledged=[r for r in timings if isinstance(r,dict) and isinstance(r.get("backchannel"),dict)
-                  and numeric(r["backchannel"].get("emitted_ms")) is not None]
+                  and numeric(r["backchannel"].get("emitted_ms")) is not None
+                  and r["backchannel"].get("refunded") is not True]
     if acknowledged:
         ack_times=[r["backchannel"]["emitted_ms"] for r in acknowledged]
         result["acknowledgment_observed"]=True

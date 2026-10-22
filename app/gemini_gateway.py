@@ -58,6 +58,10 @@ class RequestTiming:
         self.admission_released = False
         self.generation = None
         self.outcome = "interrupted"
+        # Runs once, inside finish(), before the row is copied anywhere. The
+        # gateway uses it to settle an emitted waiting cue against its budget.
+        self.before_finish = None
+        self.backchannel_budget_stamp = None
         request_id=uuid4().hex
         self.row = {
             "request_id": request_id,
@@ -133,6 +137,10 @@ class RequestTiming:
     def finish(self):
         if self.finished:
             return
+        if self.before_finish is not None:
+            hook, self.before_finish = self.before_finish, None
+            try:hook()
+            except Exception:pass  # Budget bookkeeping must never block evidence persistence.
         self.mark("total")
         self.row["outcome"] = self.outcome
         if self.outcome=="supersession_wait_expired":
@@ -1452,6 +1460,9 @@ class GeminiGateway:
                         record["phrase_id"]=phrase
                         allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase)
                         record["reason"]=reason
+                        if allowed:
+                            timing.backchannel_budget_stamp=self.backchannel_budget.receipt(call_id)
+                            timing.before_finish=lambda:self._backchannel_refund(call_id,timing)
                     else:allowed=False; record["reason"]="primary_ready"
                     if state is not None and current==selection_context and not primary.done() and allowed:
                         self._checkpoint(timing)
@@ -1508,6 +1519,29 @@ class GeminiGateway:
         with suppress(TimeoutError):
             await asyncio.wait_for(asyncio.shield(cleanup),timeout=self.limits.cleanup_seconds)
 
+    def _backchannel_refund(self,call_id,timing):
+        """Give an emitted-but-unplayed waiting cue back to the turn budget.
+
+        Vapi discards the output of a request it cancels or replaces before the
+        answer. Observed on 2026-10-21: speculative requests that Vapi started
+        while the caller was still speaking consumed the one-per-turn cue, and
+        the real post-turn request stayed silent for several seconds. Refund
+        only when no answer text or tool command was released after the cue;
+        completed answers and upstream failures keep their consumption.
+        """
+        record=timing.row.get("backchannel");stamp=timing.backchannel_budget_stamp
+        if not isinstance(record,dict) or stamp is None or record.get("emitted_ms") is None or record.get("refunded"):return
+        milestones=timing.row["milestones_ms"]
+        if milestones.get("first_text") is not None or milestones.get("tool_emitted") is not None:return
+        if self._obsolete(timing):cause="generation_superseded_before_answer"
+        elif timing.outcome in ("cancelled","interrupted"):cause="generation_cancelled_before_answer"
+        else:return
+        timing.backchannel_budget_stamp=None
+        refunded,_=self.backchannel_budget.refund(call_id,stamp)
+        if not refunded:return
+        record["refunded"]=True;record["refund_reason"]=cause
+        self._backchannel_observation(timing,"backchannel.refunded",None)
+
     def _backchannel_observation(self,timing,event,elapsed):
         if self.diagnostics is None:return
         try:
@@ -1517,7 +1551,9 @@ class GeminiGateway:
                 request_id=timing.row["request_id"],
                 start_unix=timing.row["started_at_unix"] if elapsed is not None else None,duration_ms=elapsed,
                 attributes={"generation_id":timing.row["generation_id"],"backchannel_phrase":record["phrase_id"],
-                    "backchannel_reason":record["reason"],"classifier_ms":record["classification_ms"],
+                    "backchannel_reason":record.get("refund_reason") if event=="backchannel.refunded" else record["reason"],
+                    **({"backchannel_refunded":True,"backchannel_refund_reason":record.get("refund_reason")} if record.get("refunded") else {}),
+                    "classifier_ms":record["classification_ms"],
                     "backchannel_probability":record["probability"],"backchannel_confidence":record["confidence"],
                     "classifier_requests":record["requests"],"policy_elapsed_ms":record["policy_elapsed_ms"],
                     "backchannel_language":record["language_choice"],"backchannel_language_probability":record["language_probability"],
