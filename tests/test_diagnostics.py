@@ -156,7 +156,7 @@ def test_read_scope_truncation_and_absence_are_explicit(tmp_path):
     assert len(read_call_diagnostics(path,"two")["events"])==1
     missing=read_call_diagnostics(path,"missing")
     assert missing["coverage"]["dropped_events"] is None and missing["coverage"]["state"]=="unavailable"
-    assert read_call_diagnostics(path,"one",limit=2001)["coverage"]["state"]=="unavailable"
+    assert read_call_diagnostics(path,"one",limit=8001)["coverage"]["state"]=="unavailable"
     assert read_call_diagnostics(tmp_path/"absent.sqlite3","one")["coverage"]["state"]=="unavailable"
     assert not (tmp_path/"absent.sqlite3").exists()
 

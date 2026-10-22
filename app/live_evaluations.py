@@ -26,11 +26,32 @@ import httpx
 from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evidence,
     canonical, check, latency, missing_snapshot, read_snapshot, read_timings, readonly)
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
-from .evaluation_spans import build_component_runs
-from .generation_observability import (project_gateway_timings, build_gateway_generation_runs,
-    build_provider_observation_runs)
+from .generation_observability import project_gateway_timings
 from .provider_logs import capture_provider_log_sync, safe_provider_capture, validate_trusted_hosts
-from .diagnostics import REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage
+from .diagnostics import (REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage,
+    turn_identifier, operation_identifier)
+from .call_review_presentation import (LATENCY_CHECKS, MAX_TURNS, TRACE_VERSION, build_timeline, build_overview,
+    build_review_children, call_cost, call_duration_seconds, call_started, clock, condense_diagnostics,
+    markdown_report, review_metadata, review_tags, feedback_rows as presentation_feedback_rows)
+
+REUSABLE_VERSIONS = frozenset({"live-call-review-v4", "live-call-review-v5"})
+REVIEW_QUEUE_RUBRIC = {
+    "instructions": ("Listen to the recording in the Vapi dashboard (Inputs > vapi_call_url), read the call review's "
+                     "summary and timeline, then answer each question. Score 1 = yes, 0 = no. Leave a question blank "
+                     "if you could not tell. Your answers are stored as human feedback next to the automatic checks."),
+    "items": [
+        {"feedback_key": "human_sounded_natural", "description": "Did the assistant sound natural: pace, pauses and tone a caller would accept?",
+         "score_descriptions": {"0": "Awkward, robotic or badly paced", "1": "Natural enough for a real caller"}, "is_required": True},
+        {"feedback_key": "human_cues_well_timed", "description": "Were the waiting cues ('One moment.' and similar) well timed, not intrusive and never heard as agreement?",
+         "score_descriptions": {"0": "Mistimed, intrusive or misleading", "1": "Helpful and unobtrusive"}, "is_required": False},
+        {"feedback_key": "human_heard_correctly", "description": "Did the assistant hear the caller correctly, including names, numbers and corrections?",
+         "score_descriptions": {"0": "Misheard something that mattered", "1": "Heard everything that mattered"}, "is_required": True},
+        {"feedback_key": "human_booking_correct", "description": "If a booking or change was made, was it exactly what the caller agreed to?",
+         "score_descriptions": {"0": "Different from what was agreed", "1": "Exactly as agreed"}, "is_required": False},
+        {"feedback_key": "human_overall_acceptable", "description": "Overall, would you be comfortable with a real customer having this call?",
+         "score_descriptions": {"0": "No", "1": "Yes"}, "is_required": True},
+    ],
+}
 
 MODEL = "gemini-3.8-flash"
 GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -135,6 +156,8 @@ class Config:
     diagnostics_path: Path | None = None
     max_failures: int = 8
     provider_log_hosts: tuple[str, ...] = ()
+    answer_target_ms: int = 3000
+    review_queue: str = "ServiceVoice calls to review"
 
     @classmethod
     def from_env(cls,env=None):
@@ -155,13 +178,17 @@ class Config:
             lookback_hours=int(env.get("SERVICEVOICE_EVAL_LOOKBACK_HOURS", "24")),
             assistant_id=env.get("VAPI_EVAL_ASSISTANT_ID", ""),
             diagnostics_path=Path(env["SERVICEVOICE_EVAL_DIAGNOSTICS_PATH"]) if env.get("SERVICEVOICE_EVAL_DIAGNOSTICS_PATH") else None,
-            max_failures=int(env.get("SERVICEVOICE_EVAL_MAX_FAILURES", "8")),provider_log_hosts=provider_hosts)
+            max_failures=int(env.get("SERVICEVOICE_EVAL_MAX_FAILURES", "8")),provider_log_hosts=provider_hosts,
+            answer_target_ms=int(env.get("SERVICEVOICE_EVAL_ANSWER_TARGET_MS", "3000")),
+            review_queue=env.get("SERVICEVOICE_EVAL_REVIEW_QUEUE", "ServiceVoice calls to review"))
         config.validate()
         return config
 
     def validate(self):
         validate_trusted_hosts(self.provider_log_hosts)
         if (self.endpoint not in OFFICIAL_ENDPOINTS or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{0,63}",self.project)
+                or type(self.answer_target_ms) is not int or not 250 <= self.answer_target_ms <= 15_000
+                or not isinstance(self.review_queue,str) or not re.fullmatch(r"[A-Za-z0-9 ._-]{0,80}",self.review_queue)
                 or any(not 16 <= len(k) <= 512 or any(ord(c)<33 or ord(c)>126 for c in k) for k in (self.vapi_key,self.gemini_key,self.langsmith_key))
                 or str(UUID(self.workspace)) != self.workspace
                 or self.organization and str(UUID(self.organization)) != self.organization
@@ -192,12 +219,14 @@ class Outbox:
             """)
             columns={row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             for name,declaration in (("failures","INTEGER NOT NULL DEFAULT 0"),("completed","REAL"),
-                                     ("eligible_ended","INTEGER"),("ended","REAL"),("evaluation_reason","TEXT")):
+                                     ("eligible_ended","INTEGER"),("ended","REAL"),("evaluation_reason","TEXT"),("queued","TEXT")):
                 if name not in columns:db.execute("ALTER TABLE jobs ADD COLUMN "+name+" "+declaration)
             db.execute("INSERT OR IGNORE INTO settings VALUES ('capture_since',?)",(str(clock()-lookback_hours*3600),))
             # A new review contract requires an append-only review, not relabeled old
             # passes. Existing provider-attempt budgets and old reports survive.
-            db.execute("UPDATE jobs SET state='pending',lease=0,next_attempt=?,completed=NULL WHERE state='complete' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v1','live-call-review-v2','live-call-review-v3')",(clock(),))
+            # v1-v3 reviews are judged again; v4/v5 reviews keep their frozen
+            # advisory grades and are re-exported in the readable v6 layout.
+            db.execute("UPDATE jobs SET state='pending',lease=0,next_attempt=?,completed=NULL WHERE state='complete' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v1','live-call-review-v2','live-call-review-v3','live-call-review-v4','live-call-review-v5')",(clock(),))
         if os.name != "nt":self.path.chmod(0o600)
 
     def db(self):
@@ -277,6 +306,11 @@ class Outbox:
         with closing(self.db()) as db,db:
             db.execute("UPDATE jobs SET state='unavailable',lease=0,last_error='provider_record_unavailable' WHERE call_id=?",(call_id,))
 
+    def mark_queued(self,call_id,state):
+        if not re.fullmatch(r"[a-z_]{1,40}",state):raise ValueError("invalid_queue_state")
+        with closing(self.db()) as db,db:
+            db.execute("UPDATE jobs SET queued=? WHERE call_id=?",(state,call_id))
+
     def setting(self,key,default=None):
         with closing(self.db()) as db:
             row=db.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
@@ -311,6 +345,7 @@ class Outbox:
             semantic={r[0]:r[1] for r in db.execute("SELECT evaluation_reason,COUNT(*) FROM jobs WHERE state='complete' GROUP BY evaluation_reason")}
             oldest=db.execute("SELECT MIN(ended) FROM jobs WHERE state='pending' AND eligible_ended=1").fetchone()[0]
             lag=db.execute("SELECT AVG(MAX(0,completed-ended)),MAX(MAX(0,completed-ended)) FROM jobs WHERE state='complete' AND completed IS NOT NULL AND ended IS NOT NULL").fetchone()
+            queued={r[0]:r[1] for r in db.execute("SELECT queued,COUNT(*) FROM jobs WHERE queued IS NOT NULL GROUP BY queued")}
         ended_count=eligible.get(1,0);complete=counts.get("complete",0);fully_scored=semantic.get("assessed",0)
         assessed=fully_scored+semantic.get("assessed_with_uncertainty",0)
         now=self.clock();used_count=used[0] if used else 0
@@ -332,6 +367,8 @@ class Outbox:
                 "interpretation":"Known-ended calls are the review denominator. Unavailable/active/unknown eligibility is reported separately; unknown is never pass."},
             "oldest_pending_review_age_seconds":pending_age,"average_review_lag_seconds":lag[0],"max_review_lag_seconds":lag[1],
             "semantic_status_counts":{k or "legacy_unknown":v for k,v in semantic.items()},"alerts":alerts,
+            "human_review_queue":{"queued":queued.get("queued",0)+queued.get("already_queued",0),"queue_unavailable":queued.get("queue_unavailable",0),
+                "interpretation":"Calls flagged needs_review are added to the LangSmith annotation queue for a human listen; a queue outage never blocks the review itself."},
             "alert_delivery":"Status records only; no external notification destination is configured."}
 
 
@@ -390,8 +427,36 @@ def judge(client,key,package):
     return parse_judgment(parsed,package)
 
 
-def public_report(package,judgment,call,timings,config,*,diagnostics=None,semantic_status=None,provider_capture=None):
-    """Strict export boundary. No transcripts, arguments, raw names or judge prose."""
+def reuse_cached_grades(cached,package):
+    """Carry an earlier complete review's six advisory verdicts into the current contract.
+
+    No model request is made: the frozen grades stay as judged. Evidence
+    references are revalidated against the rebuilt package; a frozen review
+    whose reviewer never ran keeps its explicit unavailable status.
+    """
+    checks=cached.get("checks") if isinstance(cached,dict) else None
+    status=(cached.get("review_process") or {}).get("semantic_status") if isinstance(cached,dict) else None
+    status=status if isinstance(status,str) and re.fullmatch(r"[a-z_]{1,60}",status) else "semantic_review_unavailable"
+    if not isinstance(checks,dict) or status not in {"assessed","assessed_with_uncertainty"}:return {},status
+    judgment={}
+    for dimension in DIMENSIONS:
+        item=checks.get(dimension)
+        if not isinstance(item,dict) or item.get("verdict") not in {"pass","fail","uncertain","not_applicable"}:return {},"semantic_review_unavailable"
+        refs=[r for r in item.get("evidence_refs",[]) if isinstance(r,str) and r in package["evidence"]] or ["state"]
+        passed=item["verdict"] in {"pass","not_applicable"}
+        code=item.get("issue_code") if item.get("issue_code") in ISSUE_CODES else None
+        if code is None or passed!=(code=="none"):code="none" if passed else "other"
+        judgment[dimension]={"verdict":item["verdict"],"evidence_refs":refs[:12],"issue_code":code,"reason":FIXED_REASONS[dimension]}
+    return judgment,status
+
+
+def public_report(package,judgment,call,timings,config,*,diagnostics=None,semantic_status=None,provider_capture=None,operation_ids=None):
+    """Strict export boundary. No transcripts, arguments, raw names or judge prose.
+
+    The readable sections (``0 Report (markdown)`` to ``7 How to read this
+    review``) and the persisted ``review_trace`` are derived from the same
+    content-free evidence as the technical sections that follow them.
+    """
     checks=dict(package["mechanical_checks"])
     for dimension in DIMENSIONS:
         item=judgment.get(dimension)
@@ -439,18 +504,25 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     except (ValueError,TypeError,KeyError,AttributeError):
         gateway_generations=project_gateway_timings([])
         gateway_generations["coverage"]["projection_error"]="gateway_timing_projection_unavailable"
-    turn=metrics.get("turn_avg_ms")
-    checks["latency_within_target"] = check("uncertain" if turn is None else "pass" if turn<=config.latency_target_ms else "fail","vapi_turn_average_target")
-    tail=metrics.get("turn_p95_ms")
-    checks["latency_tail_within_target"] = check("uncertain" if tail is None else "pass" if tail<=config.latency_target_ms*1.5 else "fail","vapi_turn_p95_target")
-    if metrics.get("acknowledgment_observed"):
-        for metric in ("latency_within_target","latency_tail_within_target"):
-            checks[metric]=check("uncertain","acknowledgment_may_mask_substantive_answer_delay")
+    # Speed is two questions. First response: what the caller heard first, as
+    # Vapi measures it (with cues that is usually the cue). Answer: when the
+    # real text or tool call started on the server, so a fast cue can never
+    # hide a slow answer, and a slow answer never masquerades as uncertainty.
+    turn=metrics.get("turn_avg_ms");tail=metrics.get("turn_p95_ms")
+    if turn is None:first=check("uncertain","no_measured_response_turns")
+    elif turn>config.latency_target_ms:first=check("fail","first_response_average_over_target")
+    elif tail is not None and tail>config.latency_target_ms*1.5:first=check("fail","first_response_tail_over_target")
+    else:first=check("pass","first_response_target_met")
+    checks["first_response_within_target"]=first
+    answer=metrics.get("server_answer_p95_ms");answer_target=getattr(config,"answer_target_ms",3000)
+    checks["answer_within_target"]=(check("uncertain","no_completed_server_generations") if answer is None
+        else check("pass","server_answer_target_met") if answer<=answer_target else check("fail","server_answer_tail_over_target"))
     state=package["evidence"]["state"]
     index={}
     for ref,item in package["evidence"].items():
         if re.fullmatch(r"turn:\d+",ref):
-            index[ref]={"speaker":item["role"],"seconds_from_start":item["seconds_from_start"],"sequence":item["sequence"]}
+            index[ref]={"speaker":item["role"],"seconds_from_start":item["seconds_from_start"],"sequence":item["sequence"],
+                "at":clock(item["seconds_from_start"]) if item["seconds_from_start"] is not None else None}
         elif re.fullmatch(r"tool:\d+",ref):
             if item.get("evidence_scope")=="platform_attempt" and item.get("name")=="endCall":
                 index[ref]={"tool":"endCall","sequence":item["sequence"],"evidence_scope":"platform_attempt",
@@ -465,7 +537,8 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     call_summary={"channel":channel if channel in {"webCall","inboundPhoneCall","outboundPhoneCall","vapi.websocketCall"} else "unknown",
         "ended_reason":reason if isinstance(reason,str) and re.fullmatch(r"[a-z][a-z0-9.\-]{0,179}",reason) else "unknown",
         "caller_utterances":sum(v.get("speaker")=="user" for v in index.values()),
-        "assistant_utterances":sum(v.get("speaker")=="assistant" for v in index.values())}
+        "assistant_utterances":sum(v.get("speaker")=="assistant" for v in index.values()),
+        "duration_seconds":call_duration_seconds(call)}
     assistant_end=(True if reason in {"assistant-ended-call","assistant-said-end-call-phrase"}
         else False if reason=="customer-ended-call" else None) if isinstance(reason,str) else None
     if semantic_status is None:
@@ -477,11 +550,16 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     elif not isinstance(diagnostics.get("configuration"),dict):
         diagnostics={**diagnostics,"configuration":{"id":None,"provenance":"unavailable",
             "provider_effective_configuration":"unknown"}}
+    # Quality and speed are separate flags: a slow call with a correct booking
+    # needs a latency look, not a conversation review, and vice versa.
+    needs_review=any(v["verdict"] in {"fail","uncertain"} for key,v in checks.items() if key not in LATENCY_CHECKS)
+    slow_call=any(checks[key]["verdict"]=="fail" for key in LATENCY_CHECKS)
     report={"review_version":VERSION,"review_source_sha256":source_hash,"checks":checks,"latency":metrics,
         "review_process":{"semantic_status":semantic_status,"judge_model":MODEL,"dimensions":list(DIMENSIONS),
             "judge_prompt_revision":JUDGE_PROMPT_REVISION,"judge_prompt_sha256":JUDGE_PROMPT_SHA256,
             "diagnostics_coverage_revision":REVIEW_DIAGNOSTICS_REVISION,
             "diagnostics_source_sha256":hashlib.sha256(Path(__file__).with_name("diagnostics.py").read_bytes()).hexdigest(),
+            "presentation_source_sha256":hashlib.sha256(Path(__file__).with_name("call_review_presentation.py").read_bytes()).hexdigest(),
             "advisory":True,"human_calibration":"not_established_by_this_review"},
         "evidence_coverage":{"spoken_audio_verified":None,
             "spoken_audio_status":"unverified_no_independent_listening_evidence_in_this_review",
@@ -491,68 +569,65 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
         "diagnostics":diagnostics,
         "gateway_generations":gateway_generations,
         "call_summary":call_summary,
-        "latency_targets_ms":{"turn_average":config.latency_target_ms,"turn_p95":config.latency_target_ms*1.5},
+        "latency_targets_ms":{"turn_average":config.latency_target_ms,"turn_p95":config.latency_target_ms*1.5,"server_answer_p95":answer_target},
         "evidence_index":index,
         "booking":{"scheduler_evidence_available":state["scheduler_evidence_available"],
             "appointment_count":len(state["appointments"]) if state["scheduler_evidence_available"] else None,
             "committed_actions":sum(p["state"]=="committed" for p in state["proposals"]) if state["scheduler_evidence_available"] else None,
             "unresolved_operations":len(state["pending_operations"]) if state["scheduler_evidence_available"] else None},
-        "needs_review":any(v["verdict"] in {"fail","uncertain"} for v in checks.values()),
+        "needs_review":needs_review,"slow_call":slow_call,
         "scope":"Advisory review of stored text plus scheduler evidence; provider internals and exact heard audio remain unverified.",
         "privacy":"Transcripts, customer details, tool arguments and judge prose excluded from this LangSmith export."}
+    capture=None
     if provider_capture is not None:
-        report["provider_observations"]=safe_provider_capture(provider_capture,call["id"])
+        capture=safe_provider_capture(provider_capture,call["id"])
+        report["provider_observations"]=capture
+    # The readable layer is derived from the sections above and the same
+    # content-free ledgers. It can never block or change a review: on any
+    # defect the technical sections stand on their own with an explicit code.
+    try:
+        own_rows=[r for r in timings if isinstance(r,dict) and r.get("call_key")==expected_key[:16]]
+        trace=build_timeline(call,package,own_rows,diagnostics,call_key=expected_key,
+            turn_ids={k:turn_identifier(call["id"],k) for k in range(1,MAX_TURNS+1)},operation_ids=operation_ids,provider=capture)
+        overview=build_overview(checks=checks,latency=metrics,timeline=trace,booking=report["booking"],call_summary=call_summary,
+            evidence_index=index,duration_s=call_summary["duration_seconds"],needs_review=needs_review,slow_call=slow_call,
+            ended_reason=call_summary["ended_reason"],targets=report["latency_targets_ms"],cost=call_cost(call),review_process=report["review_process"])
+        started=call_started(call)
+        report.update(overview)
+        report["review_trace"]=trace
+        report["0 Report (markdown)"]=markdown_report(overview,call_id=call["id"],
+            started=datetime.fromtimestamp(started,timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if started is not None else None)
+        report["diagnostics"]=condense_diagnostics(report["diagnostics"],expected_key)
+        report["presentation_status"]="ready"
+    except Exception as exc:
+        if os.environ.get("SERVICEVOICE_PRESENTATION_STRICT")=="1":raise
+        # Only the exception class name is recorded: never provider or caller text.
+        report["presentation_status"]="presentation_unavailable"
+        report["presentation_error"]=type(exc).__name__[:60]
     return report
 
 
 def feedback_rows(run_id,report):
-    for key,item in report["checks"].items():
-        verdict=item["verdict"]
-        yield {"key":key,"score":1 if verdict=="pass" else 0 if verdict=="fail" else None,"value":verdict,
-            "comment":item.get("issue_code",item.get("reason_code",""))+". "+item.get("explanation","")+" Evidence: "+", ".join(item.get("evidence_refs",[]))}
-    yield {"key":"needs_review","score":int(report["needs_review"]),"value":"review" if report["needs_review"] else "clear",
-           "comment":"1 means investigate; uncertain checks are never counted as passes."}
-    for key,score in (("semantic_assessment_available",report.get("review_process",{}).get("semantic_status") in {"assessed","assessed_with_uncertainty"}),
-                      ("six_dimensions_scored",all(report["checks"][d]["verdict"]!="uncertain" for d in DIMENSIONS))):
-        yield {"key":key,"score":int(score),"value":bool(score),
-               "comment":"Coverage indicator, not agent quality. Inspect unknown and not-applicable checks separately."}
-    coverage=report.get("evidence_coverage",{})
-    yield {"key":"spoken_audio_verified","score":None,"value":"unverified",
-        "comment":"Coverage only: no independent listening evidence is included in this review. This is not an audio-quality failure."}
-    assistant_end=coverage.get("provider_ended_by_assistant")
-    yield {"key":"provider_ended_by_assistant","score":int(assistant_end) if type(assistant_end) is bool else None,
-        "value":assistant_end if type(assistant_end) is bool else "unknown",
-        "comment":"Coverage only: recognized provider end reason. Does not establish correct goodbye timing or automatic-hangup acceptance."}
-    if "provider_observations" in report:
-        capture=report["provider_observations"]
-        yield {"key":"provider_log_available","score":1 if capture.get("status")=="observed" else None,
-            "value":capture.get("status","unavailable"),
-            "comment":"Coverage only: bounded provider log capture, not agent quality, audible interruption or phone playback proof."}
-    for key,value in report["latency"].items():
-        if type(value) in (int,float):
-            comment=("Count of observed measurements, not a duration." if key in {"measured_turns","server_acknowledgments_emitted","server_follow_up_acknowledgments"}
-                     else "Milliseconds. Lower latency is better; server yield is not phone playback.")
-            yield {"key":"latency_"+key,"score":value,"value":value,"comment":comment}
+    """Checks score 1/0 (blank = uncertain or n/a), two flags, coverage rows and metric_* measurements."""
+    yield from presentation_feedback_rows(run_id,report)
 
 
-def upgrade_v1_metrics(report,call,timings,config):
-    """Explicit one-time migration; semantic rubric and its grades are unchanged."""
-    if report.get("review_version")==VERSION:return report
-    if VERSION!="live-call-review-v2" or report.get("review_version")!="live-call-review-v1":
-        raise EvidenceError("unsupported_cached_review_version")
-    report=json.loads(canonical(report))
-    report["review_version"]=VERSION
-    report["semantic_review_version"]="live-call-review-v1"
-    report["metric_revision"]="No measured response turns means unknown, not zero latency. Semantic grades reused without another model request."
-    report["latency"]=latency(call,timings)
-    for key,metric,multiplier in (("latency_within_target","turn_avg_ms",1),("latency_tail_within_target","turn_p95_ms",1.5)):
-        value=report["latency"].get(metric)
-        report["checks"][key]=check("uncertain" if value is None else "pass" if value<=config.latency_target_ms*multiplier else "fail","measured_voice_latency_target")
-    if report["latency"].get("acknowledgment_observed"):
-        for key in ("latency_within_target","latency_tail_within_target"):
-            report["checks"][key]=check("uncertain","acknowledgment_may_mask_substantive_answer_delay")
-    report["needs_review"]=any(c["verdict"] in {"fail","uncertain"} for c in report["checks"].values())
-    return report
+def export_outputs(report,call_id,trace_coverage):
+    """Root outputs: the persisted review with bulky provider event lists condensed.
+
+    The persisted ``provider_observations`` keep every projected event so the
+    capture can be revalidated; the export keeps its status, counts, flags and
+    model spans, because the readable trace already lists the events.
+    """
+    outputs={**report,"trace_export":trace_coverage}
+    if isinstance(report.get("provider_observations"),dict):
+        capture=safe_provider_capture(report["provider_observations"],call_id)
+        projection=capture.get("projection")
+        if isinstance(projection,dict):
+            capture={**capture,"projection":{k:v for k,v in projection.items() if k not in ("events","provider_request_metadata")},
+                "export_note":"Projected provider events and request metadata are listed under the trace's vapi group; counts remain in summary."}
+        outputs["provider_observations"]=capture
+    return outputs
 
 
 class LangSmith:
@@ -622,6 +697,35 @@ class LangSmith:
         self.project_id=str(UUID(rows[0]["id"]))
         return self.project_id
 
+    def ensure_queue(self):
+        """Find or create the human listening queue by its configured name."""
+        if getattr(self,"queue_id",None):return self.queue_id
+        name=self.config.review_queue
+        def lookup():
+            rows=self.request("GET","/annotation-queues",params={"name":name,"limit":5})
+            return [r for r in rows if isinstance(r,dict) and r.get("name")==name] if isinstance(rows,list) else []
+        found=lookup()
+        if not found:
+            body={"id":str(uuid5(NAMESPACE_URL,self.config.workspace+":"+self.config.project+":queue:"+name)),"name":name,
+                "description":"Calls the automatic review flagged for a human listen. Open each item, listen in Vapi, answer the rubric.",
+                "rubric_instructions":REVIEW_QUEUE_RUBRIC["instructions"],"rubric_items":REVIEW_QUEUE_RUBRIC["items"],
+                "num_reviewers_per_item":1,"enable_reservations":False,"session_ids":[self.ensure_project()]}
+            try:self.request("POST","/annotation-queues",body=body,allowed=(200,201))
+            except EvidenceError as exc:
+                if str(exc)!="http_409":raise
+            found=lookup()
+        if len(found)!=1:raise EvidenceError("review_queue_identity_ambiguous")
+        self.queue_id=str(UUID(found[0]["id"]))
+        return self.queue_id
+
+    def enqueue(self,run_id):
+        """Add a call review to the human listening queue once; membership is checked first."""
+        queue=self.ensure_queue()
+        existing=self.request("GET","/annotation-queues/"+run_id+"/queues")
+        if isinstance(existing,list) and any(isinstance(q,dict) and str(q.get("id"))==queue for q in existing):return "already_queued"
+        self.request("POST","/annotation-queues/"+queue+"/runs",body=[run_id],allowed=(200,201,202))
+        return "queued"
+
     @staticmethod
     def same_time(value,expected):
         """Reconcile official LangSmith UTC readback without rounding times.
@@ -651,46 +755,23 @@ class LangSmith:
             start=datetime.fromisoformat(started.replace("Z","+00:00"));end=datetime.fromisoformat(ended.replace("Z","+00:00"))
             if start.tzinfo is None or end.tzinfo is None or end<start:raise ValueError()
         except (ValueError,TypeError):raise EvidenceError("invalid_call_timestamps") from None
+        summary=report.get("1 Summary") if isinstance(report.get("1 Summary"),dict) else {}
         body={"id":run_id,"trace_id":run_id,"name":"voice.call.review","run_type":"chain","session_id":project,
             "start_time":start.isoformat(),"end_time":end.isoformat(),
             "dotted_order":start.strftime("%Y%m%dT%H%M%S%fZ")+run_id,
-            "inputs":{"call_id":call_id,"vapi_call_url":"https://dashboard.vapi.ai/calls/"+call_id,
+            "inputs":{"headline":summary.get("headline") or "Automatic call review","call_id":call_id,
+                      "vapi_call_url":"https://dashboard.vapi.ai/calls/"+call_id,
                       "review_scope":"Completed call, stored text and scheduler receipts"},"outputs":report,
-            "tags":["real-call","automatic-review",VERSION,"needs-review" if report["needs_review"] else "checks-clear"],
-            "extra":{"metadata":{"thread_id":run_id,"review_version":VERSION,"environment":self.config.environment,
-                      "call_id":call_id,"judge_model":MODEL,"needs_review":report["needs_review"],"latency_target_ms":self.config.latency_target_ms}}}
-        component_plan=build_component_runs(report.get("diagnostics",{}),root_run_id=run_id,
-            root_dotted_order=body["dotted_order"],project_id=project)
-        generation_plan=build_gateway_generation_runs(report.get("gateway_generations") or project_gateway_timings([]),
-            root_run_id=run_id,root_dotted_order=body["dotted_order"],project_id=project)
-        children=component_plan["runs"]+generation_plan["runs"]
-        provider_plan=None
-        if "provider_observations" in report:
-            capture=safe_provider_capture(report["provider_observations"],call_id)
-            projection=capture.get("projection")
-            if projection is not None:
-                available=max(0,9000-len(children))
-                provider_plan=build_provider_observation_runs(projection,root_run_id=run_id,
-                    root_dotted_order=body["dotted_order"],project_id=project,expected_call_id=call_id,
-                    max_runs=max(1,min(4000,available)))
-                if not available:
-                    provider_plan["coverage"]["export_limit_omitted_spans"]+=len(provider_plan["runs"])
-                    provider_plan["coverage"].update(exported_point_event_spans=0,exported_model_interval_spans=0,
-                        trace_child_budget_exhausted=True)
-                    provider_plan["runs"]=[]
-            else:
-                provider_plan={"runs":[],"coverage":{"state":capture["status"],
-                    "reason_code":capture["reason_code"],"complete_provider_visibility":False,
-                    "audible_interruption_count":None,"late_phone_packet_discard_verified":False}}
-            children+=provider_plan["runs"]
+            "tags":review_tags(report),
+            "extra":{"metadata":{"thread_id":run_id,**review_metadata(report,call_id=call_id,environment=self.config.environment,
+                      latency_target_ms=self.config.latency_target_ms)}}}
+        # Readable children come from the persisted trace plan, so an export
+        # retry posts byte-identical payloads without re-reading any ledger.
+        plan=build_review_children(report.get("review_trace"),root_run_id=run_id,root_dotted_order=body["dotted_order"],project_id=project)
+        children=plan["runs"]
         if len(children)>9000 or len({r["id"]for r in children})!=len(children):
             raise EvidenceError("component_export_identity_or_capacity_invalid")
-        body["outputs"]={**report,"trace_export":component_plan["coverage"],"gateway_generation_export":generation_plan["coverage"]}
-        if provider_plan is not None:
-            # Cached reports cross the same fixed-schema export boundary as
-            # newly captured evidence. Never forward unknown persisted fields.
-            body["outputs"]["provider_observations"]=capture
-            body["outputs"]["provider_observation_export"]=provider_plan["coverage"]
+        body["outputs"]=export_outputs(report,call_id,plan["coverage"])
         try:self.request("GET","/runs/"+run_id)
         except EvidenceError as exc:
             if str(exc)!="http_404":raise
@@ -760,10 +841,8 @@ class LangSmith:
             if existing is None:raise EvidenceError("feedback_readback_ingestion_pending")
             if not valid_feedback(existing,payload):
                 raise EvidenceError("feedback_readback_mismatch_or_ingestion_pending")
-        return {"run_id":run_id,"project_id":project,
-            "component_spans":len(component_plan["runs"]),
-            "gateway_generation_spans":len(generation_plan["runs"]),
-            "provider_observation_spans":len(provider_plan["runs"]) if provider_plan is not None else 0,
+        return {"run_id":run_id,"project_id":project,"trace_children":len(children),
+            "trace_coverage":{k:v for k,v in plan["coverage"].items() if type(v) is int},
             "url":f"https://smith.langchain.com/o/{self.config.workspace}/projects/p/{project}/r/{run_id}"}
 
     def coverage(self,status,now):
@@ -779,8 +858,8 @@ class LangSmith:
         outputs={**status,"environment":self.config.environment,"monthly_model_attempt_limit":self.config.monthly_limit,"checked_at":utc(now),
             "interpretation":"Only voice.call.review rows are call evaluations. Unavailable records (including synthetic IDs or expired/deleted provider records) are excluded, never scored as passes."}
         body={"id":rid,"trace_id":rid,"name":"voice.review.coverage","run_type":"chain","session_id":project,
-            "start_time":utc(now),"end_time":utc(now),"inputs":{"scope":"Automatic review worker coverage"},"outputs":outputs,
-            "tags":["pipeline-status",VERSION],"extra":{"metadata":{"record_kind":"worker_coverage","review_version":VERSION}}}
+            "start_time":utc(now),"end_time":utc(now),"inputs":{"scope":"Automatic review worker coverage (not a call)"},"outputs":outputs,
+            "tags":["pipeline-status","reviewer-status",VERSION],"extra":{"metadata":{"record_kind":"worker_coverage","review_version":VERSION}}}
         try:self.request("GET","/runs/"+rid)
         except EvidenceError as exc:
             if str(exc)!="http_404":raise
@@ -857,6 +936,7 @@ class Worker:
                 self.outbox.retry(cid,"waiting_for_final_artifacts",45,failure=False);return True
             phase="review"
             cached=json.loads(job["report"]) if job["report"] else None
+            reuse=bool(cached) and cached.get("review_version") in REUSABLE_VERSIONS
             if cached and cached.get("review_version")==VERSION:
                 report=cached
             else:
@@ -866,12 +946,18 @@ class Worker:
                     snapshot=missing_snapshot(call)
                 except (sqlite3.Error,OSError):snapshot=missing_snapshot(call)
                 if snapshot.get("source_available",True) and job["session_id"] and snapshot["session"]["id"]!=job["session_id"]:raise EvidenceError("session_binding_changed")
-                package=build_evidence(call,snapshot)
+                tool_ids={}
+                package=build_evidence(call,snapshot,tool_ids=tool_ids)
+                operation_ids={ref:operation_identifier(snapshot["session"]["id"],tid) for ref,tid in tool_ids.items()} if snapshot.get("source_available",True) else {}
                 if package["evidence"]["state"]["pending_operations"] and self.clock()-ended<300:
                     self.outbox.retry(cid,"waiting_for_operation_reconciliation",30,failure=False);return True
                 judgment={}
                 semantic_status="incomplete_call_evidence"
-                if not package["evidence_issues"]:
+                if reuse:
+                    # A complete v4/v5 review keeps its frozen advisory grades; only the
+                    # presentation and measured sections are rebuilt. No model request.
+                    judgment,semantic_status=reuse_cached_grades(cached,package)
+                elif not package["evidence_issues"]:
                     if self.outbox.reserve_judge(cid,self.config.monthly_limit):
                         try:judgment=judge(self.client,self.config.gemini_key,package)
                         except (EvidenceError,httpx.HTTPError,ValueError,KeyError,TypeError):
@@ -892,11 +978,16 @@ class Worker:
                 except (ImportError,sqlite3.Error,OSError,ValueError,TypeError):
                     # Diagnostic failure cannot hide call grades or modify a booking.
                     diagnostics=None
-                report=public_report(package,judgment,call,read_timings(timing_path,cid),self.config,
-                    diagnostics=diagnostics,semantic_status=semantic_status,
+                if reuse:
+                    # A frozen review's provider capture is reused as persisted; a
+                    # review that never captured one is not fetched again now.
+                    provider_capture=cached.get("provider_observations") if isinstance(cached.get("provider_observations"),dict) else capture_provider_log_sync(call,frozen_report=cached)
+                else:
                     provider_capture=capture_provider_log_sync(call,expected_call_id=cid,
                         expected_org_id=self.config.organization,expected_assistant_id=self.config.assistant_id or None,
-                        trusted_hosts=self.config.provider_log_hosts))
+                        trusted_hosts=self.config.provider_log_hosts)
+                report=public_report(package,judgment,call,read_timings(timing_path,cid),self.config,
+                    diagnostics=diagnostics,semantic_status=semantic_status,provider_capture=provider_capture,operation_ids=operation_ids)
                 if semantic_status in {"assessed","assessed_with_uncertainty"}:
                     # Authoritative evidence can downgrade a permissive model
                     # verdict. Coverage describes finalized grades, not the raw
@@ -904,12 +995,23 @@ class Worker:
                     report["review_process"]["semantic_status"]=("assessed_with_uncertainty"
                         if any(report["checks"][d]["verdict"]=="uncertain" for d in DIMENSIONS) else "assessed")
                 if cached:report["supersedes_review_version"]=cached.get("review_version","unknown")
+                if reuse:
+                    report["review_process"]["semantic_grades_reused_from"]=cached.get("review_version")
+                    previous=(cached.get("review_process") or {}).get("judge_prompt_revision")
+                    if isinstance(previous,str) and re.fullmatch(r"[a-z0-9-]{1,80}",previous):report["review_process"]["judge_prompt_revision"]=previous
                 # Persist completed review before any LangSmith network write.
                 self.outbox.save_report(cid,report)
             phase="export"
             receipt=self.langsmith.upload(cid,report,call)
             self.outbox.finish(cid)
             print(canonical({"event":"call_review_exported","run_id":receipt["run_id"],"needs_review":report["needs_review"]}),flush=True)
+            if report.get("needs_review") and self.config.review_queue and not job.get("queued"):
+                # Best effort after the durable finish: a queue outage never fails
+                # or repeats a completed review, and is visible in worker status.
+                try:state=self.langsmith.enqueue(receipt["run_id"])
+                except Exception:state="queue_unavailable"
+                try:self.outbox.mark_queued(cid,state)
+                except (sqlite3.Error,ValueError):pass
         except (EvidenceError,httpx.HTTPError,ValueError,KeyError,TypeError,sqlite3.Error):
             # Never log raw exception text, which can include provider content/URLs.
             import sys
@@ -943,7 +1045,9 @@ class Worker:
         # manufacture a new immutable cloud trace on every polling iteration.
         signature=canonical({k:v for k,v in status.items() if k!="oldest_pending_review_age_seconds"})
         elapsed=self.clock()-float(self.outbox.setting("last_coverage", "0"))
-        if elapsed>=900 or elapsed>=10 and signature!=self.outbox.setting("coverage_signature"):
+        # A status row only when something changed, plus a six-hour heartbeat:
+        # the review project lists calls, not a status row every quarter hour.
+        if elapsed>=21600 or elapsed>=10 and signature!=self.outbox.setting("coverage_signature"):
             try:
                 self.langsmith.coverage(status,self.clock())
                 self.outbox.set_setting("last_coverage",self.clock())

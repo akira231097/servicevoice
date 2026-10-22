@@ -96,7 +96,7 @@ def test_signed_native_call_can_be_reviewed_without_dispatching_another_business
     assert mock.judge_requests==1
     report=next(iter(mock.runs.values()))['outputs']
     assert report['checks']['booking_integrity']['verdict']=='pass'
-    assert report['review_version']==VERSION=='live-call-review-v5'
+    assert report['review_version']==VERSION=='live-call-review-v6'
 
 
 def test_unsigned_native_success_cannot_consume_judge_budget_or_receive_clean_passes(scenario,tmp_path):
@@ -107,18 +107,30 @@ def test_unsigned_native_success_cannot_consume_judge_budget_or_receive_clean_pa
     assert all(report['checks'][d]['verdict']=='uncertain' for d in DIMENSIONS)
 
 
-def test_completed_v4_review_remains_valid_without_automatic_requeue_or_new_judge(scenario,tmp_path):
+def test_completed_v4_review_is_republished_readably_with_its_frozen_grades_and_no_new_judge(scenario,tmp_path):
     worker,mock,now=worker_fixture(tmp_path,scenario);assert worker.tick()
     with closing(worker.outbox.db()) as db,db:
         report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v4'
+        report['checks']['conversation_quality']={'verdict':'fail','issue_code':'unnecessary_repetition','evidence_refs':['turn:2','invented:9'],'explanation':'frozen'}
+        report['review_process']['judge_prompt_revision']='2026-10-19-historical-1'
         db.execute('UPDATE jobs SET report=?',(canonical(report),))
-    now[0]+=901
+    mock.runs.clear();mock.feedback.clear();now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0])
-    assert not restarted.tick()
+    assert restarted.tick()
     assert mock.judge_requests==1 and restarted.outbox.status()['jobs']=={'complete':1}
+    published=next(iter(mock.runs.values()))['outputs']
+    assert published['review_version']=='live-call-review-v6' and published['supersedes_review_version']=='live-call-review-v4'
+    assert published['review_process']['semantic_grades_reused_from']=='live-call-review-v4'
+    assert published['review_process']['judge_prompt_revision']=='2026-10-19-historical-1'
+    # The frozen fail survives; a reference the rebuilt package no longer holds is dropped.
+    assert published['checks']['conversation_quality']['verdict']=='fail'
+    assert published['checks']['conversation_quality']['issue_code']=='unnecessary_repetition'
+    assert published['checks']['conversation_quality']['evidence_refs']==['turn:2']
+    assert published['needs_review'] is True and '1 Summary' in published
     with closing(restarted.outbox.db()) as db:
-        assert json.loads(db.execute('SELECT report FROM jobs').fetchone()[0])['review_version']=='live-call-review-v4'
+        assert json.loads(db.execute('SELECT report FROM jobs').fetchone()[0])['review_version']=='live-call-review-v6'
         assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==1
+    assert not Worker(worker.config,client=worker.client,clock=lambda:now[0]).tick() and mock.judge_requests==1
 
 
 def test_four_authored_native_controls_are_explicit_offline_expectations_not_model_or_audio_results(scenario):

@@ -14,14 +14,16 @@
         "SERVICEVOICE_EVAL_SOURCE_DB": "/evidence/servicevoice.sqlite3",
         "SERVICEVOICE_EVAL_DIAGNOSTICS_PATH": "/speech-evidence/tts-diagnostics.sqlite3",
         "SERVICEVOICE_EVAL_OUTBOX": "/evaluations/outbox.sqlite3",
-        "SERVICEVOICE_EVAL_PROJECT": "servicevoice-speech-candidate",
-        "SERVICEVOICE_ENVIRONMENT": "staging",
+        "SERVICEVOICE_EVAL_PROJECT": "servicevoice-call-reviews",
+        "SERVICEVOICE_ENVIRONMENT": "production",
         "VAPI_EVAL_ASSISTANT_ID": "1a2caeaa-21c5-4a3c-ada1-a4b2f5fa8ff7",
         "SERVICEVOICE_EVAL_MONTHLY_LIMIT": "200",
         "SERVICEVOICE_EVAL_MAX_FAILURES": "8",
         "SERVICEVOICE_EVAL_LOOKBACK_HOURS": "24",
         "SERVICEVOICE_EVAL_POLL_SECONDS": "30",
-        "SERVICEVOICE_EVAL_LATENCY_TARGET_MS": "2000"
+        "SERVICEVOICE_EVAL_LATENCY_TARGET_MS": "2000",
+        "SERVICEVOICE_EVAL_ANSWER_TARGET_MS": "3000",
+        "SERVICEVOICE_EVAL_REVIEW_QUEUE": "ServiceVoice calls to review"
       },
       "volumes": [
         "candidate-evaluation-evidence:/evidence:ro",

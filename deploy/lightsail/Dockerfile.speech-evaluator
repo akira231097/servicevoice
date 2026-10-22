@@ -7,7 +7,8 @@ USER root
 RUN mkdir -p /evaluations && chown 10001:10001 /evaluations
 # Copy the complete review/projection closure. Diagnostics uses the fixed
 # generation-field allowlist in observability; the old base lacks that helper.
-COPY app/domain.py app/live_eval_evidence.py app/live_evaluations.py app/diagnostics.py app/evaluation_spans.py app/generation_observability.py app/observability.py app/provider_logs.py /app/app/
+# call_review_presentation renders the readable review and trace children.
+COPY app/domain.py app/live_eval_evidence.py app/live_evaluations.py app/diagnostics.py app/evaluation_spans.py app/generation_observability.py app/observability.py app/provider_logs.py app/call_review_presentation.py /app/app/
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "app.live_evaluations"]
 CMD []

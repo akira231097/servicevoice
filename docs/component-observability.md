@@ -74,6 +74,32 @@ tool arguments, names, phone numbers, credentials, provider URLs and raw
 exceptions are excluded. The private sidecar is revalidated before export;
 writing a new key into its JSON does not make that key exportable.
 
+A phone call records one `webhook` row per provider delivery (speech updates,
+transcripts, status changes), which can be most of a call's events. The
+reviewer reads up to 6,000 events per call and, when a read overflows, drops
+those webhook delivery rows first so gateway, tool, scheduler and speech
+evidence survives; the omitted count stays in coverage. The exported review
+summarizes webhook deliveries as counts by event type, outcome and HTTP status
+and lists every other recorded event.
+
+## Presentation layer
+
+`app/call_review_presentation.py` turns the same content-free evidence into
+the readable review: a headline, summary lines, a scorecard with plain-language
+questions and reasons, one sentence per caller turn, latency and cue sections,
+and a markdown document. It joins sources only through explicit identifiers:
+diagnostics `request_finished` events carry the gateway turn ordinal and the
+request id, timing rows carry the request id, and tool rows carry the harness
+operation id. Provider artifact timings (caller and assistant speech segments,
+per-turn stage latencies) attach to a turn by ordinal only when the artifact
+and the gateway count the same caller turns; otherwise they are listed apart,
+and `join_basis` records which case applied. TTS requests and Vapi model spans
+are never joined to a turn; they are grouped on their own. The persisted
+`review_trace` is the plan for the LangSmith children, so an export retry posts
+identical rows without reading any ledger again. A defect in this layer can
+never block a review: the technical sections stand on their own with
+`presentation_status` set to the failure class.
+
 The session-authorized local diagnostics endpoint and the post-call reader
 must use the call bound to that session. Do not accept an arbitrary caller
 query ID in a public diagnostic endpoint. The provider listener should expose

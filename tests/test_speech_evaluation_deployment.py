@@ -50,8 +50,9 @@ def test_candidate_compose_environment_is_accepted_by_actual_worker_config():
         "VAPI_PHONE_ORG_ID": "00000000-0000-4000-8000-000000000002",
     })
     assert configuration.assistant_id == ASSISTANT
-    assert configuration.project == "servicevoice-speech-candidate"
-    assert configuration.environment == "staging"
+    assert configuration.project == "servicevoice-call-reviews"
+    assert configuration.environment == "production"
+    assert configuration.answer_target_ms == 3000 and configuration.review_queue == "ServiceVoice calls to review"
     assert configuration.monthly_limit == 200 and configuration.max_failures == 8
     assert configuration.poll_seconds == 30 and configuration.lookback_hours == 24
     assert str(configuration.source).replace("\\", "/") == "/evidence/servicevoice.sqlite3"
@@ -74,6 +75,7 @@ def test_separate_review_image_includes_combined_scope_import_dependencies():
         "app/domain.py", "app/live_eval_evidence.py", "app/live_evaluations.py",
         "app/diagnostics.py", "app/evaluation_spans.py",
         "app/generation_observability.py", "app/observability.py", "app/provider_logs.py",
+        "app/call_review_presentation.py",
     ]
     assert 'ENTRYPOINT ["python", "-m", "app.live_evaluations"]' in dockerfile
     assert '"-c"' in dockerfile and "health.json" in dockerfile

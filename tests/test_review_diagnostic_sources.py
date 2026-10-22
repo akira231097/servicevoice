@@ -142,9 +142,11 @@ def test_combined_export_bound_and_each_source_loss_remain_explicit(tmp_path):
                 row={**template,'event_id':str(uuid4()),'start_unix':start+offset/100000}
                 db.execute('INSERT INTO diagnostic_events VALUES (?,?,?,?,?)',
                     (row['event_id'],row['call_key'],row['start_unix'],row['config_id'],canonical(row)))
-    merged=read_review_diagnostics(source,call,speech)
+    assert len(read_review_diagnostics(source,call,speech)['events'])==2002  # default union cap is 6,000
+    merged=read_review_diagnostics(source,call,speech,limit=2000)
     assert len(merged['events'])==merged['coverage']['event_count']==2000
     assert merged['coverage']['read_event_count']==2002 and merged['coverage']['union_events_omitted']==2
+    assert merged['coverage']['omitted_webhook_delivery_events']==0
     assert merged['coverage']['truncated'] is True and merged['coverage']['state']=='incomplete'
     assert 'combined_event_limit_exceeded' in merged['coverage']['reason_codes']
     with closing(sqlite3.connect(speech)) as db,db:
@@ -198,16 +200,19 @@ def test_worker_automatically_exports_both_real_ledgers_with_verified_children_a
     source_before=source.read_bytes()
     assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
     root=next(run for run in mock.runs.values() if run['name']=='voice.call.review')
-    report=root['outputs'];events=[run for run in mock.runs.values() if run.get('extra',{}).get('metadata',{}).get('record_kind')=='component_event']
-    assert {run['name'] for run in events}=={'voice.component.tool_harness.request_finished','voice.component.tts.request_finished'}
-    assert report['trace_export']['exported_event_spans']==2
+    report=root['outputs']
+    # Both ledgers reach the exported review with their source roles; events
+    # that carry no turn, operation or synthesis identity stay listed in the
+    # root rather than being guessed into a turn.
+    assert {(e['component'],e['event'],tuple(e['source_roles'])) for e in report['diagnostics']['events']}=={
+        ('tool_harness','request_finished',('business_runtime',)),('tts','request_finished',('configured_runtime',))}
     assert {entry['role'] for entry in report['diagnostics']['sources']}=={'business_runtime','configured_runtime'}
+    assert report['diagnostics']['event_counts']=={'tool_harness.request_finished.success':1,'tts.request_finished.success':1}
+    assert report['trace_export']['tts']==0 and report['trace_export']['tools']==0 and report['trace_export']['turns']==0
+    assert report['trace_export']['omitted']==2 and len(report['3 Turn-by-turn timeline']['turns'])==2  # untimed turns stay in the root
     assert report['review_process']['diagnostics_coverage_revision']==REVIEW_DIAGNOSTICS_REVISION
     assert report['review_process']['diagnostics_source_sha256']==hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
-    assert all(run['trace_id']==root['id'] for run in events)
-    # TTS request identity does not invent a model generation or audio-turn join.
-    speech_run=next(run for run in events if '.tts.' in run['name'])
-    assert 'turn_id' not in speech_run['extra']['metadata'] and 'generation_id' not in speech_run['extra']['metadata']
+    assert 'PRIVATE CANARY' not in canonical(mock.runs) and 'PRIVATE SECRET' not in canonical(mock.runs)
     assert source.read_bytes()==source_before and mock.judge_requests==1
     frozen=deepcopy(mock.runs)
     restarted=Worker(config,client=worker.client,clock=lambda:clock[0])

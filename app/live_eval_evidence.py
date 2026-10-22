@@ -17,7 +17,7 @@ import sqlite3
 
 from .domain import dealership_facts, TZ, DomainError, normalize_services
 
-VERSION = "live-call-review-v5"
+VERSION = "live-call-review-v6"
 DIMENSIONS = ("hallucination_free", "booking_accuracy", "confirmation_compliance", "action_truthfulness",
               "task_completion", "conversation_quality")
 MAX_MESSAGES = 500
@@ -217,7 +217,8 @@ class Redactor:
         return value
 
 
-def build_evidence(call, snapshot):
+def build_evidence(call, snapshot, tool_ids=None):
+    """Build the judge package. ``tool_ids`` (optional dict) receives ``tool:N`` -> provider tool call id."""
     snapshot = deepcopy(snapshot)
     artifact = call.get("artifact") or {}
     messages = artifact.get("messages")
@@ -292,6 +293,7 @@ def build_evidence(call, snapshot):
                 if tid not in local:issues.append("tool_without_terminal_receipt")
             key = f"tool:{len(tools)+1}"
             tools.append(entry);evidence[key] = entry
+            if tool_ids is not None:tool_ids[key] = tid
     # Reconcile in both directions. A provider artifact can retain plausible
     # dialogue while omitting the tool messages that actually reached this
     # scheduler. The final saved state cannot reconstruct their chronology.
@@ -375,6 +377,19 @@ def latency(call, timings=()):
     values = [r.get("milestones_ms",{}).get("first_text") for r in timings if r.get("outcome") == "completed"]
     values = [v for v in values if numeric(v) is not None]
     if values:result["server_first_text_p95_ms"] = percentile(values)
+    # The real answer starts at the first substantive text or the emitted tool
+    # call of a completed generation; cues and cancelled speculation never count.
+    answers = []
+    for r in timings:
+        if not isinstance(r,dict) or r.get("outcome") not in {"completed","tool_emitted","narrated"}:continue
+        phases = r.get("milestones_ms") if isinstance(r.get("milestones_ms"),dict) else {}
+        candidates = [numeric(phases.get(k)) for k in ("first_text","tool_emitted")]
+        candidates = [v for v in candidates if v is not None]
+        if candidates:answers.append(min(candidates))
+    if answers:
+        result["server_answer_p95_ms"] = percentile(answers)
+        result["server_answer_avg_ms"] = round(sum(answers)/len(answers),3)
+        result["server_answers_measured"] = len(answers)
     # A refunded cue was emitted into a request Vapi discarded before any
     # answer; it never reached speech and must not count as an acknowledgment.
     acknowledged=[r for r in timings if isinstance(r,dict) and isinstance(r.get("backchannel"),dict)

@@ -40,17 +40,17 @@ def test_persisted_generation_exports_as_same_review_root_child_without_model_au
     worker,mock,_=worker_fixture(tmp_path,scenario)
     assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
     root=next(r for r in mock.runs.values()if r['name']=='voice.call.review')
-    generation=next(r for r in mock.runs.values()if r['name']=='voice.gateway.generation')
-    assert generation['parent_run_id']==generation['trace_id']==root['id']
-    assert generation['inputs']['generation_id']==timing['generation_id']
-    assert generation['outputs']['provider_model_span_id'] is None
-    assert generation['outputs']['tts_generation_id'] is None
-    assert generation['outputs']['phone_playback_verified'] is False
-    assert generation['outputs']['late_phone_packet_discard_verified'] is False
+    generation=next(r for r in mock.runs.values()if r.get('parent_run_id') and r['extra']['metadata']['record_kind']=='generation')
+    # Without a diagnostics turn identifier the request is listed, not guessed into a turn.
+    group=next(r for r in mock.runs.values()if r['name'].startswith('gateway requests without a recorded turn'))
+    assert generation['parent_run_id']==group['id'] and group['parent_run_id']==generation['trace_id']==root['id']
+    assert generation['inputs']['generation_id']==timing['generation_id'] and generation['run_type']=='llm'
+    assert generation['name']=='gemini · answer, first text after 0.05 s'
+    assert generation['outputs']['first_text_ms']==50 and generation['outputs']['total_ms']==100
     assert datetime.fromisoformat(generation['end_time'])>datetime.fromisoformat(generation['start_time'])
     assert root['outputs']['gateway_generations']['coverage']['observed_generation_count']==1
-    assert root['outputs']['gateway_generation_export']['observed_generation_count']==1
-    assert root['outputs']['trace_export']['exported_event_spans']==0
+    assert root['outputs']['trace_export']['generations']==1 and root['outputs']['trace_export']['turns']==0
+    assert root['outputs']['review_trace']['join_basis']['provider_model_spans_joined_to_generations'] is False
     assert mock.judge_requests==1
     assert 'PRIVATE' not in canonical(root)+canonical(generation)
 
@@ -64,7 +64,9 @@ def test_legacy_rows_keep_original_missing_identity_coverage_without_inferred_ge
     assert coverage['state']=='unavailable' and coverage['input_rows']==1
     assert coverage['skipped_row_counts']=={'persisted_generation_identity_unavailable':1}
     assert coverage['legacy_generation_ids_inferred'] is False
-    assert not any(r['name']=='voice.gateway.generation'for r in mock.runs.values())
+    # The request is still shown by its persisted request id; no generation id is invented.
+    legacy=next(r for r in mock.runs.values() if r.get('parent_run_id') and r['extra']['metadata']['record_kind']=='generation')
+    assert legacy['inputs']['generation_id'] is None and legacy['extra']['metadata']['generation_id'] is None
     assert report['needs_review'] is False  # Unknown lineage is separate coverage.
 
 
@@ -76,7 +78,7 @@ def test_frozen_generation_projection_and_run_ids_survive_export_retry_without_a
     now[0]+=901;worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
     assert all(mock.runs[key]==value for key,value in frozen.items())
-    assert len([r for r in mock.runs.values()if r['name']=='voice.gateway.generation'])==1
+    assert len([r for r in mock.runs.values()if r.get('parent_run_id') and r['extra']['metadata']['record_kind']=='generation'])==1
     assert len(mock.run_posts)==len(set(mock.run_posts))
 
 

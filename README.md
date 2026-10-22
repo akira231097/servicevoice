@@ -97,20 +97,38 @@ This public repository contains a clean source snapshot. Credentials, customer/c
 ## Automatic live-call reviews
 
 The optional post-call worker reviews completed calls automatically and sends
-private scores and voice timing to its configured LangSmith project. The
-original baseline uses `servicevoice-live-calls`; the isolated Gemini speech
-candidate uses `servicevoice-speech-candidate`. It runs separately from voice generation and mounts the scheduler
-volume read-only. The voice process receives no evaluation Vapi API key.
+a readable review, private scores and voice timing to its configured LangSmith
+project (`servicevoice-call-reviews` for the deployed phone assistant; the
+original baseline used `servicevoice-live-calls`). It runs separately from
+voice generation and mounts the scheduler volume read-only. The voice process
+receives no evaluation Vapi API key.
+
+Each review opens with a one-line headline, a plain-language summary and a
+"what to check" list, then a scorecard, a turn-by-turn timeline (caller speech,
+waiting cue, Gemini request, tool calls, Vapi response delay), latency, waiting
+cues, booking and cost sections, and finally the technical evidence. The trace
+under it has one `turn NN` row per caller turn with its cue, Gemini request and
+tool calls, plus separate groups for speech synthesis and Vapi's own events.
+[How to read a call review](docs/evaluation-walkthrough.html) explains every
+section, feedback key and dashboard tile.
 
 It checks factual grounding, action truthfulness, caller intent versus saved
 booking details, confirmation order and explicit assent, literal reference
-consistency, and available Vapi turn/stage latency. Deterministic checks cannot
-prove human consent; semantic grades are advisory. Missing evidence is uncertain
-with a null score, never a pass. Calls without measured response turns do not
-receive zero-millisecond latency. No prompts, transcripts, customer details,
-tool arguments, raw judge prose or provider signatures are exported to LangSmith.
-The Gemini reviewer receives minimised text evidence; this redaction is not a
-general DLP guarantee.
+consistency, first-response speed (Vapi stage sum) and answer speed (server
+time to the real reply or tool call). Deterministic checks cannot prove human
+consent; semantic grades are advisory. Missing evidence is uncertain with a
+null score, never a pass. `needs_review` flags conversation, booking or
+evidence problems; `slow_call` flags speed separately. Flagged calls are added
+to the LangSmith annotation queue named by `SERVICEVOICE_EVAL_REVIEW_QUEUE` for
+a human listen against a fixed rubric. No prompts, transcripts, customer
+details, tool arguments, raw judge prose or provider signatures are exported to
+LangSmith. The Gemini reviewer receives minimised text evidence; this redaction
+is not a general DLP guarantee.
+
+`python -m evals.langsmith_dashboard --apply` provisions the
+"ServiceVoice · call quality" dashboard and the listening queue;
+`python -m evals.call_report --latest --output review.html` renders the newest
+review as a standalone page.
 
 For Lightsail, copy `deploy/lightsail/evaluation.env.example` to a private,
 owner-only `/etc/servicevoice/evaluation.env`, fill existing provider credentials,
@@ -145,15 +163,16 @@ not counted as successes. Reviews normally follow hang-up by about one or two
 minutes; provider outages and queued calls can take longer.
 
 In LangSmith, inspect `voice.call.review` in the project matching the assistant
-you tested. The original baseline's `live-call-review-v2` records are historical;
-the evaluation branch's candidate reviewer uses `live-call-review-v5`. Check
-each row's review version, source digest and judge prompt revision before
-comparing results. `voice.review.coverage` records immutable worker-status
-snapshots. Earlier versions remain visible; the historical v2 latency correction
-reused frozen semantic grades without another model request. The separate
-reference datasets/experiments remain regression evaluations, not real-call
-performance denominators. See the [candidate reviewer guide](deploy/lightsail/speech-evaluations.md)
-for its separate image, evidence volumes and outbox.
+you tested. The current contract is `live-call-review-v6`; older
+`live-call-review-v4`/`v5` reviews are republished in the v6 layout with their
+frozen advisory grades and no new model request, and `v2` records are
+historical. Check each row's review version, source digest and judge prompt
+revision before comparing results. `voice.review.coverage` records immutable
+worker-status snapshots (tagged `reviewer-status`, at most every six hours or
+on change). The separate reference datasets/experiments remain regression
+evaluations, not real-call performance denominators. See the
+[candidate reviewer guide](deploy/lightsail/speech-evaluations.md) for its
+separate image, evidence volumes and outbox.
 
 The default allowance is 200 post-call model attempts per UTC month per worker,
 including failed attempts, and at most three attempts per call. Budget exhaustion
