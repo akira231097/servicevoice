@@ -27,10 +27,14 @@ authorize an action. Explicit thinking pauses and unfinished conjunctions stay
 silent so the caller can continue.
 
 A routine utterance with fit probability at least 0.90 and margin at least 0.80
-may receive only a neutral pause when the independent subject classification is
-also strong (probability at least 0.95 and confidence at least 0.93). Lookup-style
-phrases and confirmation holds retain the stricter 0.98 fit requirement; language
-compatibility still requires 0.99. This separates phrase-selection risk from
+may receive a neutral pause. The independent subject classification no longer
+gates that pause; it only decides whether a lookup-style phrase may replace it,
+and a confidently unrelated or sensitive subject still keeps the moderate fit
+silent. Lookup-style phrases and confirmation holds retain the stricter 0.98 fit
+requirement; language compatibility still requires 0.99. The first production
+call after the budget refund showed ordinary scheduling turns at 0.91 to 0.96
+fit staying silent only because the subject answer was unsure which routine
+kind applied. This separates phrase-selection risk from
 business authority, following TypeSafe's guidance to
 [validate thresholds for the consequences of each action](https://docs.typesafe.ai/confidence).
 The reproducible synthetic corpus in `scripts/benchmark_phone_waiting.py` covers
@@ -42,12 +46,25 @@ stop requests, urgent situations, unsupported language, stale context, and faile
 classification suppress it. Any allowed confirmation hold is restricted to a
 neutral pause; business validation and confirmation requirements remain separate.
 Signed tool-follow-up requests reuse only the caller context for classification,
-not tool arguments or results, and share the same one-cue-per-turn limit.
+not tool arguments or results. Because a lookup turn spans two generations (the
+tool call, then the answer built on its result), the budget grants such a
+request one follow-up cue: always a neutral hold, never the phrase the turn
+already heard, and only once at least 2.5 seconds have passed since the turn's
+first emission. The timing row and the `backchannel.emitted` diagnostic mark it
+`follow_up`, and the evaluator reports `server_follow_up_acknowledgments`.
 
-The budget permits at most one cue per caller turn, separated by at least one
-second and capped at four within 15 seconds. It does not shut off after four
-cues over an entire conversation. Completed or expired sessions can retire their
-budget entries without evicting active calls.
+The budget permits at most one cue per caller turn plus that one follow-up,
+separated by at least one second and capped at four within 15 seconds. It does
+not shut off after four cues over an entire conversation. Completed or expired
+sessions can retire their budget entries without evicting active calls.
+
+The scheduler's `date` stage (a search that returned no slots, so the caller is
+choosing another day) is ordinary scheduling conversation and is eligible like
+`service` and `slot`; before 2026-10-22 it was rejected as an unknown stage and
+every generation in that stretch stayed silent. In the verified booking
+confirmation context, unconditional approvals such as "Yes, that's correct",
+"Confirm" or "Sounds good" now qualify for the neutral confirmation hold, which
+still requires the server's own proposal check and Jev's veto-only question.
 
 Vapi starts speculative model requests while a caller is still speaking and
 cancels or replaces them as speech continues; it discards whatever those

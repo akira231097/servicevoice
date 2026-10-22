@@ -1360,17 +1360,21 @@ class GeminiGateway:
         streams=[]
         selection_context = None
         policy_messages=upstream["messages"]
+        follow_up=False
         if policy_messages and policy_messages[-1].get("role")=="tool":
             # prepare_request already verified the signed tool group and its
             # authoritative receipt. Reuse only the caller context; tool data
             # and generated action prose never enter the optional classifier.
+            # This request answers the same caller turn after a tool result, so
+            # the budget may grant it one spaced follow-up cue.
+            follow_up=True
             caller=next((index for index in range(len(policy_messages)-1,-1,-1)
                          if policy_messages[index].get("role")=="user"),None)
             policy_messages=policy_messages[:caller+1] if caller is not None else []
         async def read_context():
             # Shield only the physical read: timed-out thread work retains its
             # slot until done, but neither classifier nor main waits for it.
-            async with asyncio.timeout(.06):
+            async with asyncio.timeout(.08):
                 if len(self.backchannel_reads)>=self.limits.concurrency:raise TimeoutError()
                 candidates=tuple(self.backchannel_budget.calls) if len(self.backchannel_budget.calls)>=self.backchannel_budget.capacity else ()
                 def inspect():
@@ -1395,7 +1399,7 @@ class GeminiGateway:
             nonlocal selection_context
             from .backchannel_policy import BackchannelDecision
             try:
-                async with asyncio.timeout(.45):
+                async with asyncio.timeout(.48):
                     selection_context=await read_context()
                     def requested():timing.row["backchannel"]["requests"]=1
                     return await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
@@ -1406,7 +1410,7 @@ class GeminiGateway:
                                     "classification_ms":None,"probability":None,"confidence":None,"requests":0,
                                     "policy_elapsed_ms":None,"language_choice":None,"language_probability":None,
                                     "language_confidence":None,"content_kind":None,"content_probability":None,
-                                    "content_confidence":None,"audible_playback":"unverified"}
+                                    "content_confidence":None,"follow_up":False,"audible_playback":"unverified"}
         timing.row["sse_response_id"]="chatcmpl-"+uuid4().hex
         primary=asyncio.create_task(prime_answer())
         policy=asyncio.create_task(choose())
@@ -1455,12 +1459,15 @@ class GeminiGateway:
                     if state is None:record["reason"]=reason
                     elif selection_context is None or current!=selection_context:record["reason"]="scheduler_changed"
                     elif not primary.done():
+                        # A follow-up after a tool result is always a neutral
+                        # hold and avoids the phrase the turn already heard.
                         phrase=waiting_phrase(decision,state["user_count"],self.backchannel_budget.previous_phrase(call_id),
-                            neutral_only=state["neutral_confirmation"])
+                            neutral_only=state["neutral_confirmation"] or follow_up)
                         record["phrase_id"]=phrase
-                        allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase)
+                        allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up)
                         record["reason"]=reason
                         if allowed:
+                            record["follow_up"]=follow_up
                             timing.backchannel_budget_stamp=self.backchannel_budget.receipt(call_id)
                             timing.before_finish=lambda:self._backchannel_refund(call_id,timing)
                     else:allowed=False; record["reason"]="primary_ready"
@@ -1553,6 +1560,7 @@ class GeminiGateway:
                 attributes={"generation_id":timing.row["generation_id"],"backchannel_phrase":record["phrase_id"],
                     "backchannel_reason":record.get("refund_reason") if event=="backchannel.refunded" else record["reason"],
                     **({"backchannel_refunded":True,"backchannel_refund_reason":record.get("refund_reason")} if record.get("refunded") else {}),
+                    "backchannel_follow_up":record.get("follow_up") is True,
                     "classifier_ms":record["classification_ms"],
                     "backchannel_probability":record["probability"],"backchannel_confidence":record["confidence"],
                     "classifier_requests":record["requests"],"policy_elapsed_ms":record["policy_elapsed_ms"],

@@ -530,7 +530,7 @@ def feedback_rows(run_id,report):
             "comment":"Coverage only: bounded provider log capture, not agent quality, audible interruption or phone playback proof."}
     for key,value in report["latency"].items():
         if type(value) in (int,float):
-            comment=("Count of observed measurements, not a duration." if key in {"measured_turns","server_acknowledgments_emitted"}
+            comment=("Count of observed measurements, not a duration." if key in {"measured_turns","server_acknowledgments_emitted","server_follow_up_acknowledgments"}
                      else "Milliseconds. Lower latency is better; server yield is not phone playback.")
             yield {"key":"latency_"+key,"score":value,"value":value,"comment":comment}
 

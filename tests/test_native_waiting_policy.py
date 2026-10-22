@@ -159,9 +159,14 @@ def test_new_phrase_and_semantic_evidence_survive_content_free_projection():
     (.93, "scheduling_request", 1., "moment"),
     (.97, "information_question", 1., "moment"),
     (.93, "other", 1., "silence"),
-    (.93, "scheduling_request", .94, "silence"),
+    # An unsure subject answer no longer withholds the neutral pause (2026-10-22
+    # production review); only a confidently unrelated/sensitive subject does.
+    (.93, "scheduling_request", .94, "moment"),
+    (.91, "ordinary_detail", .5, "moment"),
+    (.93, "other", .6, "moment"),
+    (.89, "scheduling_request", 1., "silence"),
 ])
-def test_moderate_fit_needs_independent_routine_subject_and_only_permits_neutral_pause(probability, kind, subject_probability, expected):
+def test_moderate_fit_permits_only_a_neutral_pause_unless_the_subject_is_confidently_other(probability, kind, subject_probability, expected):
     value = answer(kind)
     value["answers"]["acknowledgment"].update(
         probabilities={"ordinary_content": probability, "excluded_content": 1-probability}, confidence=2*probability-1)
