@@ -302,7 +302,8 @@ class ProviderMock:
             if request.method=='GET':
                 return result([q for q in self.queues.values() if q['name']==request.url.params.get('name')])
             body=json.loads(request.content);self.queue_posts.append(body)
-            assert body['rubric_items'] and body['rubric_instructions'] and body['session_ids']==[self.project]
+            # LangSmith refuses a queue bound to a project without a reference dataset (400).
+            assert body['rubric_items'] and body['rubric_instructions'] and 'session_ids' not in body
             self.queues[body['id']]={'id':body['id'],'name':body['name']};return result(self.queues[body['id']],201)
         if path.startswith('/annotation-queues/') and path.endswith('/queues'):
             return result([self.queues[q] for q in self.queued.get(path.split('/')[2],())])

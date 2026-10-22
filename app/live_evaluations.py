@@ -741,7 +741,10 @@ class LangSmith:
             body={"id":str(uuid5(NAMESPACE_URL,self.config.workspace+":"+self.config.project+":queue:"+name)),"name":name,
                 "description":"Calls the automatic review flagged for a human listen. Open each item, listen in Vapi, answer the rubric.",
                 "rubric_instructions":REVIEW_QUEUE_RUBRIC["instructions"],"rubric_items":REVIEW_QUEUE_RUBRIC["items"],
-                "num_reviewers_per_item":1,"enable_reservations":False,"session_ids":[self.ensure_project()]}
+                # A queue bound to a project needs that project to carry a reference
+                # dataset (LangSmith answers 400 otherwise); runs from any project can
+                # be added to an unbound queue, so the queue stands on its own.
+                "num_reviewers_per_item":1,"enable_reservations":False}
             try:self.request("POST","/annotation-queues",body=body,allowed=(200,201))
             except EvidenceError as exc:
                 if str(exc)!="http_409":raise

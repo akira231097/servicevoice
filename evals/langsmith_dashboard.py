@@ -180,7 +180,9 @@ def ensure_queue(client, apply, project, name):
         return None, "would_create"
     body = {"name": name, "description": "Calls the automatic review flagged for a human listen. Open each item, listen in Vapi, answer the rubric.",
             "rubric_instructions": REVIEW_QUEUE_RUBRIC["instructions"], "rubric_items": REVIEW_QUEUE_RUBRIC["items"],
-            "num_reviewers_per_item": 1, "enable_reservations": False, "session_ids": [project]}
+            # Binding the queue to the project requires a reference dataset on that
+            # project (LangSmith answers 400); an unbound queue accepts any run.
+            "num_reviewers_per_item": 1, "enable_reservations": False}
     created = client.call("POST", "/api/v1/annotation-queues", body=body, allowed=(200, 201))
     return str(UUID(created["id"])), "created"
 
