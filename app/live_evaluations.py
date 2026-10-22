@@ -227,6 +227,9 @@ class Outbox:
             # v1-v3 reviews are judged again; v4/v5 reviews keep their frozen
             # advisory grades and are re-exported in the readable v6 layout.
             db.execute("UPDATE jobs SET state='pending',lease=0,next_attempt=?,completed=NULL WHERE state='complete' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v1','live-call-review-v2','live-call-review-v3','live-call-review-v4','live-call-review-v5')",(clock(),))
+            # A job dead-lettered only because LangSmith kept answering 429 was
+            # throttled, not broken; throttling no longer counts as a failure.
+            db.execute("UPDATE jobs SET state='pending',failures=0,lease=0,next_attempt=? WHERE state='deadletter' AND last_error='export_http_429'",(clock(),))
         if os.name != "nt":self.path.chmod(0o600)
 
     def db(self):
@@ -1041,8 +1044,11 @@ class Worker:
             # A known immutable readback waits briefly but still consumes the
             # bounded failure allowance; a real mismatch cannot retry forever.
             delay=15 if ingestion_pending else min(900,30*2**min(job["failures"],5))
-            delay=max(delay,getattr(error,"retry_after_seconds",0))
-            self.outbox.retry(cid,code,delay,max_failures=self.config.max_failures)
+            throttled=getattr(error,"retry_after_seconds",0)
+            delay=max(delay,throttled)
+            # A provider's explicit Retry-After is a wait, not a defect of this
+            # review: it never moves a job towards the dead-letter limit.
+            self.outbox.retry(cid,code,delay,failure=not throttled,max_failures=self.config.max_failures)
         return True
 
     def heartbeat(self,error=None):

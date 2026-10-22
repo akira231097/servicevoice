@@ -417,6 +417,7 @@ def test_batch_rate_limit_honors_numeric_retry_after_without_another_judge_or_bu
         pending=dict(db.execute('SELECT * FROM jobs').fetchone())
     assert pending['last_error']=='export_http_429' and pending['next_attempt']==now[0]+120
     assert pending['report'] and not mock.feedback and mock.judge_requests==1
+    assert pending['failures']==0  # provider throttling is a wait, never a step towards dead-lettering
     now[0]+=119;assert not worker.tick()
     now[0]+=1;assert worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
@@ -424,6 +425,22 @@ def test_batch_rate_limit_honors_numeric_retry_after_without_another_judge_or_bu
     with closing(worker.outbox.db()) as db:
         assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==1
         assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]==1
+
+
+def test_job_dead_lettered_only_by_throttling_is_requeued_on_restart(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario);worker.outbox.discover(worker.config.source)
+    call=mock.call['id']
+    with closing(worker.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='export_http_429' WHERE call_id=?",(call,))
+    assert 'review_deadletters_require_operator_action' in worker.outbox.status()['alerts']
+    restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert restarted.outbox.status()['jobs']=={'pending':1} and restarted.outbox.status()['alerts']==[]
+    assert restarted.tick() and restarted.outbox.status()['jobs']=={'complete':1}
+    # Any other dead-letter reason still needs an operator.
+    with closing(restarted.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='provider_call_identity_mismatch' WHERE call_id=?",(call,))
+    again=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert again.outbox.status()['jobs']=={'deadletter':1}
 
 
 def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_component_evidence(scenario,tmp_path):
