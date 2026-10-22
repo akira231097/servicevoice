@@ -256,8 +256,8 @@ def test_budget_cooldown_and_same_turn_cannot_repeat_ack_but_primary_always_comp
         monkeypatch.setattr(module, "ACK_DELAY_SECONDS", 1)
         clock = [10.]
         class ObservedBudget(BackchannelBudget):
-            def consume(self, *args):
-                result = super().consume(*args)
+            def consume(self, *args, **kwargs):
+                result = super().consume(*args, **kwargs)
                 consumed.set()
                 return result
         gateway.backchannel_budget = ObservedBudget(cooldown_seconds=15, per_call=2, window_seconds=1000, clock=lambda: clock[0])

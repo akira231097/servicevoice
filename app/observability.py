@@ -567,7 +567,8 @@ def safe_backchannel_timing(cue):
         "language_confidence":"backchannel_language_confidence",
         "content_kind":"backchannel_content_kind", "content_probability":"backchannel_content_probability",
         "content_confidence":"backchannel_content_confidence",
-        "refunded":"backchannel_refunded", "refund_reason":"backchannel_refund_reason"}
+        "refunded":"backchannel_refunded", "refund_reason":"backchannel_refund_reason",
+        "follow_up":"backchannel_follow_up"}
     attributes = safe_attributes({target:cue.get(source) for source,target in fields.items()})
     return {**{source:attributes[target] for source,target in fields.items() if target in attributes},
         "evidence_scope":"gateway_yield_not_audible_playback"}

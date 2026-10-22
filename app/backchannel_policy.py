@@ -43,7 +43,15 @@ _UNFINISHED_TAIL = re.compile(r"\b(?:and|or|because|but|uh|um)[.,!? ]*$", re.I)
 _PRIVATE = re.compile(r"\b(?:phone|email|address|credit card|card number|social security|password|passcode|pin|account number)\b|\S+@\S+|\d[\d ().+-]{5,}\d", re.I)
 _NAME_QUESTION = re.compile(r"\b(?:your (?:full )?name|who (?:am i|is this)|what (?:name|should i call you))\b", re.I)
 _WAITING_PRIOR = re.compile(r"\b(?:confirm|confirmation|booked|reference|is that correct|shall i|ready to book|goodbye|proposal|readback)\b", re.I)
-_CLEAR_APPROVAL = re.compile(r"^(?:(?:yes|yep|yeah)(?:[,! .]+please)?|(?:(?:yes|yep|yeah)[,! .]+)?(?:please )?(?:book (?:it|that)|confirm (?:it|the booking)|go ahead(?: and book it)?))[.! ]*$", re.I)
+_AFFIRMATION = r"(?:yes|yep|yeah|yup|sure|okay|ok|correct)"
+# One unconditional approval, optionally led by an affirmation and "please";
+# any added clause fails the full match and keeps the verified-confirmation
+# exception closed. Observed on 2026-10-22: "yes, that's correct" style
+# approvals of a booking readback stayed silent for about two seconds.
+_APPROVAL = (r"(?:" + _AFFIRMATION + r"|please|that(?:['’]?s| is) (?:correct|right|fine|good|perfect)|that works|works for me|sounds good|perfect"
+             r"|book (?:it|that|this|the appointment)|confirm(?: (?:it|that|this|the booking|the appointment))?"
+             r"|go ahead(?: and (?:book|confirm) (?:it|that|this))?)")
+_CLEAR_APPROVAL = re.compile(r"^(?:" + _AFFIRMATION + r"[,! .]+)?(?:please[,! .]+)?" + _APPROVAL + r"(?:[,! .]+please)?[.! ]*$", re.I)
 _BOOKING_READBACK = re.compile(r"\b(?:confirm|readback|shall i book|would you like me to book|ready to book)\b", re.I)
 _OTHER_ACTION = re.compile(r"\b(?:cancel(?:lation|led|ing)?|reschedul(?:e|ing)|refund|delete|withdraw|handoff)\b", re.I)
 
@@ -76,7 +84,7 @@ def waiting_state(messages, context=None):
             if name == "has_pending_proposal" or (name == "active_confirmation" and confirmation_context):continue
             if name in context and context[name] is not False:return None, "sensitive_context"
         stage = context.get("stage", "service")
-        if stage not in {"service", "slot", "details", "confirmation", "complete", "handoff"}:return None, "invalid_context"
+        if stage not in {"service", "slot", "date", "details", "confirmation", "complete", "handoff"}:return None, "invalid_context"
         if stage == "handoff" or (stage in {"confirmation", "complete"} and not confirmation_context):return None, "sensitive_context"
         if "has_pending_proposal" in context and context["has_pending_proposal"] is not False:
             if context["has_pending_proposal"] is not True or (stage != "details" and not confirmation_context):return None, "sensitive_context"
@@ -187,7 +195,7 @@ def eligible_state(messages, context=None):
         if any(name in context and context[name] is not False for name in _RISK_FLAGS):
             return None, "sensitive_context"
         if "stage" in context:
-            if not isinstance(context["stage"], str) or context["stage"] not in {"service", "slot", "details", "confirmation", "complete", "handoff"}:
+            if not isinstance(context["stage"], str) or context["stage"] not in {"service", "slot", "date", "details", "confirmation", "complete", "handoff"}:
                 return None, "invalid_context"
             if context["stage"] in {"confirmation", "complete", "handoff"}:return None, "sensitive_context"
     if not isinstance(messages, list) or not 1 <= len(messages) <= 200 or any(not isinstance(m, dict) for m in messages):
@@ -341,13 +349,16 @@ class BackchannelPolicy:
                 scores = sorted(probabilities.values(), reverse=True)
                 if selection in {"silence", "excluded_content"}:return result("classifier_silence")
                 strong = scores[0] >= .98 and scores[0]-scores[1] >= .96
-                # A neutral pause carries no lookup/progress or agreement claim.
-                # Permit a lower fit threshold only when an independent subject
-                # question strongly recognizes routine content. Confirmation and
-                # legacy listening cues retain the original stricter threshold.
-                neutral_routine = (native_waiting and not state.get("neutral_confirmation")
-                    and kind in {"information_question", "scheduling_request", "ordinary_detail", "factual_correction"}
-                    and subjects[kind] >= .95 and subject_confidence >= .93
+                # A neutral pause carries no lookup/progress or agreement claim,
+                # so a routine fit of at least 0.90 with a 0.80 margin permits
+                # it on its own. The independent subject answer only decides in
+                # waiting_phrase whether a lookup-style phrase may replace the
+                # neutral one. Observed on 2026-10-22: ordinary scheduling turns
+                # at 0.91-0.96 fit stayed silent only because the subject answer
+                # was unsure which routine kind applied. Confirmation and legacy
+                # listening cues retain the original stricter threshold.
+                confident_other = (native_waiting and kind == "other" and subjects[kind] >= .90 and subject_confidence >= .90)
+                neutral_routine = (native_waiting and not state.get("neutral_confirmation") and not confident_other
                     and scores[0] >= .90 and scores[0]-scores[1] >= .80)
                 if not (strong or neutral_routine):return result("classification_uncertain")
                 # Exact clip selection belongs to code, never free text or a
