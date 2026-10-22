@@ -261,7 +261,11 @@ class Outbox:
     def claim(self):
         with closing(self.db()) as db,db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_attempt<=? AND lease<? ORDER BY created LIMIT 1",(self.clock(),self.clock())).fetchone()
+            # Calls awaiting their first review under this contract come before
+            # the republication of earlier contracts' frozen reviews.
+            row = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_attempt<=? AND lease<? "
+                "ORDER BY (report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version')<>?) ASC, created LIMIT 1",
+                (self.clock(),self.clock(),VERSION)).fetchone()
             if row is None:return None
             db.execute("UPDATE jobs SET lease=?,attempts=attempts+1 WHERE call_id=?",(self.clock()+300,row["call_id"]))
             return dict(row)
@@ -343,7 +347,13 @@ class Outbox:
             used=db.execute("SELECT used FROM budgets WHERE month=?",(month,)).fetchone()
             eligible={r[0]:r[1] for r in db.execute("SELECT eligible_ended,COUNT(*) FROM jobs GROUP BY eligible_ended")}
             semantic={r[0]:r[1] for r in db.execute("SELECT evaluation_reason,COUNT(*) FROM jobs WHERE state='complete' GROUP BY evaluation_reason")}
-            oldest=db.execute("SELECT MIN(ended) FROM jobs WHERE state='pending' AND eligible_ended=1").fetchone()[0]
+            # A historical review republished under a newer contract keeps its old
+            # call end time. It is scheduled work, not a late review: the backlog
+            # alert (and the container health check behind it) count only calls
+            # that still await their first review under the current contract.
+            republish="(report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version')<>?)"
+            oldest=db.execute("SELECT MIN(ended) FROM jobs WHERE state='pending' AND eligible_ended=1 AND NOT "+republish,(VERSION,)).fetchone()[0]
+            republishing=db.execute("SELECT COUNT(*) FROM jobs WHERE state='pending' AND "+republish,(VERSION,)).fetchone()[0]
             lag=db.execute("SELECT AVG(MAX(0,completed-ended)),MAX(MAX(0,completed-ended)) FROM jobs WHERE state='complete' AND completed IS NOT NULL AND ended IS NOT NULL").fetchone()
             queued={r[0]:r[1] for r in db.execute("SELECT queued,COUNT(*) FROM jobs WHERE queued IS NOT NULL GROUP BY queued")}
         ended_count=eligible.get(1,0);complete=counts.get("complete",0);fully_scored=semantic.get("assessed",0)
@@ -365,7 +375,8 @@ class Outbox:
                 "deadletter_calls":counts.get("deadletter",0),"completed_review_fraction":complete/ended_count if ended_count and complete<=ended_count else None,
                 "semantic_assessment_fraction":assessed/ended_count if ended_count and assessed<=ended_count else None,
                 "interpretation":"Known-ended calls are the review denominator. Unavailable/active/unknown eligibility is reported separately; unknown is never pass."},
-            "oldest_pending_review_age_seconds":pending_age,"average_review_lag_seconds":lag[0],"max_review_lag_seconds":lag[1],
+            "oldest_pending_review_age_seconds":pending_age,"republishing_earlier_reviews":republishing,
+            "average_review_lag_seconds":lag[0],"max_review_lag_seconds":lag[1],
             "semantic_status_counts":{k or "legacy_unknown":v for k,v in semantic.items()},"alerts":alerts,
             "human_review_queue":{"queued":queued.get("queued",0)+queued.get("already_queued",0),"queue_unavailable":queued.get("queue_unavailable",0),
                 "interpretation":"Calls flagged needs_review are added to the LangSmith annotation queue for a human listen; a queue outage never blocks the review itself."},
