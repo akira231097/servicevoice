@@ -163,10 +163,12 @@ not counted as successes. Reviews normally follow hang-up by about one or two
 minutes; provider outages and queued calls can take longer.
 
 In LangSmith, inspect `voice.call.review` in the project matching the assistant
-you tested. The current contract is `live-call-review-v6`; older
-`live-call-review-v4`/`v5` reviews are republished in the v6 layout with their
-frozen advisory grades and no new model request, and `v2` records are
-historical. Check each row's review version, source digest and judge prompt
+you tested. The current contract is `live-call-review-v6`. Earlier
+`live-call-review-v4`/`v5` reviews stay as they were exported (LangSmith only
+accepts runs dated within a day of the upload, so older calls cannot be
+republished); a v4/v5 review still pending at upgrade time is published in the
+v6 layout with its frozen advisory grades and no new model request, and `v2`
+records are historical. Check each row's review version, source digest and judge prompt
 revision before comparing results. `voice.review.coverage` records immutable
 worker-status snapshots (tagged `reviewer-status`, at most every six hours or
 on change). The separate reference datasets/experiments remain regression

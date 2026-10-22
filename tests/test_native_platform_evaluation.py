@@ -107,13 +107,15 @@ def test_unsigned_native_success_cannot_consume_judge_budget_or_receive_clean_pa
     assert all(report['checks'][d]['verdict']=='uncertain' for d in DIMENSIONS)
 
 
-def test_completed_v4_review_is_republished_readably_with_its_frozen_grades_and_no_new_judge(scenario,tmp_path):
+def test_pending_v4_review_is_published_readably_with_its_frozen_grades_and_no_new_judge(scenario,tmp_path):
     worker,mock,now=worker_fixture(tmp_path,scenario);assert worker.tick()
+    # A v4 review whose export was still pending at upgrade time (a completed one
+    # is never requeued) is published under the current contract.
     with closing(worker.outbox.db()) as db,db:
         report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v4'
         report['checks']['conversation_quality']={'verdict':'fail','issue_code':'unnecessary_repetition','evidence_refs':['turn:2','invented:9'],'explanation':'frozen'}
         report['review_process']['judge_prompt_revision']='2026-10-19-historical-1'
-        db.execute('UPDATE jobs SET report=?',(canonical(report),))
+        db.execute("UPDATE jobs SET report=?,state='pending',lease=0,next_attempt=0,completed=NULL",(canonical(report),))
     mock.runs.clear();mock.feedback.clear();now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0])
     assert restarted.tick()

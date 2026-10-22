@@ -35,6 +35,9 @@ from .call_review_presentation import (LATENCY_CHECKS, MAX_TURNS, TRACE_VERSION,
     markdown_report, review_metadata, review_tags, feedback_rows as presentation_feedback_rows)
 
 REUSABLE_VERSIONS = frozenset({"live-call-review-v4", "live-call-review-v5"})
+# LangSmith rejects a posted run whose start time is more than a day away from
+# the upload time; an hour of margin covers clock skew and a slow export.
+LANGSMITH_RUN_WINDOW_SECONDS = 23 * 3600
 REVIEW_QUEUE_RUBRIC = {
     "instructions": ("Listen to the recording in the Vapi dashboard (Inputs > vapi_call_url), read the call review's "
                      "summary and timeline, then answer each question. Score 1 = yes, 0 = no. Leave a question blank "
@@ -222,18 +225,16 @@ class Outbox:
                                      ("eligible_ended","INTEGER"),("ended","REAL"),("evaluation_reason","TEXT"),("queued","TEXT")):
                 if name not in columns:db.execute("ALTER TABLE jobs ADD COLUMN "+name+" "+declaration)
             db.execute("INSERT OR IGNORE INTO settings VALUES ('capture_since',?)",(str(clock()-lookback_hours*3600),))
-            # A new review contract requires an append-only review, not relabeled old
-            # passes. Existing provider-attempt budgets and old reports survive.
-            # v1-v3 reviews are judged again; v4/v5 reviews keep their frozen
-            # advisory grades and are re-exported in the readable v6 layout.
-            db.execute("UPDATE jobs SET state='pending',lease=0,next_attempt=?,completed=NULL WHERE state='complete' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v1','live-call-review-v2','live-call-review-v3','live-call-review-v4','live-call-review-v5')",(clock(),))
+            # A completed review of an earlier contract stays complete and untouched:
+            # LangSmith accepts a run only when its start time lies within a day of
+            # the upload, so an older call cannot be republished, and a worker of an
+            # earlier contract (after a rollback) must never find finished work
+            # pending again. A review still pending at upgrade time is published
+            # under this contract with its frozen grades (REUSABLE_VERSIONS) and no
+            # new model request.
             # A job dead-lettered only because LangSmith kept answering 429 was
             # throttled, not broken; throttling no longer counts as a failure.
             db.execute("UPDATE jobs SET state='pending',failures=0,lease=0,next_attempt=? WHERE state='deadletter' AND last_error='export_http_429'",(clock(),))
-            # A dead-lettered review of an EARLIER contract whose cloud run no
-            # longer matched its local report is republished under this contract
-            # with a new run id; the frozen earlier run is never rewritten.
-            db.execute("UPDATE jobs SET state='pending',failures=0,lease=0,next_attempt=? WHERE state='deadletter' AND last_error='run_readback_mismatch_or_ingestion_pending' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v4','live-call-review-v5')",(clock(),))
         if os.name != "nt":self.path.chmod(0o600)
 
     def db(self):
@@ -266,15 +267,16 @@ class Outbox:
                 db.execute("INSERT OR IGNORE INTO jobs(call_id,session_id,created,next_attempt) VALUES (?,'',?,?)",(call_id,created,max(created+60,self.clock())))
 
     def claim(self):
+        now=self.clock()
         with closing(self.db()) as db,db:
             db.execute("BEGIN IMMEDIATE")
-            # Calls awaiting their first review under this contract come before
-            # the republication of earlier contracts' frozen reviews.
-            row = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_attempt<=? AND lease<? "
-                "ORDER BY (report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version')<>?) ASC, created LIMIT 1",
-                (self.clock(),self.clock(),VERSION)).fetchone()
+            # While a provider's rate limit is in force no job is claimed at all:
+            # cycling through the queue would only collect more 429 answers.
+            throttled=db.execute("SELECT value FROM settings WHERE key='throttled_until'").fetchone()
+            if throttled and float(throttled[0])>now:return None
+            row = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_attempt<=? AND lease<? ORDER BY created LIMIT 1",(now,now)).fetchone()
             if row is None:return None
-            db.execute("UPDATE jobs SET lease=?,attempts=attempts+1 WHERE call_id=?",(self.clock()+300,row["call_id"]))
+            db.execute("UPDATE jobs SET lease=?,attempts=attempts+1 WHERE call_id=?",(now+300,row["call_id"]))
             return dict(row)
 
     def save_report(self,call_id,report):
@@ -339,6 +341,16 @@ class Outbox:
             if failure:
                 db.execute("UPDATE jobs SET state='deadletter',lease=0 WHERE call_id=? AND failures>=?",(call_id,max_failures))
 
+    def deadletter(self,call_id,code):
+        """A failure that no later attempt can repair goes to the operator at once."""
+        if not re.fullmatch(r"[a-z0-9_]{1,100}",code):raise ValueError("invalid_retry_reason")
+        with closing(self.db()) as db,db:
+            db.execute("UPDATE jobs SET state='deadletter',lease=0,last_error=?,failures=failures+1 WHERE call_id=?",(code,call_id))
+
+    def throttle(self,seconds):
+        """Pause every claim until a provider's stated rate-limit wait has passed."""
+        self.set_setting("throttled_until",self.clock()+max(0.0,float(seconds)))
+
     def requeue_deadletter(self,call_id):
         if str(UUID(call_id))!=call_id:raise ValueError("invalid_call_identity")
         with closing(self.db()) as db,db:
@@ -354,25 +366,25 @@ class Outbox:
             used=db.execute("SELECT used FROM budgets WHERE month=?",(month,)).fetchone()
             eligible={r[0]:r[1] for r in db.execute("SELECT eligible_ended,COUNT(*) FROM jobs GROUP BY eligible_ended")}
             semantic={r[0]:r[1] for r in db.execute("SELECT evaluation_reason,COUNT(*) FROM jobs WHERE state='complete' GROUP BY evaluation_reason")}
-            # A historical review republished under a newer contract keeps its old
-            # call end time. It is scheduled work, not a late review: the backlog
-            # alert (and the container health check behind it) count only calls
-            # that still await their first review under the current contract.
-            republish="(report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version')<>?)"
-            oldest=db.execute("SELECT MIN(ended) FROM jobs WHERE state='pending' AND eligible_ended=1 AND NOT "+republish,(VERSION,)).fetchone()[0]
-            republishing=db.execute("SELECT COUNT(*) FROM jobs WHERE state='pending' AND "+republish,(VERSION,)).fetchone()[0]
+            oldest=db.execute("SELECT MIN(ended) FROM jobs WHERE state='pending' AND eligible_ended=1").fetchone()[0]
+            throttled=db.execute("SELECT value FROM settings WHERE key='throttled_until'").fetchone()
             lag=db.execute("SELECT AVG(MAX(0,completed-ended)),MAX(MAX(0,completed-ended)) FROM jobs WHERE state='complete' AND completed IS NOT NULL AND ended IS NOT NULL").fetchone()
             queued={r[0]:r[1] for r in db.execute("SELECT queued,COUNT(*) FROM jobs WHERE queued IS NOT NULL GROUP BY queued")}
         ended_count=eligible.get(1,0);complete=counts.get("complete",0);fully_scored=semantic.get("assessed",0)
         assessed=fully_scored+semantic.get("assessed_with_uncertainty",0)
         now=self.clock();used_count=used[0] if used else 0
         pending_age=max(0,now-oldest) if oldest is not None else None
-        alerts=[]
+        # Alerts mean the worker is not doing its job (the container health check
+        # fails); warnings are conditions an operator should know about while
+        # reviews continue, such as a spent monthly judge allowance.
+        alerts=[];warnings=[]
         if counts.get("deadletter",0):alerts.append("review_deadletters_require_operator_action")
         if pending_age is not None and pending_age>600:alerts.append("review_backlog_older_than_ten_minutes")
-        if monthly_limit is not None and used_count>=monthly_limit:alerts.append("monthly_judge_budget_exhausted")
+        if monthly_limit is not None and used_count>=monthly_limit:warnings.append("monthly_judge_budget_exhausted")
         if self.setting("provider_discovery_error"):alerts.append("provider_discovery_incomplete")
         if self.setting("source_discovery_error"):alerts.append("scheduler_discovery_incomplete")
+        throttle_wait=max(0.0,float(throttled[0])-now) if throttled else 0.0
+        if throttle_wait:warnings.append("langsmith_rate_limited")
         return {"jobs":counts,"pending_reasons":errors,"monthly_model_attempts_used":used[0] if used else 0,
             "provider_discovery_error":self.setting("provider_discovery_error"),"source_discovery_error":self.setting("source_discovery_error"),
             "coverage":{"discovered_calls":sum(counts.values()),"known_ended_calls":ended_count,"known_active_calls":eligible.get(0,0),
@@ -382,9 +394,9 @@ class Outbox:
                 "deadletter_calls":counts.get("deadletter",0),"completed_review_fraction":complete/ended_count if ended_count and complete<=ended_count else None,
                 "semantic_assessment_fraction":assessed/ended_count if ended_count and assessed<=ended_count else None,
                 "interpretation":"Known-ended calls are the review denominator. Unavailable/active/unknown eligibility is reported separately; unknown is never pass."},
-            "oldest_pending_review_age_seconds":pending_age,"republishing_earlier_reviews":republishing,
+            "oldest_pending_review_age_seconds":pending_age,"rate_limit_wait_seconds":round(throttle_wait,3),
             "average_review_lag_seconds":lag[0],"max_review_lag_seconds":lag[1],
-            "semantic_status_counts":{k or "legacy_unknown":v for k,v in semantic.items()},"alerts":alerts,
+            "semantic_status_counts":{k or "legacy_unknown":v for k,v in semantic.items()},"alerts":alerts,"warnings":warnings,
             "human_review_queue":{"queued":queued.get("queued",0)+queued.get("already_queued",0),"queue_unavailable":queued.get("queue_unavailable",0),
                 "interpretation":"Calls flagged needs_review are added to the LangSmith annotation queue for a human listen; a queue outage never blocks the review itself."},
             "alert_delivery":"Status records only; no external notification destination is configured."}
@@ -398,9 +410,11 @@ def request_json(client,method,url,*,headers=None,body=None,params=None,allowed=
             # Only retain a bounded numeric delay, never arbitrary provider
             # header text. The queue can wait without blocking the voice path.
             retry_after=response.headers.get("retry-after","")
-            if response.status_code==429 and retry_after.isascii() and retry_after.isdigit() and len(retry_after)<=5:
-                seconds=int(retry_after)
-                if 0 <= seconds <= 86400:error.retry_after_seconds=max(15,seconds)
+            if response.status_code==429:
+                # A rate limit is a wait with or without a usable header: a provider
+                # that throttles without Retry-After is still throttling.
+                seconds=int(retry_after) if retry_after.isascii() and retry_after.isdigit() and len(retry_after)<=5 and 0<=int(retry_after)<=86400 else 60
+                error.retry_after_seconds=max(15,seconds)
             raise error
         raw = bytearray()
         for chunk in response.iter_bytes():
@@ -952,6 +966,13 @@ class Worker:
             self.outbox.mark_eligibility(cid,True,ended)
             if self.clock()-ended<45:
                 self.outbox.retry(cid,"waiting_for_final_artifacts",45,failure=False);return True
+            try:started=datetime.fromisoformat(str(call.get("startedAt") or call.get("createdAt")).replace("Z","+00:00")).timestamp()
+            except (ValueError,TypeError):started=ended
+            if self.clock()-started>LANGSMITH_RUN_WINDOW_SECONDS:
+                # LangSmith accepts a run only when its start time lies within a day
+                # of the upload. A review this late can never be exported there, so
+                # it goes to the operator at once instead of retrying for hours.
+                self.outbox.deadletter(cid,"langsmith_run_window_expired");return True
             phase="review"
             cached=json.loads(job["report"]) if job["report"] else None
             reuse=bool(cached) and cached.get("review_version") in REUSABLE_VERSIONS
@@ -1050,8 +1071,10 @@ class Worker:
             delay=15 if ingestion_pending else min(900,30*2**min(job["failures"],5))
             throttled=getattr(error,"retry_after_seconds",0)
             delay=max(delay,throttled)
-            # A provider's explicit Retry-After is a wait, not a defect of this
-            # review: it never moves a job towards the dead-letter limit.
+            # A provider's rate limit is a wait, not a defect of this review: it
+            # never moves a job towards the dead-letter limit, and it pauses every
+            # other claim for the same wait instead of collecting more refusals.
+            if throttled:self.outbox.throttle(delay)
             self.outbox.retry(cid,code,delay,failure=not throttled,max_failures=self.config.max_failures)
         return True
 
@@ -1064,7 +1087,7 @@ class Worker:
         temporary.replace(path)
         # Continuously increasing age stays precise in health.json but does not
         # manufacture a new immutable cloud trace on every polling iteration.
-        signature=canonical({k:v for k,v in status.items() if k!="oldest_pending_review_age_seconds"})
+        signature=canonical({k:v for k,v in status.items() if k not in ("oldest_pending_review_age_seconds","rate_limit_wait_seconds")})
         elapsed=self.clock()-float(self.outbox.setting("last_coverage", "0"))
         # A status row only when something changed, plus a six-hour heartbeat:
         # the review project lists calls, not a status row every quarter hour.
@@ -1113,6 +1136,10 @@ def main():
         closing_worker=True
     signal.signal(signal.SIGTERM,stop)
     signal.signal(signal.SIGINT,stop)
+    # A fresh status before the first review: the container's health check never
+    # judges this worker by the file an earlier worker left behind.
+    try:worker.heartbeat()
+    except Exception:worker.heartbeat("discovery_or_storage_unavailable")
     while not closing_worker:
         try:
             worked=worker.tick();worker.heartbeat()

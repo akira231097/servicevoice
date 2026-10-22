@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import time
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from app.gemini_gateway import SignatureStore, GatewayLimits
 from app.issuance_context import user_context
 from app.live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, Redactor, build_evidence,
     canonical, integrity, latency, read_snapshot)
+from app import live_evaluations
 from app.live_evaluations import (Config, LangSmith, Outbox, Worker, feedback_rows,
     parse_judgment, public_report)
 
@@ -262,7 +264,7 @@ class ProviderMock:
             assert batch['patch']==[] and 1<=len(batch['post'])<=100
             if self.rate_limit_batch_once:
                 self.rate_limit_batch_once=False
-                return httpx.Response(429,json={},headers={'Retry-After':'120'})
+                return httpx.Response(429,json={},headers={'Retry-After':'120'} if getattr(self,'rate_limit_header',True) else {})
             for body in batch['post']:
                 self.run_posts.append(body['id']);self.runs[body['id']]=body
             if self.fail_child_once:self.fail_child_once=False;return result({},503)
@@ -441,19 +443,21 @@ def test_job_dead_lettered_only_by_throttling_is_requeued_on_restart(scenario,tm
         db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='provider_call_identity_mismatch' WHERE call_id=?",(call,))
     again=Worker(worker.config,client=worker.client,clock=lambda:now[0])
     assert again.outbox.status()['jobs']=={'deadletter':1}
-    # A readback mismatch of an earlier contract's review is republished under the
-    # current contract (new run id); the same mismatch under this contract is not.
+    # A readback mismatch stays with the operator whatever contract the stored
+    # review belongs to; nothing is relabeled or republished on restart.
     with closing(again.outbox.db()) as db,db:
         report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v5'
         db.execute("UPDATE jobs SET report=?,last_error='run_readback_mismatch_or_ingestion_pending' WHERE call_id=?",(canonical(report),call))
+    assert Worker(worker.config,client=worker.client,clock=lambda:now[0]).outbox.status()['jobs']=={'deadletter':1}
+    # A 429-only dead letter of an earlier contract is requeued and published under
+    # this contract with its frozen grades and no new model request.
+    with closing(again.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET last_error='export_http_429' WHERE call_id=?",(call,))
     republished=Worker(worker.config,client=worker.client,clock=lambda:now[0])
     assert republished.outbox.status()['jobs']=={'pending':1}
     mock.runs.clear();mock.feedback.clear()
     assert republished.tick() and republished.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
     assert next(iter(mock.runs.values()))['outputs']['review_process']['semantic_grades_reused_from']=='live-call-review-v5'
-    with closing(republished.outbox.db()) as db,db:
-        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='run_readback_mismatch_or_ingestion_pending' WHERE call_id=?",(call,))
-    assert Worker(worker.config,client=worker.client,clock=lambda:now[0]).outbox.status()['jobs']=={'deadletter':1}
 
 
 def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_component_evidence(scenario,tmp_path):
@@ -705,7 +709,8 @@ def test_new_review_contract_rejudges_older_cached_review_without_relabeling_it(
         if previous_version!='live-call-review-v3':
             cached['checks'].pop('task_completion');cached['checks'].pop('conversation_quality')
         cached.pop('evidence_coverage',None)
-        db.execute('UPDATE jobs SET report=?',(canonical(cached),))
+        # Only a review still pending at upgrade time is assessed again; a completed one stays frozen.
+        db.execute("UPDATE jobs SET report=?,state='pending',lease=0,next_attempt=0,completed=NULL",(canonical(cached),))
     mock.runs.clear();mock.feedback.clear()
     now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
@@ -724,7 +729,7 @@ def test_old_review_with_exhausted_attempts_cannot_manufacture_new_dimension_pas
     worker,mock,now=worker_fixture(tmp_path,scenario);worker.tick()
     with closing(worker.outbox.db()) as db,db:
         cached=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);cached['review_version']=previous_version
-        db.execute('UPDATE jobs SET report=?,judge_attempts=3',(canonical(cached),))
+        db.execute("UPDATE jobs SET report=?,judge_attempts=3,state='pending',lease=0,next_attempt=0,completed=NULL",(canonical(cached),))
     mock.runs.clear();mock.feedback.clear();now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
     report=next(iter(mock.runs.values()))['outputs']
@@ -745,7 +750,9 @@ def test_budget_exhaustion_reason_and_true_coverage_denominators_are_visible(sce
     assert status['coverage']['completed_with_unknown_semantics']==1
     assert status['coverage']['completed_review_fraction']==1
     assert status['coverage']['semantic_assessment_fraction']==0
-    assert 'monthly_judge_budget_exhausted' in status['alerts']
+    # A spent allowance is an operator warning, not an unhealthy worker: reviews
+    # continue with explicit unknown semantics.
+    assert 'monthly_judge_budget_exhausted' in status['warnings'] and status['alerts']==[]
 
 
 def test_successful_review_records_lag_and_does_not_claim_provider_audio_visibility(scenario,tmp_path):
@@ -960,3 +967,48 @@ def test_legacy_four_dimension_judgment_cannot_pass_new_rubric(scenario):
     package=build_evidence(scenario[1],read_snapshot(scenario[0].path,scenario[1]['id']))
     value=judgment(package);value.pop('task_completion');value.pop('conversation_quality')
     with pytest.raises(EvidenceError,match='judge_invalid_dimensions'):parse_judgment(value,package)
+
+
+def test_rate_limit_without_retry_after_is_a_wait_that_pauses_every_claim(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.rate_limit_batch_once=True;mock.rate_limit_header=False;assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        pending=dict(db.execute('SELECT * FROM jobs').fetchone())
+    assert pending['state']=='pending' and pending['last_error']=='export_http_429' and pending['failures']==0
+    assert pending['next_attempt']==now[0]+60 and mock.judge_requests==1
+    status=worker.outbox.status(200)
+    assert status['warnings']==['langsmith_rate_limited'] and status['alerts']==[] and status['rate_limit_wait_seconds']==60
+    # Another due job is not claimed while the wait lasts: the queue stops asking.
+    with closing(worker.outbox.db()) as db,db:
+        db.execute("INSERT INTO jobs(call_id,session_id,created,next_attempt,eligible_ended,ended) VALUES (?,'',?,0,1,?)",(str(uuid4()),now[0],now[0]-100))
+    assert worker.outbox.claim() is None
+    now[0]+=60
+    assert worker.outbox.claim() is not None and worker.outbox.status(200)['warnings']==[]
+
+
+def test_review_older_than_the_langsmith_window_is_dead_lettered_at_once(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario)
+    now[0]+=24*3600  # the call started a day ago; LangSmith would refuse its run
+    assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        job=dict(db.execute('SELECT * FROM jobs').fetchone())
+    assert job['state']=='deadletter' and job['last_error']=='langsmith_run_window_expired'
+    assert mock.judge_requests==0 and not mock.runs and not mock.feedback
+    assert 'review_deadletters_require_operator_action' in worker.outbox.status(200)['alerts']
+    with closing(worker.outbox.db()) as db:
+        assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0] is None
+
+
+def test_main_writes_a_heartbeat_before_the_first_review(tmp_path,monkeypatch):
+    events=[]
+    class FakeWorker:
+        def __init__(self,config):self.config=config;self.client=httpx.Client()
+        def tick(self):events.append('tick');return False
+        def heartbeat(self,error=None):events.append(('heartbeat',error))
+    config=configuration(tmp_path,tmp_path/'source.sqlite3')
+    monkeypatch.setattr(live_evaluations.Config,'from_env',classmethod(lambda cls,env=None:config))
+    monkeypatch.setattr(live_evaluations,'Worker',FakeWorker)
+    monkeypatch.setattr(live_evaluations.os,'umask',lambda _:0o077)
+    monkeypatch.setattr(sys,'argv',['reviewer','--once'])
+    assert live_evaluations.main()==0
+    assert events==[('heartbeat',None),'tick',('heartbeat',None)]

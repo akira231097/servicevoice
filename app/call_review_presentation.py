@@ -1149,4 +1149,6 @@ def feedback_rows(run_id, report):
     ]
     for key, value, comment in metrics:
         if type(value) in (int, float) and math.isfinite(value):
+            # LangSmith accepts at most four decimal places on a feedback score.
+            value = value if type(value) is int else round(value, 4)
             yield {"key": key, "score": value, "value": value, "comment": "Measurement, not a score. " + comment}

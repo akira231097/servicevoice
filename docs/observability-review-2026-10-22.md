@@ -93,8 +93,10 @@ was never read.
 - **Human calibration:** calls flagged `needs_review` are queued once in a
   LangSmith annotation queue with a five-question listening rubric; the
   worker's status reports queue health.
-- **Historical reviews republished:** completed v4/v5 reviews are re-exported
-  in the v6 layout with their frozen advisory grades and no new model request.
+- **Earlier reviews stay frozen:** LangSmith accepts a run only when its start
+  time lies within a day of the upload, so completed v4/v5 reviews are not
+  republished; only a review still pending at upgrade time is published in the
+  v6 layout with its frozen grades. The new project fills with new calls.
 - **Project hygiene:** the reviewer exports to `servicevoice-call-reviews`;
   runtime spans go to `servicevoice-runtime`; status rows are tagged
   `reviewer-status` and posted on change or every six hours.

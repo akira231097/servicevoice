@@ -315,25 +315,28 @@ def test_readable_sections_sort_first_and_remain_free_of_private_text(scenario,t
         assert forbidden not in serialized
 
 
-def test_republished_historical_reviews_never_raise_the_backlog_alert_or_fail_health(scenario,tmp_path):
+def test_completed_earlier_reviews_stay_complete_and_a_restart_never_requeues_them(scenario,tmp_path):
     worker,mock,now=worker_fixture(tmp_path,scenario);assert worker.tick()
     with closing(worker.outbox.db()) as db,db:
         report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v5'
         db.execute('UPDATE jobs SET report=?,ended=?',(canonical(report),now[0]-5*86400))
     now[0]+=901
+    # LangSmith will not accept a run dated days ago, and a worker of the earlier
+    # contract must never find finished work pending after a rollback: the review
+    # stays complete, nothing is claimed, no alert and no health failure.
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0])
     status=restarted.outbox.status(200)
-    assert status['jobs']=={'pending':1} and status['republishing_earlier_reviews']==1
-    assert status['oldest_pending_review_age_seconds'] is None and status['alerts']==[]
+    assert status['jobs']=={'complete':1} and status['oldest_pending_review_age_seconds'] is None
+    assert status['alerts']==[] and status['warnings']==[]
     restarted.heartbeat()
     health=json.loads((restarted.config.outbox.parent/'health.json').read_text())
-    assert health['alerts']==[] and health['republishing_earlier_reviews']==1
-    # A call that still awaits its first review under this contract is a real backlog,
-    # and it is claimed before any republication even though it was discovered later.
+    assert health['alerts']==[] and health['warnings']==[] and health['jobs']=={'complete':1}
+    assert restarted.outbox.claim() is None
+    # A call that still awaits its review is a real backlog and is claimed.
     with closing(restarted.outbox.db()) as db,db:
         db.execute("INSERT INTO jobs(call_id,session_id,created,next_attempt,eligible_ended,ended) VALUES (?,'',?,?,1,?)",(str(uuid4()),now[0],now[0]-1,now[0]-700))
     status=restarted.outbox.status(200)
-    assert 'review_backlog_older_than_ten_minutes' in status['alerts'] and status['republishing_earlier_reviews']==1
+    assert 'review_backlog_older_than_ten_minutes' in status['alerts']
     claimed=restarted.outbox.claim()
     assert claimed['report'] is None and claimed['session_id']==''
 
@@ -349,3 +352,13 @@ def test_status_runs_are_rare_and_labelled(scenario,tmp_path):
     assert len(mock.runs)==first+1  # a changed status is a new immutable row
     status=next(r for r in mock.runs.values() if r['name']=='voice.review.coverage')
     assert 'reviewer-status' in status['tags'] and 'not a call' in status['inputs']['scope']
+
+
+def test_metric_feedback_scores_fit_langsmith_precision():
+    report={'checks':{},'review_process':{},'call_summary':{'duration_seconds':19.418},
+        '3 Turn-by-turn timeline':{'details':[{'asr_confidence':0.9837727272727274,'tokens':12}]},
+        '6 Booking and actions':{'provider_cost':{'total_usd':0.017612345}}}
+    rows={r['key']:r for r in feedback_rows(str(uuid4()),report)}
+    # LangSmith refuses a feedback score with more than four decimal places.
+    assert rows['metric_asr_confidence_min']['score']==rows['metric_asr_confidence_min']['value']==0.9838
+    assert rows['metric_cost_usd']['score']==0.0176 and rows['metric_call_seconds']['score']==19.418 and rows['metric_tokens_total']['score']==12

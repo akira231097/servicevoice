@@ -89,13 +89,25 @@ booking, markdown), the `review_trace` children plan, two speed checks
 (`first_response_within_target` from Vapi's stage sum and `answer_within_target`
 from the server's time to the real reply, target `SERVICEVOICE_EVAL_ANSWER_TARGET_MS`),
 the `slow_call` flag separated from `needs_review`, condensed webhook counts and
-the human listening queue (`SERVICEVOICE_EVAL_REVIEW_QUEUE`). Completed v4 and
-v5 reviews are requeued once and republished in the v6 layout with their frozen
-advisory grades and no new model request (`semantic_grades_reused_from`).
-Completed v1–v3 reviews are queued for fresh assessment using their existing
-paid-attempt counters and budget. Exhausted attempts produce unknown semantics,
-not invented passes. Finish any pending v5 export before upgrading, since a
-pending older contract is not relabeled as v6.
+the human listening queue (`SERVICEVOICE_EVAL_REVIEW_QUEUE`). Completed earlier
+reviews stay complete and untouched: LangSmith accepts a run only when its start
+time lies within a day of the upload, so older calls cannot be republished, and a
+worker of an earlier contract never finds finished work pending again after a
+rollback. A v4/v5 review still pending at upgrade time is published in the v6
+layout with its frozen advisory grades and no new model request
+(`semantic_grades_reused_from`); a pending v1–v3 review is assessed afresh using
+its existing paid-attempt counters and budget. Exhausted attempts produce unknown
+semantics, not invented passes. A review whose call started more than 23 hours
+before its export is dead-lettered as `langsmith_run_window_expired` rather than
+retried for hours.
+
+`health.json` separates `alerts` (the worker is not doing its job: dead letters,
+a backlog older than ten minutes, discovery errors; the container health check
+fails) from `warnings` (reviews continue, an operator should know:
+`monthly_judge_budget_exhausted`, `langsmith_rate_limited`). The worker writes a
+heartbeat before its first review, and a 429 from LangSmith, with or without a
+Retry-After header, pauses every claim for the stated wait (default 60 seconds)
+without counting as a failure.
 
 v5 narrowly recognizes a single empty-argument `endCall` whose exact fingerprint
 and current caller anchor match a stored issuance scoped to this call and session.
