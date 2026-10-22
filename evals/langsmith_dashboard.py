@@ -206,24 +206,23 @@ def main(argv=None):
     by_title = {c.get("title") or ("text" if c.get("chart_type") == "text" else None): c for c in current}
     created, updated = [], []
     if args.apply:
+        # A chart is replaced whole (delete, then create) so the stored definition
+        # always equals the plan; dashboards hold no evidence, only queries.
         for index, (kind, chart) in enumerate(planned):
             if kind == "text":
                 match = next((c for c in current if c.get("chart_type") == "text"), None)
-                if match:
-                    client.call("PATCH", "/api/v1/charts/" + match["id"], body={"markdown": chart["markdown"], "index": index})
-                    updated.append("text")
-                else:
-                    client.call("POST", "/api/v1/charts/create", body={"chart_type": "text", "section_id": section_id, "markdown": chart["markdown"], "index": index}, allowed=(200, 201))
-                    created.append("text")
-                continue
-            body = {"title": chart["title"], "description": chart["description"], "chart_type": kind, "series": chart["series"], "section_id": section_id, "index": index}
-            match = by_title.get(chart["title"])
-            if match:
-                client.call("PATCH", "/api/v1/charts/" + match["id"], body={"description": chart["description"], "chart_type": kind, "series": chart["series"], "index": index})
-                updated.append(chart["title"])
+                body = {"chart_type": "text", "section_id": section_id, "markdown": chart["markdown"], "index": index}
+                label = "text"
             else:
-                client.call("POST", "/api/v1/charts/create", body=body, allowed=(200, 201))
-                created.append(chart["title"])
+                match = by_title.get(chart["title"])
+                body = {"title": chart["title"], "description": chart["description"], "chart_type": kind, "series": chart["series"], "section_id": section_id, "index": index}
+                label = chart["title"]
+            if match:
+                client.call("DELETE", "/api/v1/charts/" + match["id"], allowed=(200, 204))
+                updated.append(label)
+            else:
+                created.append(label)
+            client.call("POST", "/api/v1/charts/create", body=body, allowed=(200, 201))
         verified = existing_charts(client, section_id)
         need(len(verified) == len(planned), "dashboard_readback_count_mismatch")
     archived = archive_old_sections(client, args.apply, sections)
