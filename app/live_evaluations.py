@@ -415,9 +415,14 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
     # the latency guard. Only explicit events for this exact call qualify.
     expected_key=hashlib.sha256(call["id"].encode()).hexdigest()
     diagnostic_rows=diagnostics.get("events",[]) if isinstance(diagnostics,dict) else []
+    # An emission later refunded for the same request was discarded by Vapi
+    # with a cancelled or replaced generation; it cannot have masked a turn.
+    refunded_requests={row.get("request_id") for row in diagnostic_rows if isinstance(row,dict) and row.get("call_key")==expected_key
+            and row.get("component")=="gateway" and row.get("event")=="backchannel.refunded"
+            and row.get("outcome")=="observed" and row.get("request_id")} if isinstance(diagnostic_rows,list) else set()
     if isinstance(diagnostic_rows,list) and any(isinstance(row,dict) and row.get("call_key")==expected_key
             and row.get("component")=="gateway" and row.get("event")=="backchannel.emitted"
-            and row.get("outcome")=="observed" for row in diagnostic_rows):
+            and row.get("outcome")=="observed" and row.get("request_id") not in refunded_requests for row in diagnostic_rows):
         metrics["acknowledgment_observed"]=True
         metrics["provider_latency_scope"]="may_include_acknowledgments_not_substantive_answers"
         metrics["acknowledgment_evidence_basis"]="explicit_call_scoped_gateway_event"

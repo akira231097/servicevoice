@@ -53,7 +53,7 @@ COMPONENTS = {
     "evaluator": _component("ServiceVoice reviewer; Gemini and LangSmith", "Final transcript, trusted facts and scheduler evidence", "Advisory grades, component coverage and numeric timing", ["missing_evidence", "judge_unavailable", "budget_exhausted", "export_failure"], "Review status, model attempts, queue lag, grade evidence and export readback", "evaluation"),
 }
 
-EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.suppressed", "tts.cache_hit", "request", "response", "admission", "validation", "generation", "classification", "narration", "execution", "commit", "status", "transcript", "call_started", "call_ended", "synthesis", "review", "export", "reconciliation",
+EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.suppressed", "backchannel.refunded", "tts.cache_hit", "request", "response", "admission", "validation", "generation", "classification", "narration", "execution", "commit", "status", "transcript", "call_started", "call_ended", "synthesis", "review", "export", "reconciliation",
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
@@ -87,8 +87,12 @@ _ENUM_ATTRIBUTES = {
     "tool_name": frozenset({"get_dealership_info", "begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "confirm_action", "dismiss_proposal", "get_appointment", "get_session_context", "get_operation", "prepare_reschedule", "prepare_cancellation", "request_handoff", "withdraw_handoff", "unknown_tool"}),
 }
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "private_detail", "private_prior_turn", "caller_still_formulating"})
+# A cue Vapi discarded with a cancelled or replaced request is refunded; the
+# refund cause is recorded beside the original emission reason, never over it.
+_ENUM_ATTRIBUTES["backchannel_refund_reason"] = frozenset({"generation_cancelled_before_answer", "generation_superseded_before_answer"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= _ENUM_ATTRIBUTES["backchannel_refund_reason"]
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
-_FLAGS = frozenset({"cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
+_FLAGS = frozenset({"backchannel_refunded","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
 _HASHES = frozenset({"cache_asset_id","cache_request_sha256","cache_manifest_sha256","input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
 

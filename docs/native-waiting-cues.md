@@ -49,6 +49,16 @@ second and capped at four within 15 seconds. It does not shut off after four
 cues over an entire conversation. Completed or expired sessions can retire their
 budget entries without evicting active calls.
 
+Vapi starts speculative model requests while a caller is still speaking and
+cancels or replaces them as speech continues; it discards whatever those
+requests produced. A cue emitted into such a request is refunded to the turn
+budget when the generation ends cancelled or superseded before any answer text
+or tool command was released, so the real post-turn request can still receive
+its cue. The refund keeps the one-second spacing from the unplayed emission,
+never permits back-to-back speech, and does not apply to completed answers or
+upstream failures. The timing row records `refunded` with its cause, and the
+`backchannel.refunded` diagnostic lets the evaluator ignore that emission.
+
 ## Runtime configuration
 
 Enable `SERVICEVOICE_BACKCHANNELS=on` for the gateway and speech service. Set
