@@ -26,6 +26,9 @@ from .observability import _generation_fields
 
 VERSION = "component-diagnostics-v1"
 REVIEW_DIAGNOSTICS_REVISION = "call-diagnostic-sources-v1"
+# One row per provider webhook delivery; dropped first when a read overflows.
+NOISE_EVENTS = frozenset({("webhook", "http_finished"), ("webhook", "call_bound")})
+MAX_LEDGER_ROWS = 20_000
 _HASH = re.compile(r"^[a-f0-9]{64}$")
 _ID = re.compile(r"^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$")
 _TURN = re.compile(r"^turn_[a-f0-9]{24}$")
@@ -269,22 +272,31 @@ def _project_manifest(record,cid):
 def read_call_diagnostics(path, call_id, limit=1000):
     """Read-only export helper. Invoke outside a live event-loop response path."""
     key = call_key(call_id)
-    if key is None or type(limit) is not int or not 1 <= limit <= 2000:
+    if key is None or type(limit) is not int or not 1 <= limit <= 8000:
         return _empty("invalid_read_scope", key)
     try:
         with closing(sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro", uri=True, timeout=.05)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
-            raw = db.execute("SELECT payload FROM diagnostic_events WHERE call_key=? ORDER BY started,event_id LIMIT ?", (key,limit+1)).fetchall()
+            # The ledger holds at most 20,000 rows in total; read this call's rows
+            # completely so that a webhook flood can be dropped first on overflow.
+            raw = db.execute("SELECT payload FROM diagnostic_events WHERE call_key=? ORDER BY started,event_id LIMIT ?", (key,MAX_LEDGER_ROWS+1)).fetchall()
             counts = db.execute("SELECT dropped,pruned FROM diagnostic_calls WHERE call_key=?", (key,)).fetchone()
             state = {k: json.loads(v) for k,v in db.execute("SELECT key,payload FROM diagnostic_state")}
             configs = {k: json.loads(v) for k,v in db.execute("SELECT config_id,payload FROM diagnostic_configs")}
         events = []
         invalid = 0
-        for (payload,) in raw[:limit]:
+        for (payload,) in raw[:MAX_LEDGER_ROWS]:
             item = _project_event(json.loads(payload))
             if item is not None: events.append(item)
             else: invalid += 1
+        omitted_noise = 0
+        if len(events) > limit:
+            kept = [row for row in events if (row["component"],row["event"]) not in NOISE_EVENTS]
+            noise = [row for row in events if (row["component"],row["event"]) in NOISE_EVENTS]
+            chosen = kept[:limit] if len(kept) >= limit else kept + noise[:limit-len(kept)]
+            omitted_noise = len(noise) - sum(1 for row in chosen if (row["component"],row["event"]) in NOISE_EVENTS)
+            events = sorted(chosen, key=lambda row: (row["start_unix"],row["event_id"]))
         if not events and counts is None:
             return _empty("no_call_evidence",key)
         configuration_ids = list(dict.fromkeys(e["config_id"] for e in events))
@@ -314,6 +326,7 @@ def read_call_diagnostics(path, call_id, limit=1000):
             "configurations": manifests, "events": events,
             "coverage": {"state": "incomplete" if reasons else "observed", "complete": False,
                 "event_count":len(events), "dropped_events": dropped, "truncated":len(raw)>limit,
+                "omitted_webhook_delivery_events":omitted_noise,
                 "retention_pruned":bool(pruned), "reason_codes":reasons,
                 "writer_heartbeat_unix":last_write,
                 "interpretation":"Observed application events only; not proof of complete vendor/audio visibility."}}
@@ -324,17 +337,19 @@ def read_call_diagnostics(path, call_id, limit=1000):
 read_diagnostics = read_call_diagnostics
 
 
-def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=2000):
+def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=6000):
     """Read one call from the business ledger and a distinct configured ledger.
 
     Paths are trusted worker configuration, never event content, and are not
     exported. The fixed source roles describe where evidence was captured, not
     an inferred audio/generation relationship. A missing or damaged sibling
-    cannot remove valid evidence. The union is capped at 2,000 events, including
-    when each individual ledger has more evidence than fits in that union.
+    cannot remove valid evidence. The union is capped at ``limit`` events (6,000
+    by default, 8,000 at most). When it overflows, per-delivery webhook rows are
+    dropped first so a long call keeps its gateway, tool, scheduler and speech
+    evidence; the omitted count stays visible in coverage.
     """
     key=call_key(call_id)
-    if key is None or type(limit) is not int or not 1 <= limit <= 2000:
+    if key is None or type(limit) is not int or not 1 <= limit <= 8000:
         return {**_empty("invalid_read_scope",key),"coverage_revision":REVIEW_DIAGNOSTICS_REVISION,"sources":[]}
     business=Path(source).with_name(Path(source).stem+"-diagnostics.sqlite3")
     specs=[("business_runtime","scheduler_derived_sidecar",business)]
@@ -391,7 +406,12 @@ def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=2000):
     for eid in conflicting_events|rejected_config_events:events.pop(eid,None)
     ordered=sorted(events.values(),key=lambda row:(row["start_unix"],row["event_id"]))
     omitted=max(0,len(ordered)-limit)
-    selected=ordered[:limit]
+    if omitted:
+        # Keep every non-noise event; webhook delivery rows yield first, then time order.
+        kept=[row for row in ordered if (row["component"],row["event"]) not in NOISE_EVENTS]
+        noise=[row for row in ordered if (row["component"],row["event"]) in NOISE_EVENTS]
+        selected=sorted((kept+noise[:max(0,limit-len(kept))])[:limit] if len(kept)<=limit else kept[:limit],key=lambda row:(row["start_unix"],row["event_id"]))
+    else:selected=ordered[:limit]
     for row in selected:
         row["source_roles"]=sorted(event_sources[row["event_id"]])
     for entry in sources:
@@ -408,6 +428,7 @@ def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=2000):
     if conflicting_events:reasons.add("conflicting_event_identity")
     if conflicting_configs:reasons.add("conflicting_configuration_identity")
     if omitted:reasons.add("combined_event_limit_exceeded")
+    omitted_noise=sum(1 for row in ordered if (row["component"],row["event"]) in NOISE_EVENTS)-sum(1 for row in selected if (row["component"],row["event"]) in NOISE_EVENTS)
     for entry in sources:reasons.update(entry["coverage"]["reason_codes"])
     primary=sources[0].get("configuration") if sources else None
     dropped=[entry["coverage"].get("dropped_events") for entry in sources]
@@ -420,6 +441,7 @@ def read_review_diagnostics(source, call_id, diagnostics_path=None, limit=2000):
             "conflicting_event_id_count":len(conflicting_events),"conflicting_configuration_id_count":len(conflicting_configs),
             "rejected_call_scope_events":sum(entry["rejected_call_scope_events"] for entry in sources),
             "events_rejected_due_to_configuration_conflict":len(rejected_config_events),"union_events_omitted":omitted,
+            "omitted_webhook_delivery_events":omitted_noise,"omission_order":"webhook_delivery_rows_first_then_chronological",
             "dropped_events":sum(dropped) if all(type(value) is int for value in dropped) else None,
             "truncated":bool(omitted or any(entry["coverage"].get("truncated") for entry in sources)),
             "retention_pruned":any(entry["coverage"].get("retention_pruned") for entry in sources),

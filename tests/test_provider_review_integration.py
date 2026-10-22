@@ -49,18 +49,21 @@ def test_actual_worker_exports_provider_events_and_model_interval_without_privat
     monkeypatch.setattr(module,'capture_provider_log_sync',observe)
     assert instance.tick() and instance.outbox.status()['jobs']=={'complete':1}
     root=next(r for r in mock.runs.values() if r['name']=='voice.call.review')
-    children=[r for r in mock.runs.values() if r['name'].startswith('voice.provider.')]
-    assert len(calls)==1 and mock.judge_requests==1 and len(children)==7
-    interval=next(r for r in children if r['name']=='voice.provider.model_generation')
-    assert interval['outputs']['observed_model_interval']['classification']=='completed_then_cleanup_abort_label'
-    assert interval['error'] is None
-    assert all(r['parent_run_id']==r['trace_id']==root['id'] for r in children)
-    assert root['outputs']['provider_observation_export']['exported_point_event_spans']==6
-    assert root['outputs']['provider_observation_export']['exported_model_interval_spans']==1
-    assert all(r['outputs']['phone_playback_verified'] is False for r in children)
+    children=[r for r in mock.runs.values() if r.get('parent_run_id') and r['extra']['metadata']['record_kind'] in ('provider_model','group') and 'vapi' in r['name']]
+    assert len(calls)==1 and mock.judge_requests==1 and len(children)==2
+    group=next(r for r in children if r['extra']['metadata']['record_kind']=='group')
+    interval=next(r for r in children if r['extra']['metadata']['record_kind']=='provider_model')
+    assert interval['parent_run_id']==group['id'] and group['parent_run_id']==root['id']
+    assert interval['outputs']['classification']=='completed_then_cleanup_abort_label' and interval['error'] is None
+    assert interval['name'].startswith('vapi llm · completed (cleanup abort label afterwards)')
+    assert interval['outputs']['gateway_generation_id'] is None
+    assert group['outputs']['event_counts']['provider.model_started']==1 and len(group['outputs']['timeline'])==6
+    assert root['outputs']['trace_export']['provider_model_spans']==1
+    exported=root['outputs']['provider_observations']
+    assert exported['status']=='observed' and 'events' not in exported['projection'] and exported['projection']['summary']['event_counts']['provider.model_started']==1
     assert 'PRIVATE' not in canonical(mock.runs) and 'secret.invalid' not in canonical(mock.runs)
     feedback={r['key']:r for r in mock.feedback.values()}
-    assert feedback['provider_log_available']['score']==1
+    assert feedback['coverage_provider_log']['score']==1
 
 
 def test_cached_export_retry_and_completed_restart_never_refetch_or_rejudge(scenario,tmp_path,monkeypatch):
@@ -98,9 +101,10 @@ def test_missing_provider_log_is_unknown_coverage_and_does_not_change_booking_gr
     assert instance.tick() and instance.outbox.status()['jobs']=={'complete':1}
     root=next(r for r in mock.runs.values() if r['name']=='voice.call.review')
     assert root['outputs']['checks']['booking_integrity']['verdict']=='pass'
-    assert root['outputs']['provider_observation_export']['state']==state
+    assert root['outputs']['provider_observations']['status']==state
+    assert root['outputs']['trace_export']['provider_model_spans']==0
     feedback={r['key']:r for r in mock.feedback.values()}
-    assert feedback['provider_log_available']['score'] is None
+    assert feedback['coverage_provider_log']['score'] is None
 
 
 @pytest.mark.parametrize('field',['tags','extra'])

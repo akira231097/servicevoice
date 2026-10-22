@@ -5,7 +5,7 @@ from pathlib import Path
 from app.diagnostics import safe_attributes
 from app.diagnostics import Diagnostics, configuration_manifest
 from app.live_eval_evidence import build_evidence, latency, read_snapshot
-from app.live_evaluations import public_report, upgrade_v1_metrics
+from app.live_evaluations import public_report
 from app.observability import LocalTimingSink, safe_backchannel_timing
 from app.live_eval_evidence import read_timings
 from test_local_timing import row
@@ -27,21 +27,25 @@ def test_ack_and_answer_metrics_are_separate_not_zero_latency():
     assert latency(call,[])==latency(call,[{"backchannel":{"emitted_ms":None}}])
 
 
-def test_fast_ack_cannot_pass_real_call_latency_grade_or_refresh(scenario,monkeypatch):
+def test_fast_ack_cannot_pass_real_call_latency_grade(scenario):
+    """A 0.55 s cue makes Vapi's first response fast; the 4 s server answer still fails."""
     store,call=scenario
     call=deepcopy(call)
     call["artifact"]["performanceMetrics"]={"turnLatencyAverage":900,"turnLatencies":[{"turnLatency":900}]}
     package=build_evidence(call,read_snapshot(store.path,call["id"]))
     config=configuration(Path(store.path).parent,store.path)
     report=public_report(package,judgment(package),call,candidate_timings(),config)
-    for key in ("latency_within_target","latency_tail_within_target"):
-        assert report["checks"][key]["verdict"]=="uncertain"
-        assert report["checks"][key]["reason_code"]=="acknowledgment_may_mask_substantive_answer_delay"
-    report=deepcopy(report)
-    report["review_version"]="live-call-review-v1"
-    monkeypatch.setattr("app.live_evaluations.VERSION","live-call-review-v2")
-    refreshed=upgrade_v1_metrics(report,call,candidate_timings(),config)
-    assert refreshed["checks"]["latency_within_target"]["verdict"]=="uncertain"
+    assert report["checks"]["first_response_within_target"]["verdict"]=="pass"
+    assert report["checks"]["answer_within_target"]["verdict"]=="fail"
+    assert report["checks"]["answer_within_target"]["reason_code"]=="server_answer_tail_over_target"
+    assert report["latency"]["server_answer_p95_ms"]==4000 and report["latency"]["server_first_ack_p95_ms"]==550
+    assert report["slow_call"] is True and report["needs_review"] is False
+    assert report["4 Latency"]["answer_p95_ms"]==4000 and report["4 Latency"]["cue_start_p95_ms"]==550
+    # A refunded cue is not an acknowledgment and a cancelled request is not an answer.
+    quiet=[{"outcome":"cancelled","milestones_ms":{"first_text":None},"backchannel":{"phrase_id":"moment","emitted_ms":550,"refunded":True}}]
+    report=public_report(package,judgment(package),call,quiet,config)
+    assert report["checks"]["answer_within_target"]["verdict"]=="uncertain"
+    assert "server_first_ack_p95_ms" not in report["latency"] and report["slow_call"] is False
 
 
 def test_persisted_ack_projection_is_idempotent_and_remains_measurable():
@@ -81,11 +85,15 @@ def test_dropped_timing_row_cannot_hide_explicit_call_scoped_ack(scenario):
     event={"call_key":hashlib.sha256(call["id"].encode()).hexdigest(),"component":"gateway",
            "event":"backchannel.emitted","outcome":"observed"}
     report=public_report(package,judgment(package),call,[],config,diagnostics={"events":[event]})
-    assert report["checks"]["latency_within_target"]["verdict"]=="uncertain"
+    assert report["latency"]["acknowledgment_observed"] is True
     assert "server_first_ack_p95_ms" not in report["latency"]
+    # The cue is what the caller heard first; the real answer stays unknown, never pass.
+    assert report["checks"]["first_response_within_target"]["verdict"]=="pass"
+    assert report["checks"]["answer_within_target"]["verdict"]=="uncertain"
+    assert report["checks"]["answer_within_target"]["reason_code"]=="no_completed_server_generations"
     event["call_key"]="b"*64
     other=public_report(package,judgment(package),call,[],config,diagnostics={"events":[event]})
-    assert other["checks"]["latency_within_target"]["verdict"]=="pass"
+    assert "acknowledgment_observed" not in other["latency"]
 
 
 def test_ack_diagnostic_interval_ends_at_emission_not_in_future(tmp_path):

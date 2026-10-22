@@ -501,7 +501,8 @@ def create_app(db_path=None):
         if diagnostic_request is not None:diagnostic_request.state.diagnostic_call_id=call_id
         diagnose("webhook","call_bound","success",call_id=call_id,
             request_id=getattr(getattr(diagnostic_request,"state",None),"diagnostic_request_id",None),
-            attributes={"evidence_source":"verified_session_binding"})
+            attributes={"evidence_source":"verified_session_binding",
+                "event_type":event_type if event_type in {"tool-calls","transcript","status-update","end-of-call-report","assistant-request","speech-update"} else "unknown"})
         if event_type=="tool-calls":
             # Provider auth is not execution provenance. Reject an entire batch
             # before any tool runs if the custom gateway did not issue it.

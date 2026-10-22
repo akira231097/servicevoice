@@ -81,14 +81,33 @@ configuration IDs. The primary `diagnostics.configuration` remains business-only
 including when only speech events are available. The coverage revision is
 `call-diagnostic-sources-v1`; completed older reviews retain their frozen payloads.
 
-The current worker contract is `live-call-review-v5`. It retains v4's six semantic
-dimensions, conservative reference-text uncertainty and separate acoustic and
-termination coverage. Completed v4 reviews remain valid and are not automatically
-requeued: the native platform capability was absent from their calls. Completed
-v1–v3 reviews are queued for fresh assessment using their existing paid-attempt
-counters and budget. Exhausted attempts produce unknown semantics, not invented
-passes. Finish any pending v4 export before upgrading, since a pending older
-contract is not relabeled as v5.
+The current worker contract is `live-call-review-v6`. It keeps v5's six semantic
+dimensions, native `endCall` evidence, conservative reference-text uncertainty
+and separate acoustic and termination coverage, and adds the readable
+presentation (summary, scorecard, turn-by-turn timeline, latency, cues,
+booking, markdown), the `review_trace` children plan, two speed checks
+(`first_response_within_target` from Vapi's stage sum and `answer_within_target`
+from the server's time to the real reply, target `SERVICEVOICE_EVAL_ANSWER_TARGET_MS`),
+the `slow_call` flag separated from `needs_review`, condensed webhook counts and
+the human listening queue (`SERVICEVOICE_EVAL_REVIEW_QUEUE`). Completed earlier
+reviews stay complete and untouched: LangSmith accepts a run only when its start
+time lies within a day of the upload, so older calls cannot be republished, and a
+worker of an earlier contract never finds finished work pending again after a
+rollback. A v4/v5 review still pending at upgrade time is published in the v6
+layout with its frozen advisory grades and no new model request
+(`semantic_grades_reused_from`); a pending v1–v3 review is assessed afresh using
+its existing paid-attempt counters and budget. Exhausted attempts produce unknown
+semantics, not invented passes. A review whose call started more than 23 hours
+before its export is dead-lettered as `langsmith_run_window_expired` rather than
+retried for hours.
+
+`health.json` separates `alerts` (the worker is not doing its job: dead letters,
+a backlog older than ten minutes, discovery errors; the container health check
+fails) from `warnings` (reviews continue, an operator should know:
+`monthly_judge_budget_exhausted`, `langsmith_rate_limited`). The worker writes a
+heartbeat before its first review, and a 429 from LangSmith, with or without a
+Retry-After header, pauses every claim for the stated wait (default 60 seconds)
+without counting as a failure.
 
 v5 narrowly recognizes a single empty-argument `endCall` whose exact fingerprint
 and current caller anchor match a stored issuance scoped to this call and session.
@@ -98,18 +117,21 @@ remain incomplete evidence. Provider termination is coverage only and does not
 prove caller intent or farewell playback. Native action evidence is not added to
 the fourteen business tools or their confirmation rules.
 
-Future gateway generation children belong under the same call-review root and
-use explicit persisted generation identities and measured start/duration only.
-Legacy request IDs must not be promoted into generation IDs. An older timing
-row without the new stamp remains unavailable lineage coverage. Gateway events
-are not joined to vendor audio by timing, text, matching counts or adjacency.
-Copy all eight source modules listed by the separate evaluator Dockerfile.
-The evidence reader now imports `normalize_services` from `app/domain.py` to
-check every service in a combined visit; copying only the six review/projection
-modules leaves that import unavailable in an older base image. Diagnostics also
-depends on the observability generation-field allowlist, even though this worker
-does not start a voice tracer or call controller. Provider capture adds
-`app/provider_logs.py`; omitting it prevents the current worker from importing.
+Gateway generation children sit under the `turn NN` row whose diagnostics
+`request_finished` event carries their request id; requests without a recorded
+turn identifier are listed under "gateway requests without a recorded turn".
+Legacy request IDs are shown by request id with no invented generation ID. An
+older timing row without the new stamp remains unavailable lineage coverage.
+Gateway events are not joined to vendor audio by timing, text, matching counts
+or adjacency. Copy all nine source modules listed by the separate evaluator
+Dockerfile. The evidence reader imports `normalize_services` from
+`app/domain.py` to check every service in a combined visit; copying only the
+review/projection modules leaves that import unavailable in an older base
+image. Diagnostics also depends on the observability generation-field
+allowlist, even though this worker does not start a voice tracer or call
+controller. Provider capture adds `app/provider_logs.py`, and the readable
+review adds `app/call_review_presentation.py`; omitting either prevents the
+current worker from importing.
 
 After starting, verify the resolved image ID, both read-only mount flags, worker
 health, call ID, review version, six score rows, latency metrics and LangSmith

@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import time
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from app.gemini_gateway import SignatureStore, GatewayLimits
 from app.issuance_context import user_context
 from app.live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, Redactor, build_evidence,
     canonical, integrity, latency, read_snapshot)
+from app import live_evaluations
 from app.live_evaluations import (Config, LangSmith, Outbox, Worker, feedback_rows,
     parse_judgment, public_report)
 
@@ -213,6 +215,7 @@ class ProviderMock:
         self.hide_feedback_readback_once=False
         self.batch_requests=[];self.trace_queries=[];self.feedback_queries=[];self.rate_limit_batch_once=False
         self.request_paths=[]
+        self.queues={};self.queued={};self.queue_posts=[];self.queue_adds=[];self.fail_queue=False
     def read_run(self,rid):
         body=deepcopy(self.runs.get(rid))
         if not isinstance(body,dict):return body
@@ -261,7 +264,7 @@ class ProviderMock:
             assert batch['patch']==[] and 1<=len(batch['post'])<=100
             if self.rate_limit_batch_once:
                 self.rate_limit_batch_once=False
-                return httpx.Response(429,json={},headers={'Retry-After':'120'})
+                return httpx.Response(429,json={},headers={'Retry-After':'120'} if getattr(self,'rate_limit_header',True) else {})
             for body in batch['post']:
                 self.run_posts.append(body['id']);self.runs[body['id']]=body
             if self.fail_child_once:self.fail_child_once=False;return result({},503)
@@ -295,6 +298,19 @@ class ProviderMock:
             if fid in self.feedback and self.hide_feedback_readback_once:
                 self.hide_feedback_readback_once=False;return result({},404)
             return result(self.feedback.get(fid,{}),200 if fid in self.feedback else 404)
+        if path=='/annotation-queues':
+            if request.method=='GET':
+                return result([q for q in self.queues.values() if q['name']==request.url.params.get('name')])
+            body=json.loads(request.content);self.queue_posts.append(body)
+            assert body['rubric_items'] and body['rubric_instructions'] and body['session_ids']==[self.project]
+            self.queues[body['id']]={'id':body['id'],'name':body['name']};return result(self.queues[body['id']],201)
+        if path.startswith('/annotation-queues/') and path.endswith('/queues'):
+            return result([self.queues[q] for q in self.queued.get(path.split('/')[2],())])
+        if path.startswith('/annotation-queues/') and path.endswith('/runs'):
+            assert request.method=='POST'
+            if self.fail_queue:return result({},503)
+            for rid in json.loads(request.content):self.queued.setdefault(rid,set()).add(path.split('/')[2]);self.queue_adds.append(rid)
+            return result({},200)
         raise AssertionError(str(request.url))
 
 
@@ -337,9 +353,11 @@ def test_accepted_child_temporarily_missing_retries_frozen_review_after_fifteen_
     assert pending['last_error']=='component_span_readback_ingestion_pending'
     assert pending['report'] and mock.judge_requests==1 and budget==1
     assert not mock.feedback
-    # All six component children have been posted before the first delayed
-    # readback can interrupt export. No one-child-per-retry serialization.
-    assert len([r for r in mock.runs.values() if r.get('parent_run_id')])==6
+    # Every readable child (one per caller turn plus the pending tool) has been
+    # posted before the first delayed readback can interrupt export. No
+    # one-child-per-retry serialization.
+    children=[r for r in mock.runs.values() if r.get('parent_run_id')]
+    assert len(children)==2 and sorted(r['name'][:7] for r in children)==['tool · ','turn 02']
     frozen=deepcopy(mock.runs)
     now[0]+=14;assert not worker.tick()
     now[0]+=1;assert worker.tick()
@@ -371,17 +389,24 @@ def test_hundreds_of_component_children_use_bounded_official_batches_and_two_tra
     sink=Diagnostics(source.with_name(source.stem+'-diagnostics.sqlite3'))
     start=datetime.fromisoformat(call['startedAt']).timestamp()
     for index in range(176):
-        assert sink.record('tts','tts.completed','success',call_id=call['id'],start_unix=start+10+index*.01,duration_ms=5)
+        request=uuid4().hex
+        assert sink.record('tts','tts.request_started','started',call_id=call['id'],request_id=request,start_unix=start+10+index*.01,duration_ms=0)
+        assert sink.record('tts','tts.completed','success',call_id=call['id'],request_id=request,start_unix=start+10+index*.01,duration_ms=5,
+            attributes={'cache_hit':index%2==0,'input_characters':12})
     assert sink.close()
     worker,mock,_=worker_fixture(tmp_path,scenario)
     assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
-    assert [len(b['post'])for b in mock.batch_requests]==[100,76]
+    # One speech-synthesis group and 176 synthesis rows; the untimed caller turns stay in the root.
+    assert [len(b['post'])for b in mock.batch_requests]==[100,77]
     assert all(b['patch']==[]for b in mock.batch_requests)
     assert len(mock.trace_queries)==2 and len(mock.feedback_queries)==2
     root=next(r for r in mock.runs.values()if r['name']=='voice.call.review')
     assert all(q['session']==[mock.project] and q['trace']==root['id']for q in mock.trace_queries)
     child_ids={r['id']for r in mock.runs.values()if r.get('parent_run_id')}
-    assert len(child_ids)==176
+    assert len(child_ids)==177
+    group=next(r for r in mock.runs.values() if r['name'].startswith('speech synthesis'))
+    assert group['outputs']['cached_cue_clips']==88 and root['outputs']['trace_export']['tts']==176
+    assert sum(1 for r in mock.runs.values() if r['name']=='tts · cached cue clip')==88
     assert not any(path=='/runs/'+child for _,path in mock.request_paths for child in child_ids)
     assert not any(path.startswith('/feedback/')for _,path in mock.request_paths)
     assert mock.judge_requests==1
@@ -394,6 +419,7 @@ def test_batch_rate_limit_honors_numeric_retry_after_without_another_judge_or_bu
         pending=dict(db.execute('SELECT * FROM jobs').fetchone())
     assert pending['last_error']=='export_http_429' and pending['next_attempt']==now[0]+120
     assert pending['report'] and not mock.feedback and mock.judge_requests==1
+    assert pending['failures']==0  # provider throttling is a wait, never a step towards dead-lettering
     now[0]+=119;assert not worker.tick()
     now[0]+=1;assert worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
@@ -401,6 +427,37 @@ def test_batch_rate_limit_honors_numeric_retry_after_without_another_judge_or_bu
     with closing(worker.outbox.db()) as db:
         assert db.execute('SELECT judge_attempts FROM jobs').fetchone()[0]==1
         assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0]==1
+
+
+def test_job_dead_lettered_only_by_throttling_is_requeued_on_restart(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario);worker.outbox.discover(worker.config.source)
+    call=mock.call['id']
+    with closing(worker.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='export_http_429' WHERE call_id=?",(call,))
+    assert 'review_deadletters_require_operator_action' in worker.outbox.status()['alerts']
+    restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert restarted.outbox.status()['jobs']=={'pending':1} and restarted.outbox.status()['alerts']==[]
+    assert restarted.tick() and restarted.outbox.status()['jobs']=={'complete':1}
+    # Any other dead-letter reason still needs an operator.
+    with closing(restarted.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='provider_call_identity_mismatch' WHERE call_id=?",(call,))
+    again=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert again.outbox.status()['jobs']=={'deadletter':1}
+    # A readback mismatch stays with the operator whatever contract the stored
+    # review belongs to; nothing is relabeled or republished on restart.
+    with closing(again.outbox.db()) as db,db:
+        report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v5'
+        db.execute("UPDATE jobs SET report=?,last_error='run_readback_mismatch_or_ingestion_pending' WHERE call_id=?",(canonical(report),call))
+    assert Worker(worker.config,client=worker.client,clock=lambda:now[0]).outbox.status()['jobs']=={'deadletter':1}
+    # A 429-only dead letter of an earlier contract is requeued and published under
+    # this contract with its frozen grades and no new model request.
+    with closing(again.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET last_error='export_http_429' WHERE call_id=?",(call,))
+    republished=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert republished.outbox.status()['jobs']=={'pending':1}
+    mock.runs.clear();mock.feedback.clear()
+    assert republished.tick() and republished.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert next(iter(mock.runs.values()))['outputs']['review_process']['semantic_grades_reused_from']=='live-call-review-v5'
 
 
 def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_component_evidence(scenario,tmp_path):
@@ -412,8 +469,8 @@ def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_compone
     mock.runs[extra['id']]=extra
     now[0]+=901;worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
-    assert root['outputs']['trace_export']['exported_event_spans']==3
-    assert root['outputs']['trace_export']['exported_group_spans']==3
+    assert root['outputs']['trace_export']['turns']==1 and root['outputs']['trace_export']['tools']==1
+    assert root['outputs']['trace_export']['exported_runs']==2
 
 
 def test_real_export_failures_back_off_by_failed_ticks_not_lifetime_poll_attempts(scenario,tmp_path):
@@ -516,8 +573,8 @@ def test_complete_matching_reference_can_pass_text_check_with_audio_coverage_sti
     assert report['needs_review'] is False
     assert report['evidence_coverage']['spoken_audio_verified'] is None
     feedback={r['key']:r for r in feedback_rows(str(uuid4()),report)}
-    assert feedback['spoken_audio_verified']['score'] is None
-    assert feedback['spoken_audio_verified']['value']=='unverified'
+    assert 'spoken_audio_verified' not in feedback and feedback['reference_consistency']['score']==1
+    assert 'never hears audio' in report['1 Summary']['what_to_check'][0]
 
 
 @pytest.mark.parametrize('spoken',['Your reference is C. SV. 3F2DFB5.','Your appointment is confirmed.'])
@@ -560,10 +617,10 @@ def test_provider_termination_is_separate_coverage_and_never_a_goodbye_quality_g
     report=public_report(package,judgment(package),call,[],configuration(tmp_path,store.path))
     assert report['evidence_coverage']['provider_ended_by_assistant'] is expected
     assert report['needs_review'] is False
-    assert 'provider_ended_by_assistant' not in report['checks']
+    assert 'provider_ended_by_assistant' not in report['checks'] and 'assistant_hung_up' not in report['checks']
     feedback={r['key']:r for r in feedback_rows(str(uuid4()),report)}
-    assert feedback['provider_ended_by_assistant']['score']==(int(expected) if expected is not None else None)
-    assert 'goodbye' in feedback['provider_ended_by_assistant']['comment']
+    assert feedback['assistant_hung_up']['score']==(int(expected) if expected is not None else None)
+    assert 'goodbye' in feedback['assistant_hung_up']['comment']
 
 
 def test_service_labels_are_not_replaced_as_customer_names():
@@ -633,8 +690,10 @@ def test_default_zero_averages_without_response_turns_are_not_instant_replies(sc
     assert 'turn_avg_ms' not in metrics and 'model_avg_ms' not in metrics
     package=build_evidence(call,read_snapshot(store.path,call['id']))
     report=public_report(package,judgment(package),call,[],configuration(tmp_path,store.path))
-    assert report['checks']['latency_within_target']['verdict']=='uncertain'
-    assert report['checks']['latency_tail_within_target']['verdict']=='uncertain'
+    assert report['checks']['first_response_within_target']['verdict']=='uncertain'
+    assert report['checks']['first_response_within_target']['reason_code']=='no_measured_response_turns'
+    assert report['checks']['answer_within_target']['verdict']=='uncertain'
+    assert report['slow_call'] is False and report['needs_review'] is False
 
 
 def test_zero_summary_cannot_hide_positive_measured_turns():
@@ -650,7 +709,8 @@ def test_new_review_contract_rejudges_older_cached_review_without_relabeling_it(
         if previous_version!='live-call-review-v3':
             cached['checks'].pop('task_completion');cached['checks'].pop('conversation_quality')
         cached.pop('evidence_coverage',None)
-        db.execute('UPDATE jobs SET report=?',(canonical(cached),))
+        # Only a review still pending at upgrade time is assessed again; a completed one stays frozen.
+        db.execute("UPDATE jobs SET report=?,state='pending',lease=0,next_attempt=0,completed=NULL",(canonical(cached),))
     mock.runs.clear();mock.feedback.clear()
     now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
@@ -669,7 +729,7 @@ def test_old_review_with_exhausted_attempts_cannot_manufacture_new_dimension_pas
     worker,mock,now=worker_fixture(tmp_path,scenario);worker.tick()
     with closing(worker.outbox.db()) as db,db:
         cached=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);cached['review_version']=previous_version
-        db.execute('UPDATE jobs SET report=?,judge_attempts=3',(canonical(cached),))
+        db.execute("UPDATE jobs SET report=?,judge_attempts=3,state='pending',lease=0,next_attempt=0,completed=NULL",(canonical(cached),))
     mock.runs.clear();mock.feedback.clear();now[0]+=901
     restarted=Worker(worker.config,client=worker.client,clock=lambda:now[0]);restarted.tick()
     report=next(iter(mock.runs.values()))['outputs']
@@ -690,7 +750,9 @@ def test_budget_exhaustion_reason_and_true_coverage_denominators_are_visible(sce
     assert status['coverage']['completed_with_unknown_semantics']==1
     assert status['coverage']['completed_review_fraction']==1
     assert status['coverage']['semantic_assessment_fraction']==0
-    assert 'monthly_judge_budget_exhausted' in status['alerts']
+    # A spent allowance is an operator warning, not an unhealthy worker: reviews
+    # continue with explicit unknown semantics.
+    assert 'monthly_judge_budget_exhausted' in status['warnings'] and status['alerts']==[]
 
 
 def test_successful_review_records_lag_and_does_not_claim_provider_audio_visibility(scenario,tmp_path):
@@ -736,7 +798,8 @@ def record_export_diagnostics(scenario):
     from app.diagnostics import Diagnostics, operation_identifier, turn_identifier
     store,call=scenario;source=Path(store.path)
     path=source.with_name(source.stem+'-diagnostics.sqlite3')
-    turn=turn_identifier(call['id'],2);operation=operation_identifier('session','confirm')
+    session=read_snapshot(store.path,call['id'])['session']['id']
+    turn=turn_identifier(call['id'],2);operation=operation_identifier(session,'confirm')
     request=str(uuid4());started=datetime.fromisoformat(call['startedAt']).timestamp()
     sink=Diagnostics(path,{'SERVICEVOICE_ENVIRONMENT':'production'})
     assert sink.record('gateway','request_finished','success',call_id=call['id'],turn_id=turn,request_id=request,
@@ -761,20 +824,28 @@ def test_real_diagnostic_ledger_exports_verified_children_and_late_receipt_witho
     assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
     root=next(r for r in mock.runs.values() if r['name']=='voice.call.review')
     children=[r for r in mock.runs.values() if r.get('parent_run_id')]
-    events=[r for r in children if r['extra']['metadata']['record_kind']=='component_event']
-    assert len(events)==3 and len(children)==6
-    assert root['outputs']['trace_export']['exported_event_spans']==3
-    assert root['outputs']['trace_export']['skipped_event_counts']=={'missing_or_invalid_duration':1}
-    operation=next(r for r in children if r['name']=='voice.operation.observed_events')
-    receipt=next(r for r in events if r['name']=='voice.component.scheduler.receipt_observed')
-    assert receipt['parent_run_id']==operation['id']
-    assert datetime.fromisoformat(receipt['start_time'])>datetime.fromisoformat(root['end_time'])
-    assert receipt['outputs']['measurements']['receipt_present'] is True
+    turns=[r for r in children if r['extra']['metadata']['record_kind']=='turn']
+    # The scenario artifact carries no speech timings, so only the turn with a
+    # timed tool event gets a row; the first turn stays in the root timeline.
+    assert len(turns)==1 and len(children)==2
+    assert root['outputs']['trace_export']['turns']==1 and root['outputs']['trace_export']['tools']==1
+    assert root['outputs']['trace_export']['omitted']==1 and len(root['outputs']['3 Turn-by-turn timeline']['turns'])==2
+    # The pending confirm tool joins its turn through the explicit operation id;
+    # the late scheduler receipt marks it as received, never as a fabricated duration.
+    tool=next(r for r in children if r['extra']['metadata']['record_kind']=='tool')
+    second=next(r for r in turns if r['extra']['metadata']['turn']==2)
+    assert tool['parent_run_id']==second['id'] and tool['name'].startswith('tool · confirm_action (ok, 0.05 s)')
+    assert tool['outputs']['receipt_present'] is True and tool['run_type']=='tool'
+    assert tool['outputs']['ok'] is True
     assert all(r['trace_id']==root['id'] for r in children)
     assert all(r['dotted_order'].startswith(root['dotted_order']+'.') for r in children)
-    assert 'PRIVATE SOURCE' not in canonical(children)
+    assert 'PRIVATE SOURCE' not in canonical(children) and 'PRIVATE SOURCE' not in canonical(root)
     assert scenario[1]['id'] not in canonical(children)
     assert mock.judge_requests==1
+    # Every recorded non-webhook event is still listed in the root review.
+    kept={(e['component'],e['event']) for e in root['outputs']['diagnostics']['events']}
+    assert kept=={('gateway','request_finished'),('tool_harness','execution_finished'),('scheduler','receipt_observed'),('voice_runtime','call_ended')}
+    assert root['outputs']['diagnostics']['webhook_deliveries']['deliveries']==0
 
 
 def test_ambiguous_child_upload_retries_same_frozen_ids_without_another_judge_or_new_ledger_events(scenario,tmp_path):
@@ -896,3 +967,48 @@ def test_legacy_four_dimension_judgment_cannot_pass_new_rubric(scenario):
     package=build_evidence(scenario[1],read_snapshot(scenario[0].path,scenario[1]['id']))
     value=judgment(package);value.pop('task_completion');value.pop('conversation_quality')
     with pytest.raises(EvidenceError,match='judge_invalid_dimensions'):parse_judgment(value,package)
+
+
+def test_rate_limit_without_retry_after_is_a_wait_that_pauses_every_claim(scenario,tmp_path):
+    record_export_diagnostics(scenario);worker,mock,now=worker_fixture(tmp_path,scenario)
+    mock.rate_limit_batch_once=True;mock.rate_limit_header=False;assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        pending=dict(db.execute('SELECT * FROM jobs').fetchone())
+    assert pending['state']=='pending' and pending['last_error']=='export_http_429' and pending['failures']==0
+    assert pending['next_attempt']==now[0]+60 and mock.judge_requests==1
+    status=worker.outbox.status(200)
+    assert status['warnings']==['langsmith_rate_limited'] and status['alerts']==[] and status['rate_limit_wait_seconds']==60
+    # Another due job is not claimed while the wait lasts: the queue stops asking.
+    with closing(worker.outbox.db()) as db,db:
+        db.execute("INSERT INTO jobs(call_id,session_id,created,next_attempt,eligible_ended,ended) VALUES (?,'',?,0,1,?)",(str(uuid4()),now[0],now[0]-100))
+    assert worker.outbox.claim() is None
+    now[0]+=60
+    assert worker.outbox.claim() is not None and worker.outbox.status(200)['warnings']==[]
+
+
+def test_review_older_than_the_langsmith_window_is_dead_lettered_at_once(scenario,tmp_path):
+    worker,mock,now=worker_fixture(tmp_path,scenario)
+    now[0]+=24*3600  # the call started a day ago; LangSmith would refuse its run
+    assert worker.tick()
+    with closing(worker.outbox.db()) as db:
+        job=dict(db.execute('SELECT * FROM jobs').fetchone())
+    assert job['state']=='deadletter' and job['last_error']=='langsmith_run_window_expired'
+    assert mock.judge_requests==0 and not mock.runs and not mock.feedback
+    assert 'review_deadletters_require_operator_action' in worker.outbox.status(200)['alerts']
+    with closing(worker.outbox.db()) as db:
+        assert db.execute('SELECT SUM(used) FROM budgets').fetchone()[0] is None
+
+
+def test_main_writes_a_heartbeat_before_the_first_review(tmp_path,monkeypatch):
+    events=[]
+    class FakeWorker:
+        def __init__(self,config):self.config=config;self.client=httpx.Client()
+        def tick(self):events.append('tick');return False
+        def heartbeat(self,error=None):events.append(('heartbeat',error))
+    config=configuration(tmp_path,tmp_path/'source.sqlite3')
+    monkeypatch.setattr(live_evaluations.Config,'from_env',classmethod(lambda cls,env=None:config))
+    monkeypatch.setattr(live_evaluations,'Worker',FakeWorker)
+    monkeypatch.setattr(live_evaluations.os,'umask',lambda _:0o077)
+    monkeypatch.setattr(sys,'argv',['reviewer','--once'])
+    assert live_evaluations.main()==0
+    assert events==[('heartbeat',None),'tick',('heartbeat',None)]
