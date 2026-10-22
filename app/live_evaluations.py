@@ -230,6 +230,10 @@ class Outbox:
             # A job dead-lettered only because LangSmith kept answering 429 was
             # throttled, not broken; throttling no longer counts as a failure.
             db.execute("UPDATE jobs SET state='pending',failures=0,lease=0,next_attempt=? WHERE state='deadletter' AND last_error='export_http_429'",(clock(),))
+            # A dead-lettered review of an EARLIER contract whose cloud run no
+            # longer matched its local report is republished under this contract
+            # with a new run id; the frozen earlier run is never rewritten.
+            db.execute("UPDATE jobs SET state='pending',failures=0,lease=0,next_attempt=? WHERE state='deadletter' AND last_error='run_readback_mismatch_or_ingestion_pending' AND report IS NOT NULL AND json_valid(report) AND json_extract(report,'$.review_version') IN ('live-call-review-v4','live-call-review-v5')",(clock(),))
         if os.name != "nt":self.path.chmod(0o600)
 
     def db(self):

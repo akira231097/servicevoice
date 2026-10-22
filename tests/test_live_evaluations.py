@@ -441,6 +441,19 @@ def test_job_dead_lettered_only_by_throttling_is_requeued_on_restart(scenario,tm
         db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='provider_call_identity_mismatch' WHERE call_id=?",(call,))
     again=Worker(worker.config,client=worker.client,clock=lambda:now[0])
     assert again.outbox.status()['jobs']=={'deadletter':1}
+    # A readback mismatch of an earlier contract's review is republished under the
+    # current contract (new run id); the same mismatch under this contract is not.
+    with closing(again.outbox.db()) as db,db:
+        report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0]);report['review_version']='live-call-review-v5'
+        db.execute("UPDATE jobs SET report=?,last_error='run_readback_mismatch_or_ingestion_pending' WHERE call_id=?",(canonical(report),call))
+    republished=Worker(worker.config,client=worker.client,clock=lambda:now[0])
+    assert republished.outbox.status()['jobs']=={'pending':1}
+    mock.runs.clear();mock.feedback.clear()
+    assert republished.tick() and republished.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
+    assert next(iter(mock.runs.values()))['outputs']['review_process']['semantic_grades_reused_from']=='live-call-review-v5'
+    with closing(republished.outbox.db()) as db,db:
+        db.execute("UPDATE jobs SET state='deadletter',failures=8,last_error='run_readback_mismatch_or_ingestion_pending' WHERE call_id=?",(call,))
+    assert Worker(worker.config,client=worker.client,clock=lambda:now[0]).outbox.status()['jobs']=={'deadletter':1}
 
 
 def test_unexpected_scoped_forensic_children_are_not_counted_as_expected_component_evidence(scenario,tmp_path):
