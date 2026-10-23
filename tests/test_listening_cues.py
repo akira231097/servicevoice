@@ -181,3 +181,15 @@ def test_no_opportunity_without_fresh_speech(fault):
         assert not sent and p.requests == 0
         await c.close()
     asyncio.run(run())
+
+
+def test_late_old_partial_does_not_erase_current_speaker_state():
+    async def run():
+        c, clock, p, sent, _, event, _ = setup()
+        c.event("fixture-call", dict(type="transcript", role="user", transcriptType="partial",
+            transcript="old", timestamp=(clock.wall()-3)*1000))
+        event("transcript", "user", transcriptType="partial", transcript=TEXT)
+        await drain(c)
+        assert len(sent) == 1
+        await c.close()
+    asyncio.run(run())

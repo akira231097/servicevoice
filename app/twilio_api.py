@@ -128,6 +128,8 @@ class TwilioLane:
 
     def fast_event(self, message):
         kind = message.get("type")
+        if not isinstance(kind, str):
+            return False
         fast = kind in FAST_EVENTS or kind == "transcript" and message.get("transcriptType") == "partial"
         if not fast:
             return False

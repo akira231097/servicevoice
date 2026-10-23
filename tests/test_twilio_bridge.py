@@ -167,3 +167,13 @@ def test_unresolved_dial_never_frees_test_capacity(tmp_path):
     store.set_leg(row["id"], "CA"+"3"*32)
     store.end(row["id"], verified=True)
     assert store.get(row["id"])["cleanup_verified"] == 1
+
+
+def test_explicit_pinned_variable_path_accepts_documented_prefix_mapping(tmp_path):
+    store = BridgeStore(tmp_path/"bridges.db")
+    cfg = config(sip_headers_path="call.assistantOverrides.variableValues")
+    row = store.allocate("CA"+"1"*32)
+    message = {"call":{"id":str(uuid4()), "assistantOverrides":{"variableValues":{
+        "sv_bridge":row["id"], "sv_proof":store.proof(cfg,row)}}}}
+    assert proof_header_paths(message) == (cfg.sip_headers_path,)
+    assert store.accept_proof(cfg,message) == row["id"]

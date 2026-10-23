@@ -246,11 +246,11 @@ silently retired while provider legs might still be billable.
             raise BridgeError("sip_header_contract_unverified", 403)
         headers = {}
         for key, item in value.items():
-            lower = key.lower() if isinstance(key, str) else ""
+            lower = key.lower().removeprefix("x-") if isinstance(key, str) else ""
             if lower in headers:
                 raise BridgeError("ambiguous_sip_proof", 403)
             headers[lower] = item
-        bridge_id, supplied = headers.get("x-sv_bridge"), headers.get("x-sv_proof")
+        bridge_id, supplied = headers.get("sv_bridge"), headers.get("sv_proof")
         call_id = message.get("call", {}).get("id")
         try:
             valid_call = str(UUID(call_id)) == call_id
@@ -289,8 +289,8 @@ def proof_header_paths(message):
         remaining[0] -= 1
         if remaining[0] < 0 or depth > 6 or not isinstance(value, dict):
             return
-        names = {k.lower() for k in value if isinstance(k, str)}
-        if {"x-sv_bridge", "x-sv_proof"} <= names:
+        names = {k.lower().removeprefix("x-") for k in value if isinstance(k, str)}
+        if {"sv_bridge", "sv_proof"} <= names:
             found.append(".".join(path))
         for key, child in value.items():
             if isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,40}", key):

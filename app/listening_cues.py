@@ -7,7 +7,7 @@ Live acoustic acceptance remains required: webhooks are not atomic audio locks.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import math
@@ -140,7 +140,7 @@ class ListeningState:
     turn_count: int = 0
     last_cue: float = -math.inf
     last_attempt: float = -math.inf
-    last_event: float = -math.inf
+    speech_events: dict = field(default_factory=dict)
     partial_event: float = -math.inf
     closed: bool = False
     task: asyncio.Task | None = None
@@ -173,16 +173,25 @@ class ListeningCoordinator:
         if state is None or state.closed:
             return
         now, kind = self.clock(), message.get("type")
+        if not isinstance(kind, str):
+            return
         timestamp = provider_time(message)
         age = self.wall()-timestamp if timestamp is not None else math.inf
-        if kind in {"speech-update", "transcript", "user-interrupted"}:
-            if timestamp is None or age < -.1 or age > 2 or timestamp < state.last_event:
-                self._invalidate(state)
-                state.caller = False
-                return
-            state.last_event = timestamp
         role = message.get("role")
+        if kind in {"speech-update", "transcript", "user-interrupted"}:
+            if timestamp is None or age < -.1 or age > 2:
+                # A stale partial cannot erase a newer observed speaker state.
+                # Unknown speech boundaries do revoke permission to whisper.
+                if kind != "transcript":
+                    self._invalidate(state)
+                    state.caller = False
+                return
         if kind == "speech-update":
+            if not isinstance(role, str) or role not in {"assistant", "user"}:
+                return
+            if timestamp <= state.speech_events.get(role, -math.inf):
+                return
+            state.speech_events[role] = timestamp
             started = message.get("status") == "started"
             if message.get("status") not in {"started", "stopped"}:
                 return
@@ -192,7 +201,7 @@ class ListeningCoordinator:
                 self._invalidate(state)
             elif role == "user":
                 if started and not state.caller:
-                    state.caller_started, state.turn_count = now, 0
+                    state.caller_started, state.turn_count = now-max(0, age), 0
                     state.text, state.partial_event = "", -math.inf
                     self._invalidate(state)
                 state.caller = started
