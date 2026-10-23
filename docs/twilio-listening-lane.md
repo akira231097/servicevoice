@@ -41,6 +41,12 @@ budget. No listening cue creates consent, tool work, a proposal or a booking.
   spending the audible-cue cooldown. Duplicate text is not classified again;
   there are at most 64 decision attempts per call. Confidence thresholds remain
   unchanged. This separates frequent listening decisions from restrained speech.
+- A caller pause of at most 1.5 seconds preserves the explanation's timer and
+  two-cue budget when the assistant has not spoken. A longer pause, assistant
+  speech or tool activity starts a fresh listening interval.
+- Native waiting classification can retry one malformed provider response
+  inside the existing 350 ms deadline. Valid silence, language vetoes and low
+  confidence are never resampled. Both attempts remain visible in diagnostics.
 - A dispatched announcement is never retried/refunded on an ambiguous timeout.
   Runtime checks again immediately before requesting playback. Delayed provider
   delivery can still cause overlap; only live audio can establish acceptance.

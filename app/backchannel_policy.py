@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import re
@@ -301,6 +301,29 @@ class BackchannelPolicy:
         if self.owns_client and self.client is not None:await self._close_client(self.client)
 
     async def choose(self, messages, key, *, context=None, on_request=None, native_waiting=False):
+        if not native_waiting:
+            return await self._choose_once(messages,key,context=context,on_request=on_request)
+        # An invalid provider response may be transient. Retry it once inside
+        # the original deadline; never resample a valid silence/language veto.
+        began=time.perf_counter()
+        requests=0
+        def observed_request():
+            nonlocal requests
+            requests+=1
+            if on_request is not None:on_request()
+        try:
+            async with asyncio.timeout(self.timeout):
+                result=await self._choose_once(messages,key,context=context,on_request=observed_request,native_waiting=True)
+                if result.reason=="invalid_response" and requests==1 and not self.closing:
+                    result=await self._choose_once(messages,key,context=context,on_request=observed_request,native_waiting=True)
+            elapsed=round((time.perf_counter()-began)*1000,3)
+            return replace(result,requests=requests,elapsed_ms=elapsed,
+                classification_ms=elapsed if requests>1 and result.classification_ms is not None else result.classification_ms)
+        except TimeoutError:
+            return BackchannelDecision(reason="classification_deadline",requests=requests,
+                elapsed_ms=round((time.perf_counter()-began)*1000,3))
+
+    async def _choose_once(self, messages, key, *, context=None, on_request=None, native_waiting=False):
         # Python 3.12 on Windows uses 15.625 ms ticks for monotonic(), which can
         # undercount a short blocked-loop request. perf_counter() is monotonic
         # with the highest available resolution and includes time spent asleep.

@@ -1401,7 +1401,7 @@ class GeminiGateway:
             try:
                 async with asyncio.timeout(.48):
                     selection_context=await read_context()
-                    def requested():timing.row["backchannel"]["requests"]=1
+                    def requested():timing.row["backchannel"]["requests"]+=1
                     return await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
                         context=selection_context,on_request=requested,native_waiting=True)
             except Exception:

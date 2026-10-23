@@ -116,9 +116,10 @@ class TestCaptureRuntime:
                 connected=await socket.receive_json()
                 # Provider additions must not invalidate documented protocol
                 # fields. Ownership and the one-use capability are checked next.
-                if (not isinstance(connected,dict) or any(connected.get(k)!=v for k,v in
-                        {"event":"connected","protocol":"Call","version":"1.0.0"}.items())):
-                    raise ValueError("protocol")
+                if not isinstance(connected,dict):raise ValueError("protocol")
+                for field,expected in {"event":"connected","protocol":"Call","version":"1.0.0"}.items():
+                    phase="connected_"+field
+                    if connected.get(field)!=expected:raise ValueError("protocol")
                 phase="start"
                 message=await socket.receive_json();start=message.get("start",{})
                 if message.get("event")!="start" or message.get("sequenceNumber")!="1":raise ValueError("start")
