@@ -39,8 +39,9 @@ def valid_proof(secret, nonce, proof, now):
 
 
 class Capture:
-    def __init__(self, call_sid, stream_sid):
+    def __init__(self, call_sid, stream_sid, protocol_version="1.0.0"):
         self.call_sid,self.stream_sid=call_sid,stream_sid
+        self.protocol_version=protocol_version
         self.audio={"inbound":bytearray(),"outbound":bytearray()}
         self.packets=[]
         self.sequence=1
@@ -78,6 +79,7 @@ class Capture:
                 os.chmod(path,0o600);stream.write(data)
             files[track]={"file":path.name,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()}
         receipt={"schema":"twilio-tester-capture-v1","call_sid":self.call_sid,"stream_sid":self.stream_sid,
+            "provider_protocol_version":self.protocol_version,
             "scope":"Host-received synthetic caller tracks; not handset acoustic latency",
             "encoding":"audio/x-mulaw","sample_rate":8000,"started_unix":self.started,"ended_unix":time.time(),
             "outcome":outcome,"audio":files,"packets":self.packets,"gaps":self.gaps}
@@ -117,9 +119,17 @@ class TestCaptureRuntime:
                 # Provider additions must not invalidate documented protocol
                 # fields. Ownership and the one-use capability are checked next.
                 if not isinstance(connected,dict):raise ValueError("protocol")
-                for field,expected in {"event":"connected","protocol":"Call","version":"1.0.0"}.items():
+                for field,expected in {"event":"connected","protocol":"Call"}.items():
                     phase="connected_"+field
                     if connected.get(field)!=expected:raise ValueError("protocol")
+                phase="connected_version"
+                version=connected.get("version")
+                # This receiver records a diagnostic copy, never controls audio.
+                # Retain the provider's advertised version as provenance; the
+                # start, format, ownership and every media frame are validated
+                # independently against the exact contract we can decode.
+                if not isinstance(version,str) or not re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}",version):
+                    raise ValueError("protocol_version")
                 phase="start"
                 message=await socket.receive_json();start=message.get("start",{})
                 if message.get("event")!="start" or message.get("sequenceNumber")!="1":raise ValueError("start")
@@ -145,7 +155,7 @@ class TestCaptureRuntime:
                 if len(list(self.directory.iterdir()))>=50:raise ValueError("capture_budget")
                 folder=self.directory/nonce
                 folder.mkdir(mode=0o700,exist_ok=False) # A capability is single-use across restarts.
-                capture=Capture(call,stream)
+                capture=Capture(call,stream,version)
             phase="media"
             async with asyncio.timeout(90):
                 while True:
