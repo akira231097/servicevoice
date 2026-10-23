@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -108,29 +109,39 @@ class TestCaptureRuntime:
             await socket.close(code=1008);return
         self.active.add(socket)
         capture,folder,outcome=None,None,"disconnected"
+        phase="connected"
         try:
             await socket.accept()
             async with asyncio.timeout(5):
                 connected=await socket.receive_json()
                 if connected!={"event":"connected","protocol":"Call","version":"1.0.0"}:raise ValueError("protocol")
+                phase="start"
                 message=await socket.receive_json();start=message.get("start",{})
                 if message.get("event")!="start" or message.get("sequenceNumber")!="1":raise ValueError("start")
                 call,stream=start.get("callSid"),start.get("streamSid")
-                if (start.get("accountSid")!=config.account_sid or not sid(call,"CA") or not sid(stream,"MZ")
-                        or message.get("streamSid")!=stream or set(start.get("tracks",[]))!={"inbound","outbound"}
-                        or start.get("mediaFormat")!={"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1}):
+                phase="start_identity"
+                if start.get("accountSid")!=config.account_sid or not sid(call,"CA") or not sid(stream,"MZ") or message.get("streamSid")!=stream:
                     raise ValueError("start_identity")
+                phase="tracks"
+                if set(start.get("tracks",[]))!={"inbound","outbound"}:raise ValueError("tracks")
+                phase="format"
+                if start.get("mediaFormat")!={"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1}:raise ValueError("format")
                 params=start.get("customParameters",{});nonce=params.get("nonce")
+                phase="proof"
                 if not valid_proof(config.bridge_secret,nonce,params.get("proof"),time.time()):raise ValueError("proof")
+                phase="ownership_read"
                 owned=await lane.client.request("GET",f"/Calls/{call}.json")
+                phase="ownership"
                 if (owned.get("to")!=config.phone_number or owned.get("from")!=config.phone_number
                         or owned.get("direction")!="outbound-api" or owned.get("status")!="in-progress"):
                     raise ValueError("not_owned_synthetic_call")
+                phase="storage"
                 self.directory.mkdir(mode=0o700,exist_ok=True)
                 if len(list(self.directory.iterdir()))>=50:raise ValueError("capture_budget")
                 folder=self.directory/nonce
                 folder.mkdir(mode=0o700,exist_ok=False) # A capability is single-use across restarts.
                 capture=Capture(call,stream)
+            phase="media"
             async with asyncio.timeout(90):
                 while True:
                     raw=await socket.receive_text()
@@ -144,8 +155,11 @@ class TestCaptureRuntime:
                     capture.media(message,received)
         except WebSocketDisconnect:
             pass
-        except (ValueError,KeyError,TypeError,TimeoutError,OSError,BridgeError):
+        except (ValueError,KeyError,TypeError,TimeoutError,OSError,BridgeError) as error:
             outcome="rejected_or_timed_out"
+            # Fixed phase/type only: never log provider messages, credentials,
+            # capability proofs, caller identity or audio payloads.
+            logging.getLogger(__name__).warning("Synthetic capture rejected: phase=%s type=%s",phase,type(error).__name__)
             await socket.close(code=1008)
         finally:
             self.active.discard(socket)

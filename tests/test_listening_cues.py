@@ -104,6 +104,42 @@ async def drain(coordinator):
         await asyncio.gather(*tuple(coordinator.tasks), return_exceptions=True)
 
 
+@pytest.mark.parametrize("gap,assistant,expected",[(1.2,False,True),(1.6,False,False),(.5,True,False)])
+def test_brief_caller_pause_preserves_explanation_but_not_a_new_turn(gap,assistant,expected):
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        clock.now=3.5
+        event("speech-update","user",status="stopped")
+        if assistant:
+            clock.now+=.01
+            event("speech-update","assistant",status="started")
+            clock.now+=.01
+            event("speech-update","assistant",status="stopped")
+        clock.now=3.5+gap
+        event("speech-update","user",status="started")
+        clock.now+=.2
+        event("transcript","user",transcriptType="partial",transcript=TEXT)
+        await drain(c)
+        assert bool(sent) is expected
+        await c.close()
+    asyncio.run(run())
+
+
+def test_brief_pause_does_not_replenish_two_cue_utterance_budget():
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        for i in range(3):
+            event("transcript","user",transcriptType="partial",transcript=TEXT+" again"*i)
+            await drain(c)
+            clock.now+=6.8
+            event("speech-update","user",status="stopped")
+            clock.now+=.5
+            event("speech-update","user",status="started")
+        assert len(sent)==2
+        await c.close()
+    asyncio.run(run())
+
+
 def test_long_partial_cues_twice_without_spending_waiting_budget():
     async def run():
         c, clock, p, sent, events, event, _ = setup()

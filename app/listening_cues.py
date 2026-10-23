@@ -141,6 +141,7 @@ class ListeningState:
     assistant: bool = True  # An observed stop is required before first cue.
     assistant_stopped: float = math.inf
     caller_started: float = math.inf
+    caller_stopped: float = -math.inf
     received: float = -math.inf
     text: str = ""
     previous: str = ""
@@ -209,15 +210,21 @@ class ListeningCoordinator:
             if role == "assistant":
                 state.assistant = started
                 state.assistant_stopped = math.inf if started else now
+                if started:
+                    state.caller_stopped = -math.inf
                 self._invalidate(state)
             elif role == "user":
                 if started and not state.caller:
-                    state.caller_started, state.turn_count = now-max(0, age), 0
+                    # Brief endpointing pauses inside an explanation do not
+                    # restart its listening timer or replenish its cue budget.
+                    if now-max(0, age)-state.caller_stopped > 1.5:
+                        state.caller_started, state.turn_count = now-max(0, age), 0
                     state.text, state.partial_event = "", -math.inf
                     state.last_attempt_text = ""
                     self._invalidate(state)
                 state.caller = started
                 if not started:
+                    state.caller_stopped = now-max(0, age)
                     self._invalidate(state)
         elif kind == "user-interrupted":
             self._invalidate(state)
@@ -245,6 +252,7 @@ class ListeningCoordinator:
         elif kind == "tool-calls":
             self._invalidate(state)
             state.caller = False
+            state.caller_stopped = -math.inf
 
     def timing_reason(self, state):
         now = self.clock()
