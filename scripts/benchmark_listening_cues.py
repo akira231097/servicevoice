@@ -21,6 +21,7 @@ CASES = [
     ("vehicle_background", True, "The vehicle has around forty thousand miles and I mainly drive it around town with my family"),
     ("sound_background", True, "The engine makes a gentle ticking noise in the mornings and it seems louder when the weather is cold"),
     ("tire_history", True, "The tires have been on the car for several years and the front ones are showing a little more wear"),
+    ("live_brake_partial", True, "The last couple of weeks it has been making a grinding noise when I brake, mostly at"),
     ("consent", False, "Yes please go ahead and confirm that appointment for me"),
     ("correction", False, "Actually that is the wrong car and I meant the other one"),
     ("private", False, "My phone number is five one two five five five zero one four two"),
@@ -40,11 +41,13 @@ async def run(key):
     context = dict(stage="service", active_confirmation=False, has_pending_proposal=False, has_pending_operation=False, ended=False)
     rows = []
     try:
-        for label, expected, text in CASES:
-            started = time.perf_counter()
-            reason = await policy.choose(text, "Tell me about the vehicle.", context, key)
-            rows.append(dict(case=label, expected_ack=expected, approved=reason=="approved", reason=reason,
-                             elapsed_ms=round((time.perf_counter()-started)*1000, 3)))
+        for prior_label, previous in (("vehicle_question", "Tell me about the vehicle."),
+                ("interrupted_greeting", "Hi, I'm Cedar. This is an AI demo for Cedar Service, a fictional.")):
+            for label, expected, text in CASES:
+                started = time.perf_counter()
+                reason = await policy.choose(text, previous, context, key)
+                rows.append(dict(case=label, previous_context=prior_label, expected_ack=expected, approved=reason=="approved", reason=reason,
+                                 elapsed_ms=round((time.perf_counter()-started)*1000, 3)))
     finally:
         await policy.close()
     return {"scope":"Jev classification only; no Twilio or audible-playback evidence", "cases":rows,

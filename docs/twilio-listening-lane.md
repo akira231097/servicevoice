@@ -1,9 +1,10 @@
 # Isolated Twilio listening prototype
 
-Status: local implementation, feature disabled by default. No existing Vapi
-number, assistant, deployment, edge route or production database is modified by
-this branch. Live phone acceptance is outstanding. This is not yet a verified
-simulated full-duplex release.
+Status: isolated deployment and synthetic phone testing in progress. The feature
+is disabled by default. A separate Twilio number and Vapi SIP assistant are used;
+the main Vapi number, assistant and production services remain unchanged. Live
+listening acceptance is outstanding. This is not yet a verified simulated
+full-duplex release.
 
 The separate Twilio line puts the caller and a dedicated Vapi SIP assistant in
 one conference. Jev classifies live partial transcripts; code may request a
@@ -19,11 +20,15 @@ budget. No listening cue creates consent, tool work, a proposal or a booking.
   redial. A pending dial or incomplete cleanup continues to occupy its slot.
 - A 15-second join watchdog, ten-minute Twilio call limit, terminal callback
   handling, and cleanup readbacks. Vapi's existing assistant duration is unchanged.
+- Closing an owned bridge also retires its exact local call/session binding, so
+  a missing Vapi terminal webhook cannot leave tools available after hang-up.
 - A separate random SIP address and an expiring per-call HMAC proof. Retries for
   the same Vapi call reuse the admission; reuse by another call is refused.
 - The SIP header object path is deliberately unconfigured. The first isolated
   capture must establish its actual location. Missing/unverified headers cannot
   start an assistant. Do not loosen the proof check to make a live probe pass.
+  The October 23 live probe established `call.phoneCallProviderDetails.sip.headers`
+  for the deployed SIP lane. Its default remains blank for new deployments.
 - Authenticated partials use an in-memory admitted binding and do not take the
   scheduling webhook's worker slots or write each partial to SQLite.
 - Jev uses independent typed content/language choices on already spoken words.
@@ -82,9 +87,24 @@ It is not a substitute for measured conference acceptance.
 
 ## Remaining live gates and tooling
 
-Still needed: isolated resource/edge provisioning and rollback receipts, the
-synthetic Twilio caller media-stream capture harness, actual SIP payload proof,
-partial webhook delivery timing, live Jev plus audio captures, conference versus
+Completed on October 23: isolated resource/edge provisioning with rollback
+receipts, owned Twilio self-calls, SIP proof validation, authenticated synthetic
+audio delivery, and dual-channel recordings. The first call exposed missing
+authentication on subsequent Vapi messages; the next exposed the same issue on
+custom voice requests. Explicit headers on the dedicated saved assistant fixed
+both without weakening endpoint authentication. Those private header values
+must never enter source control, reports or the publication snapshot helper.
+The third audio probe delivered the main response and ended cleanly. Earlier
+failed captures are retained. No live listening cue has passed audio acceptance.
+
+The live partial benchmark exposed an unrelated greeting influencing Jev's
+classification. The prompt now identifies the caller partial as the label target,
+and uses prior assistant speech only to identify sensitive reply context. With
+unchanged thresholds, 14/14 ordinary cases and 0/20 exclusions passed across a
+normal prior question and an interrupted greeting. These are classifier results.
+
+Still needed: shared-clock synthetic caller capture, partial webhook delivery
+timing, live Jev plus acknowledgment audio captures, conference versus
 direct-SIP timing, speakerphone echo test, and the user's listening acceptance.
 These are pending work, not passed checks. No production merge/deployment is
 authorized by a local test result alone; the current task explicitly preserves
@@ -96,6 +116,12 @@ both providers terminate after hang-up. Measure approval-to-audio median <=600ms
 and worst <=1000ms, conference overhead median <=300ms, barge-in <=800ms, greeting
 <=3.5s and cleanup <=10s. Preserve failed captures. Do not present a REST success,
 clip fetch, STT transcript or offline test as proof that a phone user heard it.
+
+Deployment checks must test HTTP methods as well as paths: callbacks use POST;
+the two approved WAV routes use GET. The waiting-cue assistant identity must
+match the new isolated assistant, independently of the listening-lane flag.
+Twilio's US/Canada low-risk outbound permission is enabled with the user's
+approval for continued use of the test number; high-risk ranges remain disabled.
 
 If participant announcements mask the conference or cannot meet overlap/timing
 gates, test the coaching participant fallback separately. No coaching fallback,

@@ -12,6 +12,7 @@ import pytest
 from app.main import create_app, create_public_app
 from app.twilio_bridge import BridgeError, signature
 from app.twilio_api import TwilioLane
+from app.telephony_ingress import IngressError
 
 ORG = "11111111-1111-4111-8111-111111111111"
 PHONE = "22222222-2222-4222-8222-222222222222"
@@ -175,6 +176,57 @@ def test_verified_sip_admission_and_partial_fast_path(lane_app):
             response = await client.post("/webhooks/vapi/inbound", headers=auth, json={"message":{
                 "type":"speech-update", "status":"started", "role":"user", "call":call}})
             assert response.status_code == 403
+        await lane.close()
+    asyncio.run(run())
+
+
+def test_bridge_hangup_closes_tools_without_provider_end_webhook(lane_app):
+    async def run():
+        lane=lane_app.state.twilio_lane
+        lane.client=Provider()
+        row=lane.store.allocate("CA"+"1"*32)
+        call={"id":str(uuid4()),"type":"inboundPhoneCall","orgId":ORG,"phoneNumberId":PHONE,
+              "sip":{"headers":{"x-sv_bridge":row["id"],"x-sv_proof":lane.store.proof(lane.config,row)}}}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_public_app(lane_app)),base_url="https://test") as client:
+            response=await client.post("/webhooks/vapi/inbound",headers={"authorization":"Bearer "+"e"*32},
+                json={"message":{"type":"assistant-request","call":call}})
+            assert response.status_code==200
+            call.update(response.json())
+            ingress=lane_app.state.telephony_ingress
+            session_id=ingress.resolve(call)
+            with pytest.raises(IngressError,match="telephony_binding_conflict"):
+                ingress.end_bridge_binding(call["id"],"different-session")
+            assert ingress.resolve(call)==session_id
+            await lane.finish(row["id"])
+            with pytest.raises(IngressError,match="telephony_call_ended"):
+                ingress.resolve(call)
+            assert ingress.resolve(call,allow_ended=True)==session_id
+            await lane.finish(row["id"])
+            assert lane.store.get(row["id"])["cleanup_verified"]==1
+        await lane.close()
+    asyncio.run(run())
+
+
+def test_hangup_between_admission_and_bridge_binding_retires_session(lane_app,monkeypatch):
+    async def run():
+        lane=lane_app.state.twilio_lane
+        lane.client=Provider()
+        row=lane.store.allocate("CA"+"1"*32)
+        call={"id":str(uuid4()),"type":"inboundPhoneCall","orgId":ORG,"phoneNumberId":PHONE,
+              "sip":{"headers":{"x-sv_bridge":row["id"],"x-sv_proof":lane.store.proof(lane.config,row)}}}
+        original=lane.store.bind_session
+        def closed(*args):
+            lane.store.end(row["id"])
+            return original(*args)
+        monkeypatch.setattr(lane.store,"bind_session",closed)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_public_app(lane_app)),base_url="https://test") as client:
+            response=await client.post("/webhooks/vapi/inbound",headers={"authorization":"Bearer "+"e"*32},
+                json={"message":{"type":"assistant-request","call":call}})
+            assert response.status_code==409
+        with lane_app.state.store.connect() as db:
+            session=db.execute("SELECT ended FROM sessions WHERE provider_call_id=?",(call["id"],)).fetchone()
+            binding=db.execute("SELECT ended FROM telephony_bindings WHERE provider_call_id=?",(call["id"],)).fetchone()
+            assert session["ended"]==1 and binding["ended"] is not None
         await lane.close()
     asyncio.run(run())
 

@@ -133,7 +133,12 @@ class TwilioLane:
         if bridge_id is None:
             raise IngressError("bridge_proof_missing", 403)
         session_id = result["assistantOverrides"]["variableValues"]["session_id"]
-        await asyncio.to_thread(self.store.bind_session, bridge_id, call_id, session_id)
+        try:
+            await asyncio.to_thread(self.store.bind_session, bridge_id, call_id, session_id)
+        except BridgeError:
+            # Hang-up can win after admission commits but before bridge binding.
+            await asyncio.to_thread(self.app.state.telephony_ingress.end_bridge_binding, call_id, session_id)
+            raise
         if self.closing:
             await self.finish(bridge_id)
             raise IngressError("bridge_closing", 503)
@@ -226,6 +231,12 @@ class TwilioLane:
                 self.bindings.pop(call_id, None)
                 self.proofs.pop(call_id, None)
             verified = not row["dial_pending"]
+            if call_id and row["session_id"]:
+                try:
+                    await asyncio.to_thread(self.app.state.telephony_ingress.end_bridge_binding, call_id, row["session_id"])
+                except IngressError:
+                    # Keep ending provider legs even when local storage needs reconciliation.
+                    verified = False
             # Ending the room prevents a late in-flight participant creation
             # from joining. The returned leg is also ended by dial() after readback.
             if apology:

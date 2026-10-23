@@ -310,6 +310,19 @@ class TelephonyIngress:
             self._live(binding, session, allow_ended=allow_ended)
             return session["id"]
 
+    def end_bridge_binding(self, call_id, session_id):
+        """Internal bridge ownership closes local tools even if the Vapi end webhook is lost.
+
+        No HTTP route exposes this operation. The isolated bridge supplies its
+        persisted call/session pair; neither a caller number nor a payload grants it.
+        """
+        with self._transaction(None) as (db, _):
+            binding, session = self._binding(db, call_id)
+            if session["id"] != session_id:
+                raise IngressError("telephony_binding_conflict", 409)
+            db.execute("UPDATE telephony_bindings SET ended=COALESCE(ended,?) WHERE provider_call_id=?", (self.clock(),call_id))
+            db.execute("UPDATE sessions SET ended=1 WHERE id=? AND tenant=?", (session_id,TENANT))
+
     def end(self, message, authorization, *, deadline=None, abandoned=None):
         self.authenticate(authorization)
         if not isinstance(message, dict) or not (message.get("type") == "end-of-call-report" or (message.get("type") == "status-update" and message.get("status") == "ended")):
