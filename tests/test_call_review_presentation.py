@@ -341,15 +341,19 @@ def test_completed_earlier_reviews_stay_complete_and_a_restart_never_requeues_th
     assert claimed['report'] is None and claimed['session_id']==''
 
 
-def test_status_runs_are_rare_and_labelled(scenario,tmp_path):
+@pytest.mark.parametrize('started,day_extra', [('2026-10-23T08:00:00+00:00',0),('2026-10-23T23:00:00+00:00',1)])
+def test_status_runs_are_rare_and_labelled(scenario,tmp_path,started,day_extra):
     worker,mock,now=worker_fixture(tmp_path,scenario)
+    # Coverage IDs include the UTC day. A wall-clock fixture started after
+    # 17:53 UTC can cross midnight during this six-hour jump on a real runner.
+    now[0]=datetime.fromisoformat(started).timestamp()
     worker.heartbeat();first=len(mock.runs)
     now[0]+=1000;worker.heartbeat()
     assert len(mock.runs)==first  # a quarter hour of unchanged status is not a new trace
     now[0]+=21000;worker.heartbeat()
-    assert len(mock.runs)==first  # the six-hour heartbeat reuses the same-day fingerprint for an unchanged status
+    assert len(mock.runs)==first+day_extra  # same-day fingerprint is reused; a new day gets a fresh status row
     worker.outbox.set_setting('provider_discovery_error','provider_discovery_incomplete');now[0]+=20;worker.heartbeat()
-    assert len(mock.runs)==first+1  # a changed status is a new immutable row
+    assert len(mock.runs)==first+day_extra+1  # a changed status is a new immutable row
     status=next(r for r in mock.runs.values() if r['name']=='voice.review.coverage')
     assert 'reviewer-status' in status['tags'] and 'not a call' in status['inputs']['scope']
 
