@@ -1,5 +1,7 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import time
 from urllib.parse import parse_qs
 from uuid import uuid4
 import xml.etree.ElementTree as ET
@@ -67,6 +69,20 @@ def test_twiml_has_private_room_and_direct_baseline():
 def proof_message(store, cfg, row, call_id=None):
     return {"call": {"id": call_id or str(uuid4()), "sip": {"headers": {
         "X-SV_Bridge": row["id"], "X-SV_Proof": store.proof(cfg, row)}}}}
+
+
+def test_duplicate_join_waits_for_short_write_lock_and_dials_once(tmp_path):
+    store = BridgeStore(tmp_path / "bridge.sqlite3")
+    row = store.allocate("CA" + "1" * 32)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with store.db() as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            claims = [pool.submit(store.claim_dial, row["id"], "CF" + "2" * 32,
+                                  row["caller_sid"]) for _ in range(2)]
+            time.sleep(.2)
+            assert all(not claim.done() for claim in claims)
+        assert sorted(claim.result(timeout=3) for claim in claims) == [False, True]
+    assert store.get(row["id"])["dial_pending"] == 1
 
 
 def test_bridge_duplicate_admission_capacity_and_restart(tmp_path):

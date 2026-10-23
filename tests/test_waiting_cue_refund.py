@@ -141,7 +141,7 @@ def test_cue_spent_on_a_request_vapi_cancelled_returns_for_the_real_post_turn_re
             await asyncio.wait_for(cue.wait(), 3)
             release.set()
             result = await asyncio.wait_for(real, 3)
-            assert speech(result.text) == PHRASES["moment"] + " <flush /> Exact primary answer."
+            assert speech(result.text) == PHRASES["moment"] + " <flush />Exact primary answer."
             second = gateway.latency_snapshot("call-a")[-1]
             assert second["backchannel"]["reason"] == "emitted" and "refunded" not in second["backchannel"]
             assert second["outcome"] == "completed" and not gateway.active and not gateway.owners
@@ -175,8 +175,8 @@ def test_cue_spent_on_a_superseded_request_returns_for_its_replacement(tmp_path,
             release.set()
             latest = await asyncio.wait_for(newer, 3)
             previous = await asyncio.wait_for(old, 3)
-            assert speech(latest.text) == PHRASES["moment"] + " <flush /> Exact primary answer."
-            assert speech(previous.text) == PHRASES["moment"] + " <flush /> "  # offered, then a neutral close
+            assert speech(latest.text) == PHRASES["moment"] + " <flush />Exact primary answer."
+            assert speech(previous.text) == PHRASES["moment"] + " <flush />"  # offered, then a neutral close
             rows = gateway.latency_snapshot("call-a")
             superseded = [item for item in rows if item["backchannel"].get("refunded")]
             assert len(superseded) == 1 and superseded[0]["backchannel"]["refund_reason"] == "generation_superseded_before_answer"
@@ -218,7 +218,7 @@ def test_completed_answer_and_upstream_failure_keep_their_cue_consumption(tmp_pa
             pending = asyncio.create_task(observed_post(app, request_body(), cue_observer(cue)))
             await asyncio.wait_for(cue.wait(), 3); first_release.set()
             completed = await asyncio.wait_for(pending, 3)
-            assert speech(completed.text) == PHRASES["moment"] + " <flush /> Exact primary answer."
+            assert speech(completed.text) == PHRASES["moment"] + " <flush />Exact primary answer."
             assert "refunded" not in gateway.latency_snapshot("call-a")[-1]["backchannel"]
             body = request_body()
             body["messages"].extend([{"role": "assistant", "content": "Tell me more."}, {"role": "user", "content": "My car is a Toyota sedan."}])
@@ -227,7 +227,7 @@ def test_completed_answer_and_upstream_failure_keep_their_cue_consumption(tmp_pa
             await asyncio.wait_for(cue.wait(), 3); second_release.set()
             failed = await asyncio.wait_for(pending, 3)
             # The second caller turn rotates to the next neutral phrase; the cue is still offered before the failure.
-            assert "generation_unavailable" in failed.text and speech(failed.text) == PHRASES["one_sec"] + " <flush /> "
+            assert "generation_unavailable" in failed.text and speech(failed.text) == PHRASES["one_sec"] + " <flush />"
             failed_row = gateway.latency_snapshot("call-a")[-1]
             assert failed_row["outcome"] == "upstream_unavailable" and "refunded" not in failed_row["backchannel"]
             assert gateway.backchannel_budget.calls["call-a"][0] == 2

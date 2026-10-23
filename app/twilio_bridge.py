@@ -166,7 +166,7 @@ silently retired while provider legs might still be billable.
 
     @contextmanager
     def db(self):
-        db = sqlite3.connect(self.path, timeout=.1)
+        db = sqlite3.connect(self.path, timeout=1.0)
         db.row_factory = sqlite3.Row
         try:
             with db:

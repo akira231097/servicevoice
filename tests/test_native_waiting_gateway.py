@@ -39,7 +39,7 @@ def test_real_native_policy_releases_context_appropriate_cached_text_in_owned_st
             await asyncio.wait_for(offered.wait(), 3)
             assert not task.done()
             release.set(); result = await asyncio.wait_for(task, 2)
-            assert speech(result.text) == expected + " <flush /> Exact primary answer."
+            assert speech(result.text) == expected + " <flush />Exact primary answer."
             timing = gateway.latency_snapshot("call-a")[-1]["backchannel"]
             assert timing["content_kind"] == kind and timing["reason"] == "emitted"
             assert timing["emitted_ms"] is not None and timing["audible_playback"] == "unverified"
@@ -166,7 +166,7 @@ def test_book_it_hold_cannot_publish_tool_prose_or_change_signed_authority(tmp_p
         task = asyncio.create_task(observed_post(app, body, lambda part: cue.set() if b"<flush />" in part else None))
         try:
             await asyncio.wait_for(cue.wait(), 3); release.set(); result = await asyncio.wait_for(task, 2)
-            assert speech(result.text) == "One moment. <flush /> "
+            assert speech(result.text) == "One moment. <flush />"
             assert "UNVERIFIED" not in result.text and "Let me check" not in result.text
             tools = issued(result.text)
             assert len(tools) == 1 and tools[0]["function"] == {"name": "get_appointment", "arguments": "{}"}
@@ -216,7 +216,7 @@ def test_signed_tool_followup_reuses_only_caller_context_and_same_turn_budget(tm
             pending = asyncio.create_task(observed_post(app, body, lambda part: cue.set() if b"<flush />" in part else None))
             await asyncio.wait_for((suppressed if cue_before_tool else cue).wait(), 3)
             second_release.set(); result = await asyncio.wait_for(pending, 2)
-            assert speech(result.text) == ("" if cue_before_tool else "One moment. <flush /> ")+"Exact primary answer."
+            assert speech(result.text) == ("" if cue_before_tool else "One moment. <flush />")+"Exact primary answer."
             assert classified and classified[-1][-1]["content"] == "Find my appointment"
             assert "PRIVATE_RECEIPT" in json.dumps(calls[-1]["messages"])
             assert len(calls) == 2

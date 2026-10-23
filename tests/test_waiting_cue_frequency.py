@@ -137,7 +137,7 @@ def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_resu
             pending = asyncio.create_task(observed_post(app, continuation(), cue_observer(cue)))
             await asyncio.wait_for(cue.wait(), 3); answer_release.set()
             result = await asyncio.wait_for(pending, 3)
-            assert speech(result.text) == PHRASES["one_sec"] + " <flush /> Exact primary answer."
+            assert speech(result.text) == PHRASES["one_sec"] + " <flush />Exact primary answer."
             second = gateway.latency_snapshot("call-a")[-1]
             assert second["backchannel"]["reason"] == "emitted" and second["backchannel"]["follow_up"] is True
             assert second["backchannel"]["phrase_id"] == "one_sec" and "refunded" not in second["backchannel"]
