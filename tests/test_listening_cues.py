@@ -12,15 +12,26 @@ TEXT = "I drive my vehicle through the neighborhood every morning and the engine
 SAFE = dict(stage="service", active_confirmation=False, has_pending_proposal=False, has_pending_operation=False, ended=False)
 
 
-@pytest.mark.parametrize("content", ["yes", "no", "confirm", "approved", "approve", "cancel", "stop", "wait", "bye",
+@pytest.mark.parametrize("content", ["confirm", "approved", "approve", "cancel", "stop", "wait", "bye",
     "goodbye", "actually", "instead", "correction", "correct", "unless", "only if", "provided that", "hang up",
-    "do not", "don't", "emergency", "urgent", "smoke", "fire", "unsafe", "danger", "collision", "crash",
+    "do not book anything", "don't proceed", "emergency", "urgent", "smoke", "fire", "unsafe", "danger", "collision", "crash",
     "injured", "bleeding", "ignore", "system prompt", "developer", "password", "secret", "token", "api key",
     "instructions", "my name", "my address", "phone number", "mobile number", "email", "credit card",
     "debit card", "account number", "social security", "passcode", "verification code", "payment details",
-    "1234567890", "someone@example.test", "123 Main Street", "can you help?", "speak in Spanish", "español"])
+    "1234567890", "someone@example.test", "123 Main Street", "can you help?", "speak in Spanish", "espaÃ±ol"])
 def test_sensitive_partial_never_reaches_classifier(content):
     assert listening_gate(TEXT+" "+content, "Tell me about the vehicle.", SAFE) != "eligible"
+
+
+@pytest.mark.parametrize("text", ["Yes.", "No", "Yeah", "Nope", "don't", "do not"])
+def test_bare_control_words_are_not_listening_content(text):
+    assert listening_gate(text, "Tell me more.", SAFE) == "control_content"
+
+
+@pytest.mark.parametrize("text", ["Yeah, my car is making shaky sounds and I don't understand the issue",
+    "My car has no power when I drive uphill", "I don’t understand what is wrong with my vehicle—there is a rattle"])
+def test_normal_description_is_not_a_stop_instruction(text):
+    assert listening_gate(text, "Tell me more.", SAFE) == "eligible"
 
 
 @pytest.mark.parametrize("field", ["active_confirmation", "has_pending_proposal", "has_pending_operation", "ended"])
@@ -125,22 +136,22 @@ def test_brief_caller_pause_preserves_explanation_but_not_a_new_turn(gap,assista
     asyncio.run(run())
 
 
-def test_brief_pause_does_not_replenish_two_cue_utterance_budget():
+def test_brief_pause_does_not_replenish_three_cue_utterance_budget():
     async def run():
         c,clock,p,sent,_,event,_=setup()
-        for i in range(3):
+        for i in range(4):
             event("transcript","user",transcriptType="partial",transcript=TEXT+" again"*i)
             await drain(c)
             clock.now+=6.8
             event("speech-update","user",status="stopped")
             clock.now+=.5
             event("speech-update","user",status="started")
-        assert len(sent)==2
+        assert len(sent)==3
         await c.close()
     asyncio.run(run())
 
 
-def test_long_partial_cues_twice_without_spending_waiting_budget():
+def test_long_partial_cues_three_times_without_spending_waiting_budget():
     async def run():
         c, clock, p, sent, events, event, _ = setup()
         event("transcript", "user", transcriptType="partial", transcript=TEXT)
@@ -152,13 +163,13 @@ def test_long_partial_cues_twice_without_spending_waiting_budget():
         clock.now += 7.1
         event("transcript", "user", transcriptType="partial", transcript=TEXT+" on my drive every day")
         await drain(c)
-        assert len(sent) == 2 and p.requests == 2
+        assert len(sent) == 3 and p.requests == 3
         assert not hasattr(c, "backchannel_budget")
         await c.close()
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("race", ["caller_stop", "assistant_start", "correction", "private_append", "tool", "fresh_context", "stale", "end"])
+@pytest.mark.parametrize("race", ["caller_stop", "assistant_start", "correction", "private_append", "consent_append", "tool", "fresh_context", "stale", "end"])
 def test_late_jev_decision_cannot_speak(race):
     async def run():
         c, clock, p, sent, _, event, context = setup()
@@ -173,6 +184,9 @@ def test_late_jev_decision_cannot_speak(race):
         if race == "private_append":
             clock.now += .1
             event("transcript", "user", transcriptType="partial", transcript=TEXT+" my phone number is")
+        if race == "consent_append":
+            clock.now += .1
+            event("transcript", "user", transcriptType="partial", transcript=TEXT+", yes please")
         if race == "tool": event("tool-calls")
         if race == "fresh_context": context["has_pending_operation"] = True
         if race == "stale": clock.now += .4
@@ -262,5 +276,55 @@ def test_eight_words_after_four_seconds_can_acknowledge_without_waiting_for_sent
         event("transcript","user",transcriptType="partial",transcript="My Honda makes a rattling sound every morning")
         await drain(c)
         assert len(sent)==1
+        await c.close()
+    asyncio.run(run())
+
+
+def test_partial_fragments_keep_context_without_speaking_on_final_or_stale_events():
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        clock.now=2
+        event("transcript","user",transcriptType="partial",transcript="My car has a rattling noise.")
+        clock.now+=.1
+        event("transcript","user",transcriptType="final",transcript="My car has a rattling noise.")
+        await drain(c);assert not sent
+        clock.now=3.1
+        seen=[]
+        async def choose(text,*args):seen.append(text);return "approved"
+        p.choose=choose
+        event("transcript","user",transcriptType="partial",transcript="And it gets")
+        await drain(c)
+        assert seen==["My car has a rattling noise. And it gets"] and len(sent)==1
+        assert c.calls["fixture-call"].phrase_id=="acknowledge"
+        clock.now+=.1
+        event("speech-update","assistant",status="started")
+        clock.now+=.1
+        event("transcript","user",transcriptType="final",transcript="old caller content")
+        assert c.calls["fixture-call"].completed==""
+        await c.close()
+    asyncio.run(run())
+
+
+def test_private_final_cannot_be_forgotten_by_the_next_short_fragment():
+    async def run():
+        c,clock,p,sent,events,event,_=setup()
+        event("transcript","user",transcriptType="final",transcript="My phone number is five one two.")
+        clock.now+=.2
+        event("transcript","user",transcriptType="partial",transcript=TEXT)
+        await drain(c)
+        assert not sent
+        assert events[-1][-1]=="context_changed"
+        await c.close()
+    asyncio.run(run())
+
+
+def test_earlier_opportunity_still_obeys_cooldown_and_three_cue_limit():
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        for tick in (3.1,4.7,8.2,9.8,13.3,18.4):
+            clock.now=tick
+            event("transcript","user",transcriptType="partial",transcript=TEXT+" words"*int(tick))
+            await drain(c)
+        assert len(sent)==3
         await c.close()
     asyncio.run(run())

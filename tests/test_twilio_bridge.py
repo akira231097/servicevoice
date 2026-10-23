@@ -150,12 +150,17 @@ def test_rest_shapes_and_no_retry(tmp_path):
             api = TwilioClient(cfg, client=client)
             await api.add_vapi(row, "sip:fixture@sip.vapi.ai")
             await api.announce(row)
+            await api.announce(row,"acknowledge")
+            with pytest.raises(BridgeError,match="cue_not_approved"):
+                await api.announce(row,"booked")
         fields = parse_qs(requests[0].content.decode())
         assert fields["StatusCallbackEvent"] == ["initiated", "ringing", "answered", "completed"]
         assert fields["EndConferenceOnExit"] == ["true"]
         assert fields["JitterBufferSize"] == ["small"]
         assert requests[1].url.path.endswith(row["caller_sid"]+".json")
         assert "AnnounceUrl" in parse_qs(requests[1].content.decode())
+        assert len(requests)==3
+        assert parse_qs(requests[2].content.decode())["AnnounceUrl"][0].endswith("&cue=acknowledge")
         attempts = []
         def fail(request):
             attempts.append(request)

@@ -43,6 +43,8 @@ CASES = (
     ("name_after_general_greeting", "My name is Alex Morgan.", "Hi, I'm Cedar. This is an AI demo for Cedar Service, a fictional dealership. How can I help with your service?", SAFE, False),
     ("name_with_phone", "My name is Alex Morgan and my phone is 555 555 0123.", "How can I help with your service?", SAFE, True),
     ("name_with_email", "My name is Alex Morgan and my email is alex@example.com.", "How can I help with your service?", SAFE, True),
+    ("asr_em_dash_question", "Are there any other—uh. Availabilities?", "Do either of those times work for you?", SAFE, False),
+    ("asr_em_dash_preference", "Yeah, I have October—27 in mind.", "Did you have another day in mind?", SAFE, False),
 )
 
 

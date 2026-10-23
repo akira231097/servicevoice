@@ -254,7 +254,8 @@ def test_telephone_clip_wraps_exact_warmed_pcm_without_synthesis(lane_app, tmp_p
     async def run():
         cache = BackchannelAudioCache(tmp_path/"audio")
         asset = cache.store("neutral_ack", tone(seconds=.67))
-        path = cache.write_manifest([asset])
+        other = cache.store("acknowledge", tone(seconds=.9))
+        path = cache.write_manifest([asset, other])
         cache.load_manifest(path)
         monkeypatch.setattr(api, "APPROVED_MANIFEST", cache.manifest_sha256)
         lane = lane_app.state.twilio_lane
@@ -266,6 +267,28 @@ def test_telephone_clip_wraps_exact_warmed_pcm_without_synthesis(lane_app, tmp_p
             assert (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (8000,1,2)
             assert audio.readframes(audio.getnframes()) == cache.lookup_pcm("Mm-hmm.",8000)[0]
         assert hashlib.sha256(lane.wav).hexdigest() == lane.wav_sha
+        await lane.close()
+    asyncio.run(run())
+
+
+def test_listening_clip_selection_is_signed_closed_set_and_requires_joined_caller(lane_app):
+    async def run():
+        lane=lane_app.state.twilio_lane;lane.client=Provider()
+        row=lane.store.allocate("CA"+"1"*32)
+        lane.store.claim_dial(row["id"],"CF"+"2"*32,row["caller_sid"])
+        with lane.store.db() as db:db.execute("UPDATE twilio_bridges SET state='joined' WHERE id=?",(row["id"],))
+        lane.wav=b"neutral";lane.wav_sha="a"*64
+        lane.clips={"neutral_ack":(lane.wav,lane.wav_sha),"acknowledge":(b"attention","b"*64)}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_public_app(lane_app)),base_url="https://test") as client:
+            suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&cue=acknowledge"
+            headers={"x-twilio-signature":signature(lane.config.auth_token,lane.config.url(suffix),[])}
+            response=await client.get("/twilio/"+suffix,headers=headers)
+            assert response.status_code==200 and response.content==b"attention"
+            assert (await client.get("/twilio/"+suffix.replace("cue=acknowledge","cue=neutral_ack"),headers=headers)).status_code==401
+            for query in ("cue=booked","cue=acknowledge&cue=neutral_ack"):
+                suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&"+query
+                headers={"x-twilio-signature":signature(lane.config.auth_token,lane.config.url(suffix),[])}
+                assert (await client.get("/twilio/"+suffix,headers=headers)).status_code==404
         await lane.close()
     asyncio.run(run())
 

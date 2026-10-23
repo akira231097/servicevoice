@@ -23,6 +23,19 @@ def messages(text, prior="How can I help?"):
     return [{"role": "assistant", "content": prior}, {"role": "user", "content": text}]
 
 
+@pytest.mark.parametrize("text", ["Are there any other—uh. Availabilities?", "Yeah, I have October—27 in mind.",
+    "I’m looking for an oil change… next week."])
+def test_asr_typography_is_not_a_language_veto(text):
+    state,reason=waiting_state(messages(text),SAFE)
+    assert reason=="eligible" and state["utterance"].isascii()
+    assert messages(text)[-1]["content"]==text  # Main conversation stays verbatim.
+
+
+@pytest.mark.parametrize("text", ["Sí, necesito ayuda.", "నా కారు", "Car\u200b service", "Ａppointment please"])
+def test_typography_normalization_does_not_transliterate_or_hide_unicode(text):
+    assert waiting_state(messages(text),SAFE)[1]=="cached_language_unverified"
+
+
 def answer(kind="information_question"):
     return {"model": JEV_MODEL, "answers": {"acknowledgment": choice("ordinary_content", WAITING_LABELS),
         "delivery_language": choice("cache_compatible", LANGUAGE_LABELS), "content_kind": choice(kind, CONTENT_LABELS)}}

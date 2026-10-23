@@ -22,6 +22,7 @@ import httpx
 
 from .jev_classifier import ClassificationUnavailable, JEV_MODEL, JEV_URL, MAX_RESPONSE_BYTES, parse_choice
 from .backchannel_catalog import PHRASES
+from .cue_text import cue_text
 
 PHRASE_IDS = ("silence", "neutral_ack", "acknowledge", "moment")
 SELECTION_LABELS = ("acknowledge", "silence")
@@ -93,7 +94,7 @@ def waiting_state(messages, context=None):
     if last.get("role") != "user" or last.get("tool_calls") is not None:return None, "not_final_user_turn"
     text = last.get("content")
     if not isinstance(text, str) or not text.strip() or len(text) > 1600:return None, "input_bounds"
-    text = text.strip()
+    text = cue_text(text).strip()
     if not text.isascii() or _LANGUAGE_REQUEST.search(text):return None, "cached_language_unverified"
     if _RISK.search(text):return None, "urgent_or_safety"
     if _INJECTION.search(text):return None, "untrusted_control_content"
@@ -102,6 +103,7 @@ def waiting_state(messages, context=None):
     prior = next((m.get("content") for m in reversed(messages[:-1]) if m.get("role") == "assistant"), "")
     if prior is None:prior = ""
     if not isinstance(prior, str) or len(prior) > 1600:return None, "prior_context_bounds"
+    prior = cue_text(prior)
     neutral_confirmation = bool(confirmation_context and _CLEAR_APPROVAL.fullmatch(text)
         and _BOOKING_READBACK.search(prior) and not _OTHER_ACTION.search(prior))
     if (_WAITING_CONTROL.search(text) or _AFFIRMATION_ONLY.fullmatch(text)) and not neutral_confirmation:return None, "sensitive_utterance"

@@ -8,7 +8,7 @@ full-duplex release.
 
 The separate Twilio line puts the caller and a dedicated Vapi SIP assistant in
 one conference. Jev classifies live partial transcripts; code may request a
-caller-only participant announcement from the existing approved “Mm-hmm.” bank.
+caller-only participant announcement from the approved “Mm-hmm.” / “I hear you.” bank.
 Waiting cues continue inside the existing Vapi stream with their separate
 budget. No listening cue creates consent, tool work, a proposal or a booking.
 
@@ -34,16 +34,28 @@ budget. No listening cue creates consent, tool work, a proposal or a booking.
 - Jev uses independent typed content/language choices on already spoken words.
   Main speech, caller stop, stale/rewritten partials, task-state changes,
   corrections, questions, private details, approvals and readbacks suppress cues.
-- Initial limits: at least four seconds and eight words; partial age at dispatch
-  at most 300 ms; seven seconds between audible cues; two cues per utterance and
-  six per call; 1.5 seconds after observed assistant speech stops.
+- Revised limits after the October 23 handset test: at least three seconds and
+  six words; partial age at dispatch at most 300 ms; five seconds between cue
+  reservations; three cues per explanation and twelve per call; 1.5 seconds
+  after observed assistant speech stops.
   An uncertain growing partial may be reconsidered after 1.5 seconds, without
   spending the audible-cue cooldown. Duplicate text is not classified again;
   there are at most 64 decision attempts per call. Confidence thresholds remain
   unchanged. This separates frequent listening decisions from restrained speech.
 - A caller pause of at most 1.5 seconds preserves the explanation's timer and
-  two-cue budget when the assistant has not spoken. A longer pause, assistant
+  three-cue budget when the assistant has not spoken. A longer pause, assistant
   speech or tool activity starts a fresh listening interval.
+- Completed ASR clauses stay in bounded context for the next fresh partial;
+  final transcripts never trigger listening playback themselves. Ordinary
+  symptom uncertainty and casual conversational yes/no are classified by Jev;
+  explicit control, final approval, sensitive context and private details veto.
+- Only known ASR typography (curly quotes, dash, ellipsis, nonbreaking space) is
+  normalized for cue decisions. The main transcript stays verbatim. Other
+  non-ASCII text is not transliterated into an English-cue opportunity.
+- After Jev approval, problem descriptions can use “I hear you.” (1.06 s),
+  alternating with “Mm-hmm.” (0.67 s). Neither clip claims diagnosis, consent,
+  accepted work or booking progress. Clip choice is a closed, signed query on
+  the existing audio route; no production routing change is required.
 - Native waiting classification can retry one malformed provider response
   inside the existing 350 ms deadline. Valid silence, language vetoes and low
   confidence are never resampled. Both attempts remain visible in diagnostics.

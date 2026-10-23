@@ -22,6 +22,12 @@ CASES = [
     ("sound_background", True, "The engine makes a gentle ticking noise in the mornings and it seems louder when the weather is cold"),
     ("tire_history", True, "The tires have been on the car for several years and the front ones are showing a little more wear"),
     ("live_brake_partial", True, "The last couple of weeks it has been making a grinding noise when I brake, mostly at"),
+    ("noisy_vehicle_partial", True, "Hey, uh, so my card is kind of making a lot of shaky sounds"),
+    ("symptom_uncertainty", True, "My car is making shaky sounds and I don't understand what's wrong with it"),
+    ("joined_fragments", True, "My car is making shaky sounds. The issue with it, so I've been like tweaking a lot of things"),
+    ("casual_yeah", True, "Yeah, my vehicle has been making a rattling noise when I drive uphill"),
+    ("negative_symptom", True, "My car has no power when I drive uphill and it struggles on the highway"),
+    ("initial_service", True, "Okay, uh, so I would like to have the local diagnosis and probably a brake inspection"),
     ("consent", False, "Yes please go ahead and confirm that appointment for me"),
     ("correction", False, "Actually that is the wrong car and I meant the other one"),
     ("private", False, "My phone number is five one two five five five zero one four two"),
@@ -32,6 +38,10 @@ CASES = [
     ("unclear", False, "Well it is just that thing with the other one around it"),
     ("other_language", False, "Mi coche hace ruido por la manana cuando voy al trabajo"),
     ("goodbye", False, "That is everything I wanted to tell you goodbye"),
+    ("action_rejection", False, "My vehicle makes a noise but don't book anything for me"),
+    ("payment_card", False, "My card was charged twice and I need to give you the card number"),
+    ("bare_approval", False, "Yeah"),
+    ("bare_rejection", False, "No"),
 ]
 
 

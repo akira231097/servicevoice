@@ -16,7 +16,7 @@ import wave
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate
+from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate, LISTENING_PHRASES
 from .telephony_ingress import IngressError
 from .twilio_test_capture import install_capture, CAPTURE_PATH
 from .twilio_bridge import (BridgeError, BridgeStore, TwilioClient, TwilioConfig,
@@ -57,6 +57,7 @@ class TwilioLane:
         self.ending = set()
         self.wav = None
         self.wav_sha = None
+        self.clips = {}
         self.started = False
         self.observed_proof_paths = ()
         self.fixture = None
@@ -89,18 +90,22 @@ class TwilioLane:
             cache = self.app.state.gemini_tts.backchannel_cache
             if cache is None or cache.manifest_sha256 != APPROVED_MANIFEST:
                 raise ValueError("Listening cues require the approved audio bank.")
-            item = cache.lookup_pcm("Mm-hmm.", 8000)
-            if item is None:
-                raise ValueError("Missing approved telephone cue.")
-            pcm, metadata = item
-            stream = io.BytesIO()
-            with wave.open(stream, "wb") as output:
-                output.setnchannels(1)
-                output.setsampwidth(2)
-                output.setframerate(8000)
-                output.writeframes(pcm)
-            self.wav = stream.getvalue()
-            self.wav_sha = hashlib.sha256(self.wav).hexdigest()
+            for phrase_id, text in LISTENING_PHRASES.items():
+                item = cache.lookup_pcm(text, 8000)
+                if item is None:
+                    raise ValueError("Missing approved telephone cue.")
+                pcm, metadata = item
+                if not 0 < len(pcm)/16000 <= 1.5:
+                    raise ValueError("Listening clip exceeds its audio budget.")
+                stream = io.BytesIO()
+                with wave.open(stream, "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(8000)
+                    output.writeframes(pcm)
+                wav = stream.getvalue()
+                self.clips[phrase_id] = (wav, hashlib.sha256(wav).hexdigest())
+            self.wav, self.wav_sha = self.clips["neutral_ack"]
             await self.coordinator.policy.start()
         # Restart cannot reopen rooms with stale speaker state or fresh budgets.
         for row in await asyncio.to_thread(self.store.active):
@@ -178,10 +183,12 @@ class TwilioLane:
     async def context(self, session_id, call_id):
         return await asyncio.to_thread(self.app.state.gemini_gateway._backchannel_context, session_id, call_id)
 
-    def observe(self, call_id, event, reason):
-        component = "listening_cue" if event in {"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"} else "twilio_bridge"
+    def observe(self, call_id, event, reason, phrase_id=None):
+        component = "listening_cue" if event in {"decision", "suppressed", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"} else "twilio_bridge"
+        state = self.coordinator.calls.get(call_id)
+        phrase_id = phrase_id or (state.phrase_id if state else "neutral_ack")
         self.app.state.diagnose(component, event, "observed", call_id=call_id,
-            attributes={"listening_reason": reason, "backchannel_phrase": "neutral_ack" if component == "listening_cue" else "silence"})
+            attributes={"listening_reason": reason, "backchannel_phrase": phrase_id if component == "listening_cue" else "silence"})
 
     async def dispatch(self, call_id):
         binding = self.bindings.get(call_id)
@@ -195,7 +202,7 @@ class TwilioLane:
                 or self.coordinator.clock()-state.assistant_stopped < 1.5
                 or listening_gate(state.text, state.previous, context) != "eligible"):
             raise BridgeError("cue_superseded")
-        return await self.client.announce(row)
+        return await self.client.announce(row, state.phrase_id)
 
     async def dial(self, bridge_id):
         row = await asyncio.to_thread(self.store.get, bridge_id)
@@ -397,12 +404,18 @@ def install_twilio(app, settings):
         await authenticated(request)
         if phrase_id != "neutral_ack" or lane.wav is None:
             raise HTTPException(404)
+        # Keep the existing edge route. Twilio signs the full query, including
+        # the closed-set clip selection; arbitrary text/URLs are never accepted.
+        selection = request.query_params.get("cue", "neutral_ack")
+        if len(request.query_params.getlist("cue")) > 1 or selection not in lane.clips:
+            raise HTTPException(404)
         row = await asyncio.to_thread(lane.store.get, request.query_params.get("bridge", ""))
         if row is None or row["state"] != "joined":
             raise HTTPException(404)
-        lane.observe(row["provider_call_id"] or row["id"], "clip_fetched", "accepted_unverified")
-        return Response(lane.wav, media_type="audio/wav", headers={
-            "Cache-Control": "private, max-age=86400", "ETag": '"' + lane.wav_sha + '"'})
+        lane.observe(row["provider_call_id"] or row["id"], "clip_fetched", "accepted_unverified", selection)
+        wav, sha = lane.clips[selection]
+        return Response(wav, media_type="audio/wav", headers={
+            "Cache-Control": "private, max-age=86400", "ETag": '"' + sha + '"'})
 
     @app.get("/api/twilio/readiness")
     async def local_readiness():

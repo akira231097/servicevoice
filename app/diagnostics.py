@@ -62,7 +62,7 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
-EVENTS |= frozenset({"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
+EVENTS |= frozenset({"decision", "suppressed", "dispatched", "clip_fetched", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
 _ENUM_ATTRIBUTES = {
     "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),

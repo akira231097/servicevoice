@@ -338,9 +338,11 @@ class TwilioClient:
             "StatusCallback": self.config.url("participant-status") + "?bridge=" + row["id"],
             "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"]})
 
-    async def announce(self, row):
+    async def announce(self, row, phrase_id="neutral_ack"):
+        if phrase_id not in {"neutral_ack", "acknowledge"}:
+            raise BridgeError("cue_not_approved")
         return await self.request("POST", f"/Conferences/{row['conference_sid']}/Participants/{row['caller_sid']}.json",
-            {"AnnounceUrl": self.config.url("clip/neutral_ack.wav") + "?bridge=" + row["id"], "AnnounceMethod": "GET"})
+            {"AnnounceUrl": self.config.url("clip/neutral_ack.wav") + "?bridge=" + row["id"] + "&cue=" + phrase_id, "AnnounceMethod": "GET"})
 
     async def end_conference(self, conference_sid):
         return await self.request("POST", f"/Conferences/{conference_sid}.json", {"Status": "completed"})
