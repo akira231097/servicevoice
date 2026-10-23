@@ -366,3 +366,11 @@ def test_metric_feedback_scores_fit_langsmith_precision():
     # LangSmith refuses a feedback score with more than four decimal places.
     assert rows['metric_asr_confidence_min']['score']==rows['metric_asr_confidence_min']['value']==0.9838
     assert rows['metric_cost_usd']['score']==0.0176 and rows['metric_call_seconds']['score']==19.418 and rows['metric_tokens_total']['score']==12
+
+
+@pytest.mark.parametrize('tokens,score',[(99999,99999),(100000,None),(160096,None)])
+def test_large_call_metric_keeps_value_without_overflowing_feedback_score(tokens,score):
+    report={'checks':{},'review_process':{},'3 Turn-by-turn timeline':{'details':[{'tokens':tokens}]}}
+    rows={r['key']:r for r in feedback_rows(str(uuid4()),report)}
+    assert rows['metric_tokens_total']['score']==score
+    assert rows['metric_tokens_total']['value']==tokens
