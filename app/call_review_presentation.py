@@ -378,6 +378,22 @@ def diagnostic_events(diagnostics, call_key):
     return rows
 
 
+def listening_summary(diagnostics, call_key):
+    rows = [row for row in diagnostic_events(diagnostics, call_key) if row["component"] == "listening_cue"]
+    if not rows:
+        return None
+    allowed = {"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"}
+    rows = [row for row in rows if row["event"] in allowed]
+    return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
+                         "phrase": "Mm-hmm.", "reason": row["attributes"].get("listening_reason", "unknown")}
+                        for row in rows],
+            "dispatched": sum(row["event"] == "dispatched" for row in rows),
+            "clip_fetches": sum(row["event"] == "clip_fetched" for row in rows),
+            "announcement_failures": sum(row["event"] == "announcement_fail" for row in rows),
+            "audible_playback": "unverified",
+            "scope": "Caller-only announcement dispatch and fetch evidence. Captured caller audio is required to verify audibility, overlap and preserved words."}
+
+
 def condense_diagnostics(diagnostics, call_key):
     """Keep every non-noise event; summarize webhook deliveries as counts.
 
@@ -1015,6 +1031,11 @@ def build_review_children(trace, *, root_run_id, root_dotted_order, project_id, 
                      {"classification": span.get("classification"), "first_token_ms": span.get("first_token_ms"), "duration_ms": span.get("duration_ms"), "gateway_generation_id": None},
                      parent=group, tags=["provider-reported"]) is not None:
                 counts["provider_model_spans"] += 1
+    for index, cue in enumerate(trace.get("listening", [])):
+        if isinstance(cue, dict) and cue.get("event") == "dispatched":
+            child("listening", index, "listen · Mm-hmm.", cue.get("start_unix"), cue.get("start_unix"),
+                  {"phrase": "neutral_ack"}, {"status": "accepted_unverified", "scope": "Twilio REST acceptance; caller playback unverified"},
+                  tags=["listening-cue", "experimental"])
     if len(runs) > max_children:
         counts["omitted"] += len(runs) - max_children
         runs = runs[:max_children]
@@ -1094,6 +1115,13 @@ def review_metadata(report, *, call_id, environment, latency_target_ms):
 
 def feedback_rows(run_id, report):
     """Feedback a person can scan: checks score 1/0, flags, coverage, metric_* values."""
+    listening = report.get("listening_cues")
+    if isinstance(listening, dict):
+        for key, source in (("metric_listening_cues", "dispatched"), ("metric_listening_clip_fetches", "clip_fetches")):
+            value = listening.get(source)
+            if type(value) is int and value >= 0:
+                yield {"key": key, "score": value, "value": value,
+                       "comment": "Measurement of provider acceptance or clip fetch, not proof of audible playback."}
     checks = report.get("checks") or {}
     for key, item in checks.items():
         if not isinstance(item, dict):

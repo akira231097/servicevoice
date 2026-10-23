@@ -41,6 +41,8 @@ def _component(owner, entering, leaving, failures, observation, path):
 
 
 COMPONENTS = {
+    "twilio_bridge": _component("Twilio isolated lane", "Authenticated conference lifecycle", "Owned caller and SIP legs", ["join_failed", "cleanup_pending"], "Signed callbacks and REST terminal readbacks; Vapi end observed separately", "audio"),
+    "listening_cue": _component("ServiceVoice Jev and Twilio", "Fresh partial and observed speaker state", "Caller participant announcement", ["stale_partial", "provider_unavailable", "speaker_priority"], "Selection, dispatch and clip fetch; acoustic playback and overlap require captured audio", "audio"),
     "caller_device": _component("Caller device and carrier", "Microphone sound frames", "Received and played sound", ["muted_microphone", "packet_loss", "playback_failure"], "Controlled endpoint audio capture; not visible to this backend", "audio"),
     "voice_runtime": _component("Vapi and carrier", "Phone or browser audio session", "Audio transport, call events and transcripts", ["connection_failure", "call_drop", "transport_delay"], "Vapi call status, end reason and provider timing", "audio"),
     "stt": _component("Configured speech recognition provider via Vapi", "Caller audio", "Transcript events", ["misrecognized_words", "misrecognized_digits", "missing_speech"], "Provider transcript; independent audio comparison needed for accuracy", "audio"),
@@ -60,6 +62,7 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
+EVENTS |= frozenset({"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
 _ENUM_ATTRIBUTES = {
     "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),
@@ -94,6 +97,11 @@ _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "priva
 # refund cause is recorded beside the original emission reason, never over it.
 _ENUM_ATTRIBUTES["backchannel_refund_reason"] = frozenset({"generation_cancelled_before_answer", "generation_superseded_before_answer"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= _ENUM_ATTRIBUTES["backchannel_refund_reason"]
+_ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverified", "twilio_legs_only",
+    "sensitive_context", "input_bounds", "language_unverified", "control_content", "sensitive_content",
+    "private_content", "sensitive_prior_turn", "question", "policy_unavailable", "provider_unavailable",
+    "invalid_response", "classifier_silence", "speaker_priority", "speech_too_short", "stale_partial",
+    "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})

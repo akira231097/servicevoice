@@ -104,6 +104,7 @@ class TelephonyIngress:
         self.limits = limits or IngressLimits()
         self.clock, self.monotonic = clock, monotonic
         self.live_admission=live_admission
+        self.admission_guard = None  # Optional isolated SIP proof, after provider identity validation.
         self._workers = threading.BoundedSemaphore(self.limits.workers)
         # Short admission/end writes queue inside the existing deadline instead
         # of ten connections competing through SQLite's 100 ms busy timeout.
@@ -248,6 +249,8 @@ class TelephonyIngress:
         call_id = self._identity(call, message.get("assistant"), assistant_required=False)
         if call.get("status") == "ended" or call.get("endedAt") is not None:
             raise IngressError("telephony_call_ended", 409)
+        if self.admission_guard is not None:
+            self.admission_guard(message)
         # Exact retries are reads. Reuse the original budget across both the
         # read fast path and a possible new atomic admission transaction.
         if deadline is None:deadline=self.monotonic()+self.limits.deadline_seconds
