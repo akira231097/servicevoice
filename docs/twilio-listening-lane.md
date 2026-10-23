@@ -105,7 +105,7 @@ custom voice requests. Explicit headers on the dedicated saved assistant fixed
 both without weakening endpoint authentication. Those private header values
 must never enter source control, reports or the publication snapshot helper.
 The third audio probe delivered the main response and ended cleanly. Earlier
-failed captures are retained. No live listening cue has passed audio acceptance.
+failed captures are retained. Later probes below establish listening playback.
 
 The fourth probe recorded a complete caller-only “Mm-hmm” during the synthetic
 23.2-second utterance, followed by “Let me check that” and “One moment” in the
@@ -127,12 +127,42 @@ and uses prior assistant speech only to identify sensitive reply context. With
 unchanged thresholds, 14/14 ordinary cases and 0/20 exclusions passed across a
 normal prior question and an interrupted greeting. These are classifier results.
 
-Still needed: shared-clock synthetic caller capture, partial webhook delivery
-timing, live Jev plus acknowledgment audio captures, conference versus
-direct-SIP timing, speakerphone echo test, and the user's listening acceptance.
-These are pending work, not passed checks. No production merge/deployment is
-authorized by a local test result alone; the current task explicitly preserves
-the main agent and asks for user testing first.
+The final isolated runtime tested on October 23 is `7d83141`. Both GitHub
+workflows passed: 2,648 Python tests, 155 JavaScript tests, and 57 deployment
+tests with 19 subtests. Three test services are healthy; the main assistant,
+number and protected runtime remain unchanged. The prototype is restored to
+conference mode with listening enabled and no active test bridges.
+
+Further live evidence:
+
+- Consecutive 23.2-second explanations produced two full listening clips and
+  preserved all 75 source words in order. A multi-turn call used four distinct
+  waiting phrases plus two listening clips, with no appointment or proposal.
+- Shared-clock synthetic caller capture measured 492.7 and 567.7 ms from cue
+  approval to first voiced audio arrival (median 530.2 ms; only two samples).
+  All 5,568 media messages were contiguous. This is not handset acoustic latency.
+  The provider advertised protocol version `0.2.0`, unlike the documentation's
+  example; the diagnostic receiver records that metadata and separately validates
+  the authenticated call, capability, media format and every frame.
+- Three FAQ calls per topology measured median caller-end-to-answer gaps of
+  1.48 seconds in conference mode and 1.38 seconds in direct-SIP mode. The observed
+  100 ms difference includes backend/network variability and does not isolate
+  pure transport overhead. One scripted caller overlapped the greeting tail;
+  the measured answer gap starts after the caller's question.
+- One recorded interruption stopped old speech in approximately 720 ms. A
+  goodbye call ended with `assistant-ended-call` after 18 seconds, before its
+  75-second test cap. Known Twilio legs, Vapi calls and local sessions closed.
+- A live malformed waiting-classifier response recovered on its second attempt;
+  both requests were retained in diagnostics. Automatic reviews completed for
+  the main tested scenarios. Waveform evidence is distinct from advisory audio
+  model ratings, which sometimes missed cues present in the recording.
+
+Still needed before production acceptance: handset/speakerphone echo and
+listening tests, broader timing/race samples, and settled incremental billing
+evidence. One repeat call substituted connecting words; exact transcription is
+not guaranteed. Dispatched participant announcements are not an atomic audio
+lock. No production merge/deployment follows from these samples alone; this
+task explicitly preserves the main agent and asks for user testing first.
 
 Acceptance must demonstrate that each cue is audible only to the caller, no
 caller words are lost or split by it, no cues overlap the useful answer, and
