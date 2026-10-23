@@ -97,6 +97,20 @@ must never enter source control, reports or the publication snapshot helper.
 The third audio probe delivered the main response and ended cleanly. Earlier
 failed captures are retained. No live listening cue has passed audio acceptance.
 
+The fourth probe recorded a complete caller-only “Mm-hmm” during the synthetic
+23.2-second utterance, followed by “Let me check that” and “One moment” in the
+waiting period. All 75 caller words were retained in order, the listening cue
+did not appear as an assistant turn, no proposal/appointment was created, and
+all three Twilio legs and Vapi ended. This is one successful mechanism capture,
+not completed interruption, latency, echo or human-listening acceptance.
+
+The opt-in tester includes a signed WebSocket receiver for both audio tracks of
+an owned synthetic self-call. It additionally requires a short-lived single-use
+capability, checks the call's exact account-owned To/From and outbound direction,
+and bounds duration, bytes, connections and stored captures. Ordinary inbound
+caller audio cannot enter this path. Its packet-arrival timestamps share the
+host clock with Jev diagnostics; they do not measure handset acoustic latency.
+
 The live partial benchmark exposed an unrelated greeting influencing Jev's
 classification. The prompt now identifies the caller partial as the label target,
 and uses prior assistant speech only to identify sensitive reply context. With

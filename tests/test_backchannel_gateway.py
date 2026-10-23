@@ -76,7 +76,7 @@ def test_delayed_primary_releases_one_flushed_prefix_then_exact_answer_with_same
             release.set()
             result = await asyncio.wait_for(pending, 2)
             assert result.status_code == 200
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> Exact primary answer, complete."
+            assert speech(result.text) == PHRASES["moment"]+" <flush />Exact primary answer, complete."
             assert len({event["id"] for event in events(result.text) if "choices" in event}) == 1
             assert result.text.count("<flush />") == 1 and result.text.endswith(DONE.decode())
             row = gateway.latency_snapshot("call-a")[-1]
@@ -178,7 +178,7 @@ def test_delayed_tool_prose_stays_discarded_and_exact_signature_authority_is_pre
             await asyncio.wait_for(cue.wait(), 2)
             release.set()
             result = await asyncio.wait_for(pending, 2)
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> "
+            assert speech(result.text) == PHRASES["moment"]+" <flush />"
             assert "PRIVATE" not in result.text and "Let me check" not in result.text and SIG not in result.text
             tools = issued(result.text)
             assert len(tools) == 1 and tools[0]["function"] == {"name": "get_appointment", "arguments": "{}"}
@@ -344,7 +344,7 @@ def test_cancelled_header_worker_retains_physical_lease_until_cleanup_really_fin
             previous = await asyncio.wait_for(old, 2)
             assert "OBSOLETE" not in previous.text and issued(previous.text) == []
             assert previous.text.count("<flush />") <= 1
-            assert speech(previous.text) in ("", PHRASES["moment"]+" <flush /> ")
+            assert speech(previous.text) in ("", PHRASES["moment"]+" <flush />")
             after_supersession = b"".join(body for superseded, body in offered if superseded)
             assert b"<flush />" not in after_supersession and b"OBSOLETE" not in after_supersession
             assert after_supersession.endswith(DONE)
@@ -420,7 +420,7 @@ def test_upstream_failure_after_offered_cue_never_becomes_a_false_success(tmp_pa
             release.set()
             result = await asyncio.wait_for(pending, 2)
             assert "generation_unavailable" in result.text and "PRIVATE" not in result.text
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> "
+            assert speech(result.text) == PHRASES["moment"]+" <flush />"
             assert result.text.count("<flush />") == 1 and issued(result.text) == []
             assert DONE.decode() not in result.text and '"finish_reason":"stop"' not in result.text
             assert not gateway.active and not gateway.owners and not gateway.successors

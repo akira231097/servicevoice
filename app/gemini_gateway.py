@@ -1477,9 +1477,11 @@ class GeminiGateway:
                         record["emitted_ms"]=elapsed
                         self._payload(timing)
                         self._backchannel_observation(timing,"backchannel.emitted",elapsed)
+                        # A trailing space after flush becomes a separate blank
+                        # voice request when the next payload is a tool call.
                         yield sse({"id":timing.row["sse_response_id"],"object":"chat.completion.chunk",
                             "created":int(time.time()),"model":MODEL,"choices":[{"index":0,"delta":{
-                                "role":"assistant","content":PHRASES[record["phrase_id"]]+" <flush /> "},"finish_reason":None}]})
+                                "role":"assistant","content":PHRASES[record["phrase_id"]]+" <flush />"},"finish_reason":None}]})
             else:record["reason"]="policy_not_ready"
             if record["emitted_ms"] is None:self._backchannel_observation(timing,"backchannel.suppressed",None)
             stream,first=await asyncio.shield(primary)

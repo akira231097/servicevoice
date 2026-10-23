@@ -18,12 +18,13 @@ from fastapi.responses import JSONResponse, Response
 
 from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate
 from .telephony_ingress import IngressError
+from .twilio_test_capture import install_capture, CAPTURE_PATH
 from .twilio_bridge import (BridgeError, BridgeStore, TwilioClient, TwilioConfig,
     conference_twiml, direct_twiml, unavailable_twiml, verify_signature, sid, proof_header_paths, flag)
 
 APPROVED_MANIFEST = "2eaa539728bb43ae6e33d61f7e359f7d34419d4ec443c66b6ea953efd15ca467"
 TWILIO_PATHS = frozenset({"/twilio/voice", "/twilio/conference-status", "/twilio/participant-status",
-    "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav", "/twilio/tester/fixture.wav"})
+    "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav", "/twilio/tester/fixture.wav", CAPTURE_PATH})
 FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
 
@@ -59,6 +60,7 @@ class TwilioLane:
         self.started = False
         self.observed_proof_paths = ()
         self.fixture = None
+        self.test_capture = None
         self.coordinator = ListeningCoordinator(ListeningPolicy(connection_capacity=2), "",
             self.context, self.dispatch, self.observe)
 
@@ -107,6 +109,8 @@ class TwilioLane:
 
     async def close(self):
         self.closing = True
+        if self.test_capture:
+            await self.test_capture.close()
         for task in self.watchdogs.values():
             task.cancel()
         await self.coordinator.close()
@@ -275,6 +279,7 @@ def install_twilio(app, settings):
     config = TwilioConfig.from_mapping(settings)
     lane = TwilioLane(app, config) if config else None
     app.state.twilio_lane = lane
+    install_capture(app,lane)
     if lane:
         if app.state.telephony_ingress.config is None:
             raise ValueError("Twilio requires dedicated authenticated phone admission.")
