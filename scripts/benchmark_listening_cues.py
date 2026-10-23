@@ -28,6 +28,7 @@ CASES = [
     ("casual_yeah", True, "Yeah, my vehicle has been making a rattling noise when I drive uphill"),
     ("negative_symptom", True, "My car has no power when I drive uphill and it struggles on the highway"),
     ("initial_service", True, "Okay, uh, so I would like to have the local diagnosis and probably a brake inspection"),
+    ("asr_greeting", True, "Hei, uh, so my car has been making a lot of shaky sounds and I don't understand what is wrong with it"),
     ("consent", False, "Yes please go ahead and confirm that appointment for me"),
     ("correction", False, "Actually that is the wrong car and I meant the other one"),
     ("private", False, "My phone number is five one two five five five zero one four two"),
@@ -42,6 +43,8 @@ CASES = [
     ("payment_card", False, "My card was charged twice and I need to give you the card number"),
     ("bare_approval", False, "Yeah"),
     ("bare_rejection", False, "No"),
+    ("finnish_content", False, "Hei tarvitsen autolleni huoltoajan koska moottori pitaeae aeaentae"),
+    ("greeting_language_request", False, "Hei my car is making a rattling noise please respond in Finnish"),
 ]
 
 

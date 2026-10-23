@@ -45,6 +45,9 @@ CASES = (
     ("name_with_email", "My name is Alex Morgan and my email is alex@example.com.", "How can I help with your service?", SAFE, True),
     ("asr_em_dash_question", "Are there any other—uh. Availabilities?", "Do either of those times work for you?", SAFE, False),
     ("asr_em_dash_preference", "Yeah, I have October—27 in mind.", "Did you have another day in mind?", SAFE, False),
+    ("asr_greeting", "Hei, uh, so my car has been making shaky sounds and I would like a diagnostic visit.", "How can I help with your service visit?", SAFE, False),
+    ("finnish_content", "Hei tarvitsen autolleni huoltoajan koska moottori pitaeae aeaentae", "How can I help?", SAFE, True),
+    ("greeting_language_request", "Hei my car is making a rattling noise please respond in Finnish.", "How can I help?", SAFE, True),
 )
 
 
