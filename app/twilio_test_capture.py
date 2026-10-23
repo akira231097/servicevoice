@@ -114,7 +114,11 @@ class TestCaptureRuntime:
             await socket.accept()
             async with asyncio.timeout(5):
                 connected=await socket.receive_json()
-                if connected!={"event":"connected","protocol":"Call","version":"1.0.0"}:raise ValueError("protocol")
+                # Provider additions must not invalidate documented protocol
+                # fields. Ownership and the one-use capability are checked next.
+                if (not isinstance(connected,dict) or any(connected.get(k)!=v for k,v in
+                        {"event":"connected","protocol":"Call","version":"1.0.0"}.items())):
+                    raise ValueError("protocol")
                 phase="start"
                 message=await socket.receive_json();start=message.get("start",{})
                 if message.get("event")!="start" or message.get("sequenceNumber")!="1":raise ValueError("start")

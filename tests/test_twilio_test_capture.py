@@ -76,7 +76,7 @@ def test_websocket_capture_accepts_only_owned_synthetic_call(tmp_path,fault):
     if fault=="replay":(tmp_path/"twilio-test-captures"/NONCE).mkdir(parents=True)
     def exchange():
         with TestClient(app).websocket_connect("/twilio/tester/media",headers={"x-twilio-signature":auth}) as socket:
-            socket.send_json({"event":"connected","protocol":"Call","version":"1.0.0"})
+            socket.send_json({"event":"connected","protocol":"Call","version":"1.0.0","sequenceNumber":"0"})
             socket.send_json(start)
             if fault is not None:return socket.receive()
             socket.send_json(packet())
