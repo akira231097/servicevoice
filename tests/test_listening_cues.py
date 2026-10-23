@@ -193,3 +193,38 @@ def test_late_old_partial_does_not_erase_current_speaker_state():
         assert len(sent) == 1
         await c.close()
     asyncio.run(run())
+
+
+def test_uncertain_partial_can_be_reconsidered_before_playback_cooldown():
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        async def choose(*args):
+            p.requests+=1
+            return "classifier_silence" if p.requests==1 else "approved"
+        p.choose=choose
+        event("transcript","user",transcriptType="partial",transcript=TEXT)
+        await drain(c)
+        assert not sent
+        clock.now+=1.6
+        # Repeated text does not spend another model request.
+        event("transcript","user",transcriptType="partial",transcript=TEXT)
+        await drain(c);assert p.requests==1
+        clock.now+=.1
+        event("transcript","user",transcriptType="partial",transcript=TEXT+" around town")
+        await drain(c);assert p.requests==2 and len(sent)==1
+        clock.now+=1.6
+        event("transcript","user",transcriptType="partial",transcript=TEXT+" around town each day")
+        await drain(c);assert p.requests==2 and len(sent)==1
+        await c.close()
+    asyncio.run(run())
+
+
+def test_eight_words_after_four_seconds_can_acknowledge_without_waiting_for_sentence_end():
+    async def run():
+        c,clock,p,sent,_,event,_=setup()
+        clock.now=4.1
+        event("transcript","user",transcriptType="partial",transcript="My Honda makes a rattling sound every morning")
+        await drain(c)
+        assert len(sent)==1
+        await c.close()
+    asyncio.run(run())

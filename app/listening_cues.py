@@ -28,6 +28,11 @@ _PRIVATE = re.compile(r"@|(?:\d[\s().+-]*){7,}|\b(?:my name|my address|phone num
 _QUESTION = re.compile(r"\?|^(?:can|could|would|will|what|when|where|why|how|do|does|is|are)\b", re.I)
 CONTENT_LABELS = ("ordinary", "excluded")
 LANGUAGE_LABELS = ("english", "other", "uncertain")
+MIN_SPEECH_SECONDS = 4
+MIN_PARTIAL_WORDS = 8
+DECISION_RETRY_SECONDS = 1.5
+CUE_COOLDOWN_SECONDS = 7
+MAX_DECISIONS_PER_CALL = 64
 
 
 def listening_gate(text, previous, context):
@@ -144,6 +149,8 @@ class ListeningState:
     turn_count: int = 0
     last_cue: float = -math.inf
     last_attempt: float = -math.inf
+    last_attempt_text: str = ""
+    decisions: int = 0
     speech_events: dict = field(default_factory=dict)
     partial_event: float = -math.inf
     closed: bool = False
@@ -207,6 +214,7 @@ class ListeningCoordinator:
                 if started and not state.caller:
                     state.caller_started, state.turn_count = now-max(0, age), 0
                     state.text, state.partial_event = "", -math.inf
+                    state.last_attempt_text = ""
                     self._invalidate(state)
                 state.caller = started
                 if not started:
@@ -242,23 +250,26 @@ class ListeningCoordinator:
         now = self.clock()
         if state.closed or not state.caller or state.assistant:
             return "speaker_priority"
-        if now-state.assistant_stopped < 1.5 or now-state.caller_started < 5:
+        if now-state.assistant_stopped < 1.5 or now-state.caller_started < MIN_SPEECH_SECONDS:
             return "speech_too_short"
         if now-state.received > .3:
             return "stale_partial"
-        if len(state.text.split()) < 12:
+        if len(state.text.split()) < MIN_PARTIAL_WORDS:
             return "insufficient_words"
         if state.count >= 6 or state.turn_count >= 2:
             return "cue_budget"
-        if now-state.last_cue < 7:
+        if now-state.last_cue < CUE_COOLDOWN_SECONDS:
             return "cue_cooldown"
         return "eligible"
 
     def _schedule(self, call_id, state):
-        if (self.timing_reason(state) != "eligible" or self.clock()-state.last_attempt < 7
+        if (self.timing_reason(state) != "eligible" or self.clock()-state.last_attempt < DECISION_RETRY_SECONDS
+                or state.text == state.last_attempt_text or state.decisions >= MAX_DECISIONS_PER_CALL
                 or state.task and not state.task.done()):
             return
         state.last_attempt = self.clock()
+        state.last_attempt_text = state.text
+        state.decisions += 1
         task = asyncio.create_task(self._decide(call_id, state, state.epoch, state.text))
         state.task = task
         self.tasks.add(task)

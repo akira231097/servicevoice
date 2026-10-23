@@ -34,9 +34,13 @@ budget. No listening cue creates consent, tool work, a proposal or a booking.
 - Jev uses independent typed content/language choices on already spoken words.
   Main speech, caller stop, stale/rewritten partials, task-state changes,
   corrections, questions, private details, approvals and readbacks suppress cues.
-- Initial limits: at least five seconds and twelve words; partial age at dispatch
-  at most 300 ms; seven seconds between attempts/cues; two cues per utterance and
+- Initial limits: at least four seconds and eight words; partial age at dispatch
+  at most 300 ms; seven seconds between audible cues; two cues per utterance and
   six per call; 1.5 seconds after observed assistant speech stops.
+  An uncertain growing partial may be reconsidered after 1.5 seconds, without
+  spending the audible-cue cooldown. Duplicate text is not classified again;
+  there are at most 64 decision attempts per call. Confidence thresholds remain
+  unchanged. This separates frequent listening decisions from restrained speech.
 - A dispatched announcement is never retried/refunded on an ambiguous timeout.
   Runtime checks again immediately before requesting playback. Delayed provider
   delivery can still cause overlap; only live audio can establish acceptance.
