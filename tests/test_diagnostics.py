@@ -129,7 +129,8 @@ def test_restart_preserves_request_turn_operation_and_config_without_content(tmp
     sink=Diagnostics(path,{"SERVICEVOICE_ENVIRONMENT":"production"})
     assert sink.record("tool_harness","execution_finished","success",call_id=call,turn_id=turn,request_id=request,operation_id=operation,duration_ms=12,
         attributes={"receipt_present":True,"tool_name":"confirm_action","transcript":"PRIVATE NAME 2025550146","headers":{"authorization":"PRIVATE"}})
-    assert sink.close()
+    # Verify persisted content without imposing a disk-speed target on shared CI.
+    assert sink.close(timeout_seconds=10)
     report=read_call_diagnostics(path,call)
     assert report["coverage"]["state"]=="observed" and report["coverage"]["complete"] is False
     row=report["events"][0]
@@ -139,7 +140,7 @@ def test_restart_preserves_request_turn_operation_and_config_without_content(tmp
         assert forbidden not in json.dumps(report)
         assert forbidden.encode() not in path.read_bytes()
     second=Diagnostics(path)
-    assert second.close()
+    assert second.close(timeout_seconds=10)
     assert read_call_diagnostics(path,call)["events"][0]==row
     assert "prior_unclean_shutdown_possible_loss" not in read_call_diagnostics(path,call)["coverage"]["reason_codes"]
 
@@ -149,7 +150,7 @@ def test_read_scope_truncation_and_absence_are_explicit(tmp_path):
     for index in range(3):
         assert sink.record("gateway","request_finished","success",call_id="one",start_unix=time.time()+index/1000)
     assert sink.record("gateway","request_finished","failure",call_id="two")
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     first=read_call_diagnostics(path,"one",limit=2)
     assert len(first["events"])==2 and first["coverage"]["truncated"]
     assert first["coverage"]["state"]=="incomplete"
@@ -177,7 +178,7 @@ def test_queue_pressure_is_nonblocking_and_marks_the_affected_call(tmp_path,monk
         assert not sink.record("gateway","request_finished","success",call_id="lost")
         assert sink.status()["queue_dropped"]==1
         assert sink.snapshot("lost")["coverage"]["dropped_events"]==1
-    finally:release.set();assert sink.close()
+    finally:release.set();assert sink.close(timeout_seconds=10)
     final=read_call_diagnostics(sink.path,"lost")
     assert final["coverage"]["dropped_events"]==1
     assert final["coverage"]["state"]=="incomplete"
@@ -194,7 +195,7 @@ def test_storage_failure_is_per_call_and_visible_after_recovery(tmp_path,monkeyp
     sink=Diagnostics(tmp_path/"ledger.sqlite3")
     assert sink.record("gateway","request_finished","success",call_id="lost")
     assert failed.wait(2)
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     report=read_call_diagnostics(sink.path,"lost")
     assert report["coverage"]["dropped_events"]==1
     assert report["coverage"]["state"]=="incomplete"
@@ -207,7 +208,7 @@ def test_capacity_retention_pruning_keeps_explicit_call_tombstone(tmp_path):
     now=time.time()
     assert sink.record("gateway","request_finished","success",call_id="old",start_unix=now-20)
     assert sink.record("gateway","request_finished","success",call_id="new",start_unix=now)
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     old=read_call_diagnostics(sink.path,"old")
     assert old["events"]==[] and old["coverage"]["retention_pruned"]
     assert old["coverage"]["state"]=="incomplete"
@@ -217,13 +218,13 @@ def test_capacity_retention_pruning_keeps_explicit_call_tombstone(tmp_path):
 def test_unclean_shutdown_marker_and_stale_writer_do_not_claim_complete_capture(tmp_path):
     sink=Diagnostics(tmp_path/"ledger.sqlite3")
     sink.record("gateway","request_finished","success",call_id="one")
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     with sqlite3.connect(sink.path) as db:
         db.execute("UPDATE diagnostic_state SET payload='true' WHERE key='writer_open'")
         db.execute("UPDATE diagnostic_state SET payload=? WHERE key='last_write_unix'",(str(time.time()-200),))
     report=read_call_diagnostics(sink.path,"one")
     assert "diagnostic_writer_stale" in report["coverage"]["reason_codes"]
-    restarted=Diagnostics(sink.path);assert restarted.close()
+    restarted=Diagnostics(sink.path);assert restarted.close(timeout_seconds=10)
     report=read_call_diagnostics(sink.path,"one")
     assert "prior_unclean_shutdown_possible_loss" in report["coverage"]["reason_codes"]
 
@@ -234,7 +235,7 @@ def test_invalid_records_are_rejected_and_counted(tmp_path,field,value):
     args={"component":"gateway","event":"request_finished","outcome":"success","call_id":"one"}
     args[field]=value
     assert not sink.record(**args)
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     assert sink.status()["filtered"]==1
     report=read_call_diagnostics(sink.path,"one")
     assert report["coverage"]["state"]=="incomplete"
@@ -243,7 +244,7 @@ def test_invalid_records_are_rejected_and_counted(tmp_path,field,value):
 def test_modified_sidecar_cannot_export_raw_attributes_or_manifest_values(tmp_path):
     sink=Diagnostics(tmp_path/"ledger.sqlite3")
     sink.record("gateway","request_finished","success",call_id="one")
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     with sqlite3.connect(sink.path) as db:
         eid,payload=db.execute("SELECT event_id,payload FROM diagnostic_events").fetchone();event=json.loads(payload)
         event["attributes"]["transcript"]="PRIVATE"
@@ -263,7 +264,7 @@ def test_modified_sidecar_cannot_export_raw_attributes_or_manifest_values(tmp_pa
 def test_component_presence_is_not_equated_with_quality_or_audio_observation(tmp_path):
     sink=Diagnostics(tmp_path/"ledger.sqlite3")
     sink.record("gateway","request_finished","failure",call_id="one")
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     coverage=component_coverage(read_call_diagnostics(sink.path,"one"))
     assert coverage["complete"] is False
     assert coverage["components"]["gateway"]["failed_event_count"]==1
@@ -277,4 +278,4 @@ def test_disabled_sink_has_no_filesystem_side_effect_and_explicit_unknown(tmp_pa
     assert isinstance(sink,NullDiagnostics)
     assert not sink.record("llm","generation_finished","success",call_id="one")
     assert sink.snapshot("one")["coverage"]["state"]=="unavailable"
-    assert sink.close() and not path.parent.exists()
+    assert sink.close(timeout_seconds=10) and not path.parent.exists()
