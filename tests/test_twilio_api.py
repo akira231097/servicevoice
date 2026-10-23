@@ -216,3 +216,18 @@ def test_telephone_clip_wraps_exact_warmed_pcm_without_synthesis(lane_app, tmp_p
         assert hashlib.sha256(lane.wav).hexdigest() == lane.wav_sha
         await lane.close()
     asyncio.run(run())
+
+
+def test_synthetic_caller_fixture_is_pinned_and_bounded(tmp_path):
+    import hashlib
+    import io
+    import wave
+    from app.twilio_api import load_test_fixture
+    path=tmp_path/'fixture.wav'
+    with wave.open(str(path),'wb') as audio:
+        audio.setnchannels(1);audio.setsampwidth(2);audio.setframerate(8000)
+        audio.writeframes(b'\x01\x02'*8000)
+    expected=path.read_bytes()
+    assert load_test_fixture(path,hashlib.sha256(expected).hexdigest())==expected
+    with pytest.raises(ValueError):load_test_fixture(path,'0'*64)
+    with pytest.raises(ValueError):load_test_fixture('relative.wav','0'*64)

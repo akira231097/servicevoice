@@ -19,13 +19,27 @@ from fastapi.responses import JSONResponse, Response
 from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate
 from .telephony_ingress import IngressError
 from .twilio_bridge import (BridgeError, BridgeStore, TwilioClient, TwilioConfig,
-    conference_twiml, direct_twiml, unavailable_twiml, verify_signature, sid, proof_header_paths)
+    conference_twiml, direct_twiml, unavailable_twiml, verify_signature, sid, proof_header_paths, flag)
 
 APPROVED_MANIFEST = "2eaa539728bb43ae6e33d61f7e359f7d34419d4ec443c66b6ea953efd15ca467"
 TWILIO_PATHS = frozenset({"/twilio/voice", "/twilio/conference-status", "/twilio/participant-status",
-    "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav"})
+    "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav", "/twilio/tester/fixture.wav"})
 FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
+
+
+def load_test_fixture(path, expected):
+    path = Path(path)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_size > 2*1024*1024:
+        raise ValueError("Invalid isolated test fixture.")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("Isolated test fixture changed.")
+    with wave.open(io.BytesIO(data), "rb") as audio:
+        if (audio.getnchannels() != 1 or audio.getsampwidth() != 2 or audio.getframerate() not in {8000,16000}
+                or not 0 < audio.getnframes()/audio.getframerate() <= 30):
+            raise ValueError("Unsupported isolated test fixture format.")
+    return data
 
 
 class TwilioLane:
@@ -44,6 +58,7 @@ class TwilioLane:
         self.wav_sha = None
         self.started = False
         self.observed_proof_paths = ()
+        self.fixture = None
         self.coordinator = ListeningCoordinator(ListeningPolicy(connection_capacity=2), "",
             self.context, self.dispatch, self.observe)
 
@@ -64,6 +79,10 @@ class TwilioLane:
         if self.client is None:
             self.client = TwilioClient(self.config)
         self.coordinator.key = settings.get("TYPESAFE_API_KEY", "")
+        if flag(settings, "SERVICEVOICE_TWILIO_TESTER"):
+            self.fixture = await asyncio.to_thread(load_test_fixture,
+                settings.get("SERVICEVOICE_TWILIO_TESTER_FIXTURE", ""),
+                settings.get("SERVICEVOICE_TWILIO_TESTER_FIXTURE_SHA256", ""))
         if self.config.listening:
             cache = self.app.state.gemini_tts.backchannel_cache
             if cache is None or cache.manifest_sha256 != APPROVED_MANIFEST:
@@ -377,5 +396,12 @@ def install_twilio(app, settings):
                 "observed_proof_paths": lane.observed_proof_paths,
                 "sip_header_path_configured": bool(config.sip_headers_path),
                 "clip_sha256": lane.wav_sha, "listening_enabled": config.listening}
+
+    @app.get("/twilio/tester/fixture.wav")
+    async def test_fixture(request: Request):
+        await authenticated(request)
+        if lane.fixture is None:
+            raise HTTPException(404)
+        return Response(lane.fixture, media_type="audio/wav", headers={"Cache-Control":"private, max-age=86400"})
 
     return lane
