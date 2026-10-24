@@ -315,6 +315,8 @@ def generation_rows(timings):
         generation = source.get("generation_id")
         rows[request] = {
             "request_id": request, "generation_id": generation if isinstance(generation, str) and _UUID.fullmatch(generation) else None,
+            "model": source.get("model") if route == "gemini" and isinstance(source.get("model"), str) and source["model"] in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None,
+            "reasoning_effort": source.get("reasoning_effort") if route == "gemini" and isinstance(source.get("reasoning_effort"), str) and source["reasoning_effort"] in {"low", "minimal"} else None,
             "started_at_unix": started, "total_ms": total, "route": route, "outcome": code(source.get("outcome")) or "unknown",
             "first_text_ms": number(phases.get("first_text")), "tool_emitted_ms": number(phases.get("tool_emitted")),
             "upstream_headers_ms": number(phases.get("upstream_headers")), "preflight_ms": number(phases.get("preflight")),
@@ -404,6 +406,7 @@ def listening_summary(diagnostics, call_key):
         if row["turn_id"]: by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
     fetched = sum(row["event"] == "clip_fetched" for row in rows)
     return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
+                         "phrase_id": row["attributes"].get("backchannel_phrase") if row["attributes"].get("backchannel_phrase") in phrases else None,
                          "phrase": phrases.get(row["attributes"].get("backchannel_phrase"), "unknown"),
                          "reason": row["attributes"].get("listening_reason", "unknown")}
                         for row in rows],
@@ -1061,8 +1064,14 @@ def build_review_children(trace, *, root_run_id, root_dotted_order, project_id, 
                 counts["provider_model_spans"] += 1
     for index, cue in enumerate(trace.get("listening", [])):
         if isinstance(cue, dict) and cue.get("event") == "dispatched":
-            child("listening", index, "listen · Mm-hmm.", cue.get("start_unix"), cue.get("start_unix"),
-                  {"phrase": "neutral_ack"}, {"status": "accepted_unverified", "scope": "Twilio REST acceptance; caller playback unverified"},
+            # Frozen older exports retain their exact labels for immutable readback.
+            # New timelines carry a closed phrase id; never export arbitrary prose.
+            from .listening_audio import VARIATIONS
+            phrases = {"neutral_ack": "Mm-hmm.", "acknowledge": "I hear you.", **VARIATIONS}
+            phrase = cue.get("phrase_id") if "phrase_id" in cue else "neutral_ack"
+            phrase = phrase if isinstance(phrase, str) and phrase in phrases else None
+            child("listening", index, "listen · " + phrases.get(phrase, "unknown"), cue.get("start_unix"), cue.get("start_unix"),
+                  {"phrase": phrase}, {"status": "accepted_unverified", "scope": "Twilio REST acceptance; caller playback unverified"},
                   tags=["listening-cue", "experimental"])
     if len(runs) > max_children:
         counts["omitted"] += len(runs) - max_children
@@ -1112,9 +1121,17 @@ def _generation_children(child, generation, group, counts):
         outputs["usage_metadata"] = {"input_tokens": generation.get("input_tokens") if type(generation.get("input_tokens")) is int else 0,
                                      "output_tokens": generation.get("output_tokens") if type(generation.get("output_tokens")) is int else 0, "total_tokens": tokens}
     generation_id = generation.get("generation_id") if isinstance(generation.get("generation_id"), str) and _UUID.fullmatch(generation["generation_id"]) else None
+    # Missing key denotes a frozen legacy trace. An explicit null means the new
+    # projection did not observe an allowed model; do not guess one in that case.
+    model = generation.get("model", "gemini-3.8-flash") if route == "gemini" else None
+    model = model if isinstance(model, str) and model in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None
+    if "model" in generation:
+        outputs["model"] = model
+        effort = generation.get("reasoning_effort") if route == "gemini" else None
+        outputs["reasoning_effort"] = effort if isinstance(effort, str) and effort in {"low", "minimal"} else None
     if child("generation", request, name, start, end, {"generation_id": generation_id, "route": route}, outputs, parent=group,
              run_type="llm" if route == "gemini" else "chain", tags=["gateway-generation", route],
-             metadata={"generation_id": generation_id, "model": "gemini-3.8-flash" if route == "gemini" else None, "not_an_additional_model_call": True}) is not None:
+             metadata={"generation_id": generation_id, "model": model, "not_an_additional_model_call": True}) is not None:
         counts["generations"] += 1
 
 
