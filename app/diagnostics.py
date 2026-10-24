@@ -93,6 +93,8 @@ _ENUM_ATTRIBUTES = {
     "tool_name": frozenset({"get_dealership_info", "begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "confirm_action", "dismiss_proposal", "get_appointment", "get_session_context", "get_operation", "prepare_reschedule", "prepare_cancellation", "request_handoff", "withdraw_handoff", "unknown_tool"}),
 }
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "private_detail", "private_prior_turn", "caller_still_formulating"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"speaker_state_unavailable", "caller_speaking",
+    "assistant_speaking", "caller_end_unobserved", "caller_pause_too_short", "caller_resumed", "listening_clip_pending"})
 # A cue Vapi discarded with a cancelled or replaced request is refunded; the
 # refund cause is recorded beside the original emission reason, never over it.
 _ENUM_ATTRIBUTES["backchannel_refund_reason"] = frozenset({"generation_cancelled_before_answer", "generation_superseded_before_answer"})

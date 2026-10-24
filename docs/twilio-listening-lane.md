@@ -12,6 +12,24 @@ caller-only participant announcement from the approved “Mm-hmm.” / “I hear
 Waiting cues continue inside the existing Vapi stream with their separate
 budget. No listening cue creates consent, tool work, a proposal or a booking.
 
+### Listening versus waiting
+
+Listening permits only “Mm-hmm” and “I hear you,” on approved partial content
+during caller speech, with a five-second cooldown. Waiting permits only the
+separate hold/check phrase catalog after an observed caller stop and at least
+750 ms of quiet following its receipt or the latest partial. A finalized ASR
+clause or speculative model request does not establish that the caller finished.
+The waiting stream may wait up to 1.25 seconds for that boundary while the main
+answer runs concurrently; a ready main answer always wins. Resumed caller speech
+invalidates the pending cue, including during the fresh business-state read.
+Unknown speaker state fails closed, and a recently dispatched listening clip
+also defers the waiting cue. The main Vapi transport is not changed by this guard.
+
+This prevents the observed early waiting-cue emissions inside ongoing speech.
+Webhooks still arrive asynchronously: the check is not an atomic handset audio
+lock, and Vapi retains responsibility for interruption after a cue is released.
+An extended pause inside a completed thought can still resemble a turn ending.
+
 ## Implemented boundaries
 
 - Twilio signature verification over the configured external URL and all form

@@ -115,6 +115,66 @@ async def drain(coordinator):
         await asyncio.gather(*tuple(coordinator.tasks), return_exceptions=True)
 
 
+def test_waiting_cues_require_observed_quiet_and_invalidate_on_resumed_speech():
+    c, clock, _, _, _, event, _ = setup()
+    ticket, reason = c.waiting_status("fixture-call", "session")
+    assert reason == "caller_speaking"
+    event("transcript", "user", transcriptType="final", transcript=TEXT)
+    assert c.waiting_status("fixture-call", "session")[1] == "caller_speaking"
+    event("speech-update", "user", status="stopped")
+    clock.now += .74
+    assert c.waiting_status("fixture-call", "session") == (ticket, "caller_pause_too_short")
+    clock.now += .02
+    assert c.waiting_status("fixture-call", "session") == (ticket, "eligible")
+    event("speech-update", "user", status="started")
+    changed, reason = c.waiting_status("fixture-call", "session")
+    assert changed != ticket and reason == "caller_speaking"
+
+
+def test_waiting_cues_fail_closed_on_missing_state_and_stale_boundary():
+    c, clock, _, _, _, event, _ = setup()
+    assert c.waiting_status("unknown", "session") == (None, "speaker_state_unavailable")
+    assert c.waiting_status("fixture-call", "other") == (None, "speaker_state_unavailable")
+    event("speech-update", "user", status="stopped", timestamp=(clock.wall()-3)*1000)
+    clock.now += 3
+    assert c.waiting_status("fixture-call", "session")[1] == "caller_end_unobserved"
+
+
+def test_waiting_quiet_window_uses_receipt_and_recent_partial_and_keeps_tool_followup():
+    c, clock, _, _, _, event, _ = setup()
+    event("speech-update", "user", status="stopped", timestamp=(clock.wall()-1)*1000)
+    assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
+    clock.now += .6
+    event("transcript", "user", transcriptType="partial", transcript=TEXT)
+    clock.now += .3
+    assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
+    clock.now += .5
+    assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+    event("speech-update", "assistant", status="started")
+    assert c.waiting_status("fixture-call", "session")[1] == "assistant_speaking"
+    clock.now += .2
+    event("speech-update", "assistant", status="stopped")
+    event("tool-calls")
+    assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+
+
+def test_waiting_cue_cannot_overlap_recent_listening_clip():
+    c, clock, _, _, _, event, _ = setup()
+    c.calls["fixture-call"].last_cue = clock.now
+    event("speech-update", "user", status="stopped")
+    clock.now += .8
+    assert c.waiting_status("fixture-call", "session")[1] == "listening_clip_pending"
+    clock.now += 1.1
+    assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+
+
+def test_listening_and_waiting_phrase_sets_are_disjoint():
+    from app.listening_cues import LISTENING_PHRASES
+    from app.backchannel_policy import WAITING_PHRASE_IDS
+    assert not set(LISTENING_PHRASES).intersection(WAITING_PHRASE_IDS)
+    assert set(LISTENING_PHRASES.values()) == {"Mm-hmm.", "I hear you."}
+
+
 @pytest.mark.parametrize("gap,assistant,expected",[(1.2,False,True),(1.6,False,False),(.5,True,False)])
 def test_brief_caller_pause_preserves_explanation_but_not_a_new_turn(gap,assistant,expected):
     async def run():

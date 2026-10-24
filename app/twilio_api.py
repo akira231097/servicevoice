@@ -180,6 +180,12 @@ class TwilioLane:
         if call_id in self.bindings:
             self.coordinator.event(call_id, message)
 
+    def waiting_status(self, call_id, session_id):
+        binding = self.bindings.get(call_id)
+        if self.closing or binding is None or binding[1] != session_id:
+            return None, "speaker_state_unavailable"
+        return self.coordinator.waiting_status(call_id, session_id)
+
     async def context(self, session_id, call_id):
         return await asyncio.to_thread(self.app.state.gemini_gateway._backchannel_context, session_id, call_id)
 
@@ -291,6 +297,8 @@ def install_twilio(app, settings):
         if app.state.telephony_ingress.config is None:
             raise ValueError("Twilio requires dedicated authenticated phone admission.")
         app.state.telephony_ingress.admission_guard = lane.admission_guard
+        if config.listening and config.topology == "conference":
+            app.state.gemini_gateway.waiting_cue_state = lane.waiting_status
 
     @app.exception_handler(BridgeError)
     async def bridge_error(request, exc):

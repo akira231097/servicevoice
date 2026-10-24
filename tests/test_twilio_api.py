@@ -49,6 +49,22 @@ class Provider:
     async def close(self): pass
 
 
+def test_conference_waiting_guard_uses_only_admitted_speaker_state(lane_app, monkeypatch, tmp_path):
+    assert lane_app.state.gemini_gateway.waiting_cue_state is None
+    monkeypatch.setenv("SERVICEVOICE_LISTENING_CUES", "on")
+    app = create_app(tmp_path/"guard.sqlite3")
+    lane = app.state.twilio_lane
+    gate = app.state.gemini_gateway.waiting_cue_state
+    assert gate is not None
+    assert gate("fixture", "session") == (None, "speaker_state_unavailable")
+    lane.bindings["fixture"] = ("bridge", "session")
+    lane.coordinator.register("fixture", "session")
+    assert gate("fixture", "other") == (None, "speaker_state_unavailable")
+    assert gate("fixture", "session")[1] == "assistant_speaking"
+    lane.closing = True
+    assert gate("fixture", "session") == (None, "speaker_state_unavailable")
+
+
 async def post(client, lane, suffix, fields, **kwargs):
     body = urlencode(fields)
     url = lane.config.url(suffix)

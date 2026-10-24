@@ -48,6 +48,11 @@ CASES = (
     ("asr_greeting", "Hei, uh, so my car has been making shaky sounds and I would like a diagnostic visit.", "How can I help with your service visit?", SAFE, False),
     ("finnish_content", "Hei tarvitsen autolleni huoltoajan koska moottori pitaeae aeaentae", "How can I help?", SAFE, True),
     ("greeting_language_request", "Hei my car is making a rattling noise please respond in Finnish.", "How can I help?", SAFE, True),
+    ("unfinished_auxiliary", "So do.", "Would you like a brake inspection?", SAFE, True),
+    ("unfinished_question", "The brakes make a noise. Do you.", "How can I help?", SAFE, True),
+    ("unfinished_thought", "My car is making a noise. And. I.", "How can I help?", SAFE, True),
+    ("unfinished_so", "My car is making a noise. So.", "How can I help?", SAFE, True),
+    ("complete_capabilities", "So what can I do? What can you do for me?", "How can I help?", SAFE, False),
 )
 
 

@@ -105,6 +105,70 @@ def test_fast_primary_wins_and_no_acknowledgment_is_released(tmp_path, monkeypat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("case", ["speaking", "brief_pause", "resumed", "quiet", "fast_answer", "read_race", "missing"])
+def test_phone_waiting_cues_follow_speaker_state_without_delaying_main(tmp_path, monkeypatch, case):
+    async def scenario():
+        release, checked, suppressed, emitted = (asyncio.Event() for _ in range(4))
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                await release.wait()
+                yield frame({"content": "Exact primary answer."})
+                yield frame(reason="stop")
+                yield DONE
+        app, gateway, _ = setup(tmp_path, lambda r: httpx.Response(200,
+            headers={"content-type": "text/event-stream"}, stream=Stream()))
+        enable(gateway, monkeypatch)
+        state = {"ticket": 1, "reason": "caller_speaking", "reads": 0}
+        if case == "brief_pause": state["reason"] = "caller_pause_too_short"
+        if case == "read_race": state["reason"] = "eligible"
+        if case == "missing": state["ticket"] = None
+        def status(*args):
+            state["reads"] += 1
+            if state["reads"] > 1: checked.set()
+            return state["ticket"], state["reason"]
+        gateway.waiting_cue_state = status
+        observe = gateway._backchannel_observation
+        def observation(timing, event, elapsed):
+            observe(timing, event, elapsed)
+            if event == "backchannel.suppressed": suppressed.set()
+            if event == "backchannel.emitted": emitted.set()
+        monkeypatch.setattr(gateway, "_backchannel_observation", observation)
+        if case == "read_race":
+            context = gateway._backchannel_context
+            reads = []
+            def racing_context(*args):
+                reads.append(1)
+                if len(reads) == 2:
+                    state["ticket"] = 2
+                    state["reason"] = "caller_speaking"
+                return context(*args)
+            monkeypatch.setattr(gateway, "_backchannel_context", racing_context)
+        pending = asyncio.create_task(post(app, request_body()))
+        try:
+            await asyncio.wait_for(checked.wait(), 3)
+            if case == "quiet": state["reason"] = "eligible"
+            if case == "resumed": state["ticket"] = 2
+            if case == "fast_answer": release.set()
+            await asyncio.wait_for((emitted if case == "quiet" else suppressed).wait(), 3)
+            release.set()
+            result = await asyncio.wait_for(pending, 2)
+            assert result.status_code == 200
+            assert "Exact primary answer." in speech(result.text)
+            assert ("<flush />" in result.text) is (case == "quiet")
+            row = gateway.latency_snapshot("call-a")[-1]
+            expected = {"speaking":"caller_speaking", "brief_pause":"caller_pause_too_short",
+                "resumed":"caller_resumed", "quiet":"emitted", "fast_answer":"primary_ready",
+                "read_race":"caller_resumed", "missing":"speaker_state_unavailable"}
+            assert row["backchannel"]["reason"] == expected[case]
+            if case != "quiet": assert gateway.backchannel_budget.receipt("call-a") is None
+            assert not gateway.active and not gateway.owners
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+            await gateway.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("flag,assistant,ready", [("off", "our-assistant", True), ("on", "another-assistant", True),
     ("on", "", True), ("on", "our-assistant", False)])
 def test_disabled_or_non_candidate_assistant_keeps_existing_primary_path(tmp_path, monkeypatch, flag, assistant, ready):

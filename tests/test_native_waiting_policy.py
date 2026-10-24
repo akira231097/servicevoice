@@ -6,6 +6,21 @@ import json
 import httpx
 import pytest
 
+
+@pytest.mark.parametrize("text", ["So do.", "Do you.", "The engine makes a noise. And. I.",
+    "The brakes make a noise. So.", "My vehicle is making a noise...", "I need a brake inspection and--"])
+def test_unfinished_asr_clauses_are_not_post_turn_waiting_cues(text):
+    from app.backchannel_policy import waiting_state
+    state, reason = waiting_state([{"role":"user", "content":text}])
+    assert state is None and reason == "caller_still_formulating"
+
+
+@pytest.mark.parametrize("text", ["What can I do?", "What can you do for me?", "My name is Jordan."])
+def test_complete_requests_and_short_details_remain_waiting_eligible(text):
+    from app.backchannel_policy import waiting_state
+    state, reason = waiting_state([{"role":"user", "content":text}])
+    assert state is not None and reason == "eligible"
+
 from app.backchannel_budget import BackchannelBudget
 from app.backchannel_catalog import PHRASES
 from app.backchannel_policy import (BackchannelDecision, BackchannelPolicy, CONTENT_LABELS,

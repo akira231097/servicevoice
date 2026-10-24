@@ -787,6 +787,9 @@ class GeminiGateway:
         self.backchannel_budget = BackchannelBudget()
         self.backchannel_cache_ready = False
         self.backchannel_reads = set()
+        # Installed only by the isolated conference lane. Other assistants keep
+        # their existing transport; timing checks never authorize business work.
+        self.waiting_cue_state = None
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -1351,6 +1354,33 @@ class GeminiGateway:
                 f"SELECT provider_call_id FROM sessions WHERE provider_call_id IN ({marks}) AND (ended!=0 OR created<?)",
                 (*call_ids,time.time()-4*3600)))
 
+    def _waiting_status(self, call_id, sid, ticket):
+        if self.waiting_cue_state is None:
+            return "eligible"
+        try:
+            current, reason = self.waiting_cue_state(call_id, sid)
+            if current is None or ticket is None:
+                return "speaker_state_unavailable"
+            return reason if current == ticket else "caller_resumed"
+        except Exception:
+            return "speaker_state_unavailable"
+
+    async def _wait_for_caller_pause(self, primary, call_id, sid, ticket):
+        # Bounded, optional wait concurrent with the main answer. Caller events
+        # arrive on the same event loop; no locks, provider calls or disk reads.
+        deadline = time.monotonic()+1.25
+        while True:
+            if primary.done():
+                primary.result()
+                return "primary_ready"
+            reason = self._waiting_status(call_id, sid, ticket)
+            if reason in {"eligible", "caller_resumed", "speaker_state_unavailable"}:
+                return reason
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                return reason
+            await asyncio.wait((primary,), timeout=min(.04, remaining))
+
     async def _backchannel_stream(self,request,config,key,upstream,sid,call_id,started,timing):
         """One bounded acknowledgment in the existing owned Vapi stream.
 
@@ -1358,6 +1388,10 @@ class GeminiGateway:
         speculative tool prose, dynamic name or booking authority is added.
         """
         streams=[]
+        try:
+            speaker_ticket = self.waiting_cue_state(call_id, sid)[0] if self.waiting_cue_state else None
+        except Exception:
+            speaker_ticket = None
         selection_context = None
         policy_messages=upstream["messages"]
         follow_up=False
@@ -1441,6 +1475,7 @@ class GeminiGateway:
             elif decision is not None:
                 self._backchannel_observation(timing,"backchannel.selected",None)
                 if decision.phrase_id in WAITING_PHRASE_IDS and decision.reason=="eligible_classification":
+                    speaker_reason = await self._wait_for_caller_pause(primary, call_id, sid, speaker_ticket)
                     # Never wait for this optional fresh read ahead of a ready
                     # main answer. A context change cannot grant new authority.
                     fresh=asyncio.create_task(read_context())
@@ -1456,6 +1491,12 @@ class GeminiGateway:
                         if not fresh.done():fresh.cancel()
                         await asyncio.gather(fresh,return_exceptions=True)
                     state,reason=waiting_state(policy_messages,current) if current is not None else (None,record["reason"])
+                    # Recheck after the asynchronous context read. This check,
+                    # budget reservation and SSE yield have no intervening await.
+                    if speaker_reason == "eligible":
+                        speaker_reason = self._waiting_status(call_id, sid, speaker_ticket)
+                    if speaker_reason != "eligible":
+                        state,reason = None,speaker_reason
                     if state is None:record["reason"]=reason
                     elif selection_context is None or current!=selection_context:record["reason"]="scheduler_changed"
                     elif not primary.done():

@@ -36,6 +36,7 @@ MIN_SPEECH_SECONDS = 3
 MIN_PARTIAL_WORDS = 6
 DECISION_RETRY_SECONDS = 1.5
 CUE_COOLDOWN_SECONDS = 5
+WAITING_QUIET_SECONDS = .75
 MAX_DECISIONS_PER_CALL = 64
 LISTENING_PHRASES = {"neutral_ack": "Mm-hmm.", "acknowledge": "I hear you."}
 _PROBLEM = re.compile(r"\b(?:noise|sounds?|rattl\w*|shak\w*|grind\w*|issue|problem|worr\w*)\b", re.I)
@@ -161,6 +162,8 @@ class ListeningState:
     assistant_stopped: float = math.inf
     caller_started: float = math.inf
     caller_stopped: float = -math.inf
+    waiting_stopped: float = -math.inf
+    user_revision: int = 0
     received: float = -math.inf
     text: str = ""
     segment: str = ""
@@ -222,6 +225,8 @@ class ListeningCoordinator:
                 if kind != "transcript":
                     self._invalidate(state)
                     state.caller = False
+                    state.waiting_stopped = -math.inf
+                    state.user_revision += 1
                 return
         if kind == "speech-update":
             if not isinstance(role, str) or role not in {"assistant", "user"}:
@@ -241,6 +246,7 @@ class ListeningCoordinator:
                 self._invalidate(state)
             elif role == "user":
                 if started and not state.caller:
+                    state.user_revision += 1
                     # Brief endpointing pauses inside an explanation do not
                     # restart its listening timer or replenish its cue budget.
                     if now-max(0, age)-state.caller_stopped > 1.5:
@@ -251,11 +257,18 @@ class ListeningCoordinator:
                     state.last_attempt_text = ""
                     self._invalidate(state)
                 state.caller = started
+                if started:
+                    state.waiting_stopped = -math.inf
                 if not started:
                     state.caller_stopped = now-max(0, age)
+                    # Use receipt time for the quiet window: delayed webhooks
+                    # must not grant an already-expired permission to speak.
+                    state.waiting_stopped = now
                     self._invalidate(state)
         elif kind == "user-interrupted":
             self._invalidate(state)
+            state.user_revision += 1
+            state.waiting_stopped = -math.inf
         elif kind == "transcript":
             value = cue_text(message.get("transcript"))
             if not isinstance(value, str) or len(value) > 1600:
@@ -294,6 +307,32 @@ class ListeningCoordinator:
             self._invalidate(state)
             state.caller = False
             state.caller_stopped = -math.inf
+
+    def waiting_status(self, call_id, session_id):
+        """Read-only permission for the separate, post-turn waiting stream.
+
+        A generation request or a final ASR clause is not an end-of-turn signal.
+        Resumed speech changes the ticket and invalidates that request's cue.
+        Provider webhooks cannot guarantee atomic cancellation after dispatch.
+        """
+        state = self.calls.get(call_id)
+        if state is None or state.closed or state.session_id != session_id:
+            return None, "speaker_state_unavailable"
+        ticket = (id(state), state.user_revision)
+        if state.caller:
+            return ticket, "caller_speaking"
+        if state.assistant:
+            return ticket, "assistant_speaking"
+        if not math.isfinite(state.waiting_stopped):
+            return ticket, "caller_end_unobserved"
+        now = self.clock()
+        if now-max(state.waiting_stopped, state.received) < WAITING_QUIET_SECONDS:
+            return ticket, "caller_pause_too_short"
+        # Give an already-dispatched listening clip time to finish; this is a
+        # conservative bound, not an assertion of measured handset playback.
+        if now-state.last_cue < 1.8:
+            return ticket, "listening_clip_pending"
+        return ticket, "eligible"
 
     def timing_reason(self, state):
         now = self.clock()
