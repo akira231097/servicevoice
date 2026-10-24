@@ -33,7 +33,9 @@ def test_listening_variants_rotate_without_immediate_word_repeats():
         c.available_phrases.update(VARIATIONS)
         chosen = []
         for index in range(10):
-            clock.now += 6
+            # Test rotation after every allowed cadence (up to seven seconds).
+            # The separately tested pause preference must not suppress a turn.
+            clock.now += 8
             event("transcript", "user", transcriptType="partial", transcript=TEXT+" again"*index)
             await drain(c)
             chosen.append(c.calls["fixture-call"].phrase_id)
