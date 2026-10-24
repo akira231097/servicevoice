@@ -90,11 +90,13 @@ def test_bridge_duplicate_admission_capacity_and_restart(tmp_path):
     first = store.allocate("CA"+"1"*32)
     assert store.allocate(first["caller_sid"]) == first
     store.allocate("CA"+"2"*32)
+    store.allocate("CA"+"3"*32)
+    store.allocate("CA"+"4"*32)
     store.end(first["id"])
     with pytest.raises(BridgeError, match="capacity"):
-        BridgeStore(store.path).allocate("CA"+"3"*32)
+        BridgeStore(store.path).allocate("CA"+"5"*32)
     store.end(first["id"], verified=True)
-    assert store.allocate("CA"+"3"*32)
+    assert store.allocate("CA"+"5"*32)
 
 
 def test_dial_claim_is_once_and_terminal_state_never_reopens(tmp_path):

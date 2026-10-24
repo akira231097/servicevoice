@@ -6,6 +6,21 @@ the main Vapi number, assistant and production services remain unchanged. Live
 listening acceptance is outstanding. This is not yet a verified simulated
 full-duplex release.
 
+## Current concurrent capacity
+
+The isolated bridge, listening registry and Jev listening pool admit **four**
+callers. Application admission, main generation, speech generation and Twilio's
+HTTP pool also have four slots. Each caller gets a private two-participant room
+(caller and assistant); the conference participant count is not raised.
+The user confirmed Vapi's shared account allowance is four, so the main and test
+lines cannot assume four slots each at the provider. Startup refuses an application
+call cap below four. The local readiness endpoint reports the relevant ceilings.
+
+The independent lifetime prototype quota is now **60 calls**, raised from 50 so
+the remaining three admissions would not prevent four callers from connecting.
+Admission history is retained; no counters are reset. These are configured and
+offline-tested limits, not a four-caller live audio performance claim.
+
 ## October 24 handset regression repairs
 
 The later handset call ended with `pipeline-error-custom-llm-llm-failed`, not a
@@ -61,7 +76,7 @@ An extended pause inside a completed thought can still resemble a turn ending.
 
 - Twilio signature verification over the configured external URL and all form
   fields, including future fields; bounded form bodies; exact account and number.
-- Durable ownership and two concurrent bridge slots. Duplicate joins cannot
+- Durable ownership and four concurrent bridge slots. Duplicate joins cannot
   redial. A pending dial or incomplete cleanup continues to occupy its slot.
 - A 15-second join watchdog, ten-minute Twilio call limit, terminal callback
   handling, and cleanup readbacks. Vapi's existing assistant duration is unchanged.

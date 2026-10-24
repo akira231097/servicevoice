@@ -117,6 +117,8 @@ def test_full_listening_registry_keeps_phone_call_available(lane_app):
         lane.client = Provider()
         lane.coordinator.register("old-1", "s1")
         lane.coordinator.register("old-2", "s2")
+        lane.coordinator.register("old-3", "s3")
+        lane.coordinator.register("old-4", "s4")
         row = lane.store.allocate(CALLER)
         call = {"id": str(uuid4()), "type": "inboundPhoneCall", "orgId": ORG, "phoneNumberId": PHONE,
             "sip": {"headers": {"x-sv_bridge": row["id"], "x-sv_proof": lane.store.proof(lane.config, row)}}}

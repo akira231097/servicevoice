@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 from .listening_audio import VARIATIONS
+from .twilio_limits import MAX_CONCURRENT_CALLS, MAX_PROTOTYPE_CALLS
 
 
 class BridgeError(Exception):
@@ -244,9 +245,9 @@ silently retired while provider legs might still be billable.
             if previous:
                 return dict(previous)
             now = self.clock()
-            if db.execute("SELECT COUNT(*) FROM twilio_bridges").fetchone()[0] >= 50:
+            if db.execute("SELECT COUNT(*) FROM twilio_bridges").fetchone()[0] >= MAX_PROTOTYPE_CALLS:
                 raise BridgeError("bridge_test_budget", 429)
-            if db.execute("SELECT COUNT(*) FROM twilio_bridges WHERE cleanup_verified=0").fetchone()[0] >= 2:
+            if db.execute("SELECT COUNT(*) FROM twilio_bridges WHERE cleanup_verified=0").fetchone()[0] >= MAX_CONCURRENT_CALLS:
                 raise BridgeError("bridge_capacity", 429)
             if db.execute("SELECT COUNT(*) FROM twilio_bridges WHERE created>?", (now-60,)).fetchone()[0] >= 10:
                 raise BridgeError("bridge_rate_limit", 429)

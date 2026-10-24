@@ -20,6 +20,7 @@ import time
 from fastapi import WebSocket, WebSocketDisconnect
 
 from .twilio_bridge import BridgeError, sid, verify_signature
+from .twilio_limits import MAX_CONCURRENT_CALLS, MAX_PROTOTYPE_CALLS
 
 CAPTURE_PATH = "/twilio/tester/media"
 MAX_CAPTURE_SECONDS = 240  # Owned self-call evidence, never ordinary callers.
@@ -107,7 +108,7 @@ class TestCaptureRuntime:
         url=config.url("tester/media")
         urls=(url,url+"/",url.replace("https://","wss://",1),url.replace("https://","wss://",1)+"/")
         signature=socket.headers.get("x-twilio-signature","")
-        if (lane.fixture is None or lane.closing or len(self.active)>=2 or socket.scope.get("query_string")
+        if (lane.fixture is None or lane.closing or len(self.active)>=MAX_CONCURRENT_CALLS or socket.scope.get("query_string")
                 or not any(verify_signature(config,u,[],signature) for u in urls)):
             await socket.close(code=1008);return
         self.active.add(socket)
@@ -153,7 +154,7 @@ class TestCaptureRuntime:
                     raise ValueError("not_owned_synthetic_call")
                 phase="storage"
                 self.directory.mkdir(mode=0o700,exist_ok=True)
-                if len(list(self.directory.iterdir()))>=50:raise ValueError("capture_budget")
+                if len(list(self.directory.iterdir()))>=MAX_PROTOTYPE_CALLS:raise ValueError("capture_budget")
                 folder=self.directory/nonce
                 folder.mkdir(mode=0o700,exist_ok=False) # A capability is single-use across restarts.
                 capture=Capture(call,stream,version)

@@ -21,6 +21,7 @@ from .backchannel_policy import BackchannelPolicy, _RISK, _INJECTION, _LANGUAGE_
 from .cue_text import cue_text
 from .backchannel_catalog import PHRASES
 from .listening_audio import VARIATIONS, ROTATION
+from .twilio_limits import MAX_CONCURRENT_CALLS
 from .jev_classifier import ClassificationUnavailable, JEV_MODEL, JEV_URL, MAX_RESPONSE_BYTES, parse_choice
 
 _CONTROL = re.compile(r"\b(?:i meant|confirm|confirmed|confirmation|approve|approved|cancel|bye|goodbye|"
@@ -279,7 +280,7 @@ class ListeningCoordinator:
 
     def register(self, call_id, session_id):
         if call_id not in self.calls:
-            if len(self.calls) >= 2:
+            if len(self.calls) >= MAX_CONCURRENT_CALLS:
                 return False
             self.calls[call_id] = ListeningState(session_id)
         return True

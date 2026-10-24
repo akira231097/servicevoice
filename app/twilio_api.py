@@ -23,6 +23,7 @@ from .listening_cues import CueNotSent, ListeningCoordinator, ListeningPolicy, i
 from .telephony_ingress import IngressError, IngressConfig, TelephonyIngress
 from .phone_ingress_router import PhoneIngressRouter
 from .twilio_media_health import OpeningMedia
+from .twilio_limits import MAX_CONCURRENT_CALLS, MAX_PROTOTYPE_CALLS
 from .listening_audio import load_variations
 from .twilio_test_capture import install_capture, CAPTURE_PATH
 from .twilio_bridge import (BridgeError, BridgeStore, TwilioClient, TwilioConfig,
@@ -98,7 +99,7 @@ class TwilioLane:
         self.observed_proof_paths = ()
         self.fixture = None
         self.test_capture = None
-        self.coordinator = ListeningCoordinator(ListeningPolicy(connection_capacity=2), "",
+        self.coordinator = ListeningCoordinator(ListeningPolicy(connection_capacity=MAX_CONCURRENT_CALLS), "",
             self.context, self.dispatch, self.observe)
 
     def spawn(self, coroutine):
@@ -114,7 +115,7 @@ class TwilioLane:
                 self.observe("twilio-background", "background_failure", "unavailable")
 
     def lock(self, bridge_id):
-        # The durable prototype admits at most 50 bridge identities.
+        # The durable prototype's lifetime admission quota bounds this registry.
         return self.locks.setdefault(bridge_id, asyncio.Lock())
 
     async def _sweep(self):
@@ -524,6 +525,8 @@ def install_twilio(app, settings):
     app.state.twilio_lane = lane
     install_capture(app,lane)
     if lane:
+        if app.state.capacity.max_live_calls < MAX_CONCURRENT_CALLS:
+            raise ValueError("Twilio requires application capacity for four live calls.")
         if app.state.telephony_ingress.config is None:
             raise ValueError("Twilio requires dedicated authenticated phone admission.")
         lane.ingress.admission_guard = lane.admission_guard
@@ -743,6 +746,9 @@ def install_twilio(app, settings):
         if lane is None:
             return {"enabled": False}
         return {"enabled": True, "prototype": True, "started": lane.started,
+                "max_concurrent_calls": MAX_CONCURRENT_CALLS, "prototype_call_limit": MAX_PROTOTYPE_CALLS,
+                "application_call_capacity": app.state.capacity.max_live_calls,
+                "listening_classifier_capacity": lane.coordinator.policy.connection_capacity,
                 "observed_proof_paths": lane.observed_proof_paths,
                 "sip_header_path_configured": bool(config.sip_headers_path),
                 "clip_sha256": lane.wav_sha, "listening_enabled": config.listening,
