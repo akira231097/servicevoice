@@ -99,13 +99,13 @@ def test_later_long_vehicle_details_are_neutral_with_a_pending_proposal():
         await c.close()
     asyncio.run(run())
 
-@pytest.mark.parametrize('case',['hold','fast_answer','caller_speaking','other_assistant'])
+@pytest.mark.parametrize('case',['hold','cancelled_hold','fast_answer','caller_speaking','other_assistant'])
 def test_neutral_tier_in_real_gateway_preserves_speaker_and_assistant_boundaries(tmp_path,monkeypatch,case):
     from test_backchannel_gateway import enable,observed_post,DONE
     from test_gemini_gateway import setup as gateway_setup,request_body,frame
     from test_pretool_speech_gate import speech
     async def run():
-        release=asyncio.Event();cue=asyncio.Event();marked=[]
+        release=asyncio.Event();cue=asyncio.Event();marked=[];tracked=[]
         class Stream(httpx.AsyncByteStream):
             async def __aiter__(self):
                 await release.wait()
@@ -117,6 +117,7 @@ def test_neutral_tier_in_real_gateway_preserves_speaker_and_assistant_boundaries
         gateway.waiting_cue_assistant='different-assistant' if case=='other_assistant' else 'our-assistant'
         gateway.waiting_cue_state=lambda *args:('ticket','caller_speaking' if case=='caller_speaking' else 'eligible')
         gateway.waiting_cue_commit=lambda *args:True
+        gateway.waiting_cue_track=lambda *args,**kwargs:tracked.append((args,kwargs))
         gateway.waiting_content_finished=lambda *args:marked.append(args)
         monkeypatch.setattr(gateway,'_backchannel_context',lambda *args:{**SAFE,'stage':'confirmation','active_confirmation':True,'has_pending_proposal':True,'has_pending_operation':True})
         client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r:httpx.Response(200,json=answer())))
@@ -125,8 +126,17 @@ def test_neutral_tier_in_real_gateway_preserves_speaker_and_assistant_boundaries
         if case=='fast_answer':release.set()
         task=asyncio.create_task(observed_post(app,body,lambda b:cue.set() if b'<flush />' in b else None))
         try:
-            if case=='hold':await asyncio.wait_for(cue.wait(),3)
+            if case in {'hold','cancelled_hold'}:await asyncio.wait_for(cue.wait(),3)
             else:await asyncio.sleep(2.5)
+            if case=='cancelled_hold':
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
+                async with asyncio.timeout(3):
+                    while gateway.active or gateway.owners:await asyncio.sleep(.001)
+                assert len(tracked)==2 and tracked[0][0]==tracked[1][0]
+                assert tracked[0][1]=={} and tracked[1][1]=={'abandoned':True}
+                assert gateway.backchannel_budget.calls['call-a'][0]==1
+                assert 'refunded' not in gateway.latency_snapshot('call-a')[-1]['backchannel']
+                return
             release.set();result=await asyncio.wait_for(task,3)
             assert result.status_code==200
             if case=='hold':

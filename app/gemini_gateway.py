@@ -807,6 +807,7 @@ class GeminiGateway:
         self.before_answer = None
         self.waiting_fallback_ready = None
         self.waiting_content_finished = None
+        self.waiting_cue_track = None
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -1586,6 +1587,8 @@ class GeminiGateway:
                             timing.waiting_cue_committed = scoped_waiting and self.waiting_cue_commit is not None
                             record["follow_up"]=follow_up
                             timing.backchannel_budget_stamp=self.backchannel_budget.receipt(call_id)
+                            if timing.waiting_cue_committed and self.waiting_cue_track is not None:
+                                self.waiting_cue_track(call_id,sid,timing.backchannel_budget_stamp)
                             timing.before_finish=lambda:self._backchannel_refund(call_id,timing)
                     else:allowed=False; record["reason"]="primary_ready"
                     if state is not None and current==selection_context and not primary.done() and allowed:
@@ -1657,16 +1660,18 @@ class GeminiGateway:
         """
         record=timing.row.get("backchannel");stamp=timing.backchannel_budget_stamp
         if not isinstance(record,dict) or stamp is None or record.get("emitted_ms") is None or record.get("refunded"):return
-        # Cancellation never proves that emitted audio was unheard. The phone
-        # lane uses a logical caller-turn ledger that survives cue interruptions
-        # and ASR/Vapi history splitting. Never reopen that turn on a refund.
-        if getattr(timing, "waiting_cue_committed", False):
-            return
         milestones=timing.row["milestones_ms"]
         if milestones.get("first_text") is not None or milestones.get("tool_emitted") is not None:return
         if self._obsolete(timing):cause="generation_superseded_before_answer"
         elif timing.outcome in ("cancelled","interrupted"):cause="generation_cancelled_before_answer"
         else:return
+        # Do not refund the phone lane immediately. It reconciles only after
+        # the caller resumed and stopped, a lateness grace elapsed, and no
+        # assistant speech/transcript was observed since this reservation.
+        if getattr(timing, "waiting_cue_committed", False):
+            if self.waiting_cue_track is not None:
+                self.waiting_cue_track(call_id,timing.correlation,stamp,abandoned=True)
+            return
         timing.backchannel_budget_stamp=None
         refunded,_=self.backchannel_budget.refund(call_id,stamp)
         if not refunded:return

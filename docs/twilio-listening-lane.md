@@ -40,6 +40,16 @@ take the waiting cue's place; resumed speech invalidates that match. Fetch refus
 still return silent HTTP 200. This does not make already-fetched Twilio clips
 instantly cancellable.
 
+An additional live regression showed an inaudible speculative hold consuming the
+logical-turn allowance. A cancelled generation with no released answer/tool can
+now mark its reservation abandoned. Both budgets are reclaimed together only
+after later caller speech and a stop, at least 2.1 seconds of event-lateness grace,
+and no observed assistant speech or transcript since reservation. Heard or
+interrupted cues, unknown/completed generations and stale reservation stamps keep
+their allowance consumed. Reclaiming is not based on HTTP cancellation alone.
+The private-address filter also avoids interpreting mileage followed by ordinary
+driving prose as a street address; real contact/address dictation stays excluded.
+
 An isolated-only delivery instruction targets one idea and about 20 words, with
 complete readbacks, references and option lists taking priority. Automatic reviews
 measure ordinary reply length separately, excluding greetings, approved hold

@@ -311,6 +311,10 @@ class TwilioLane:
         binding = self.bindings.get(call_id)
         if self.closing or binding is None or binding[1] != session_id:
             return None, "speaker_state_unavailable"
+        stamp=self.coordinator.refundable_waiting(call_id,session_id)
+        if stamp is not None:
+            refunded,_=self.app.state.gemini_gateway.backchannel_budget.refund(call_id,stamp)
+            if refunded:self.coordinator.reclaim_waiting(call_id,session_id,stamp)
         return self.coordinator.waiting_status(call_id, session_id, follow_up)
 
     def commit_waiting(self, call_id, session_id, follow_up=False):
@@ -537,6 +541,7 @@ def install_twilio(app, settings):
             app.state.gemini_gateway.before_answer = lane.before_answer
             app.state.gemini_gateway.waiting_fallback_ready = lane.fallback_ready
             app.state.gemini_gateway.waiting_content_finished = lane.coordinator.mark_waiting_finished
+            app.state.gemini_gateway.waiting_cue_track = lane.coordinator.track_waiting
 
     @app.exception_handler(BridgeError)
     async def bridge_error(request, exc):

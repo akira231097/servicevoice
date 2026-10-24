@@ -30,10 +30,13 @@ _CONTROL = re.compile(r"\b(?:i meant|confirm|confirmed|confirmation|approve|appr
     r"(?:don't|do not) (?:book|schedule|proceed|continue|speak)|(?:book|schedule|reserve) (?:it|that|this))\b", re.I)
 _BARE_CONTROL = re.compile(r"^(?:yes|yep|yeah|no|nope|don't|do not)[.! ,]*$", re.I)
 _TAIL_CONTROL = re.compile(r"\b(?:yes|yep|yeah|no|nope)(?:[, .]+please)?[.! ,]*$", re.I)
+# A number followed by ordinary driving prose is not a street address. In
+# particular, do not restart at the comma in '60,000 miles and I mainly drive'.
+_ADDRESS_WORD = r"(?!(?:i|we|you|they)\b)[a-z]+"
 _PRIVATE = re.compile(r"@|(?:\d[\s().+-]*){7,}|\b(?:my name|my address|phone number|mobile number|"
     r"email|e-mail|credit card|debit card|card number|account number|social security|pin|passcode|"
     r"verification code|home address|street address|payment details)\b|"
-    r"\b\d+\s+[a-z]+(?:\s+[a-z]+){0,3}\s+(?:street|road|avenue|lane|drive|boulevard)\b", re.I)
+    rf"(?<![\d,])\b\d+\s+{_ADDRESS_WORD}(?:\s+{_ADDRESS_WORD}){{0,3}}\s+(?:street|road|avenue|lane|drive|boulevard)\b", re.I)
 _QUESTION = re.compile(r"\?|^(?:can|could|would|will|what|when|where|why|how|do|does|is|are)\b", re.I)
 _QUESTION_CONTEXT = re.compile(r"\?|\b(?:what|why|how|would i|will i|can i|do you think|does (?:that|it|the)|is (?:that|it|the))\b", re.I)
 _INFORMATION_TOPIC = re.compile(r"\b(?:car|vehicle|engine|brakes?|tires?|inspection|diagnostic|service|appointment|"
@@ -239,6 +242,8 @@ class ListeningState:
     user_revision: int = 0
     waiting_count: int = 0
     waiting_first: float = -math.inf
+    waiting_reservation: dict | None = None
+    assistant_observations: int = 0
     rotation_start: int = field(default_factory=lambda: secrets.randbelow(len(ROTATION)))
     substantive_since_user: bool = True
     clip_until: float = -math.inf
@@ -311,6 +316,11 @@ class ListeningCoordinator:
         timestamp = provider_time(message)
         age = self.wall()-timestamp if timestamp is not None else math.inf
         role = message.get("role")
+        # Even a delayed assistant event prevents reclaiming a cue. Absence of
+        # an event at HTTP cancellation time is not evidence that it was unheard.
+        if role=="assistant" and ((kind=="speech-update" and message.get("status")=="started")
+                or (kind=="transcript" and isinstance(message.get("transcript"),str) and message["transcript"].strip())):
+            state.assistant_observations+=1
         if kind in {"speech-update", "transcript", "user-interrupted"}:
             if timestamp is None or age < -.1 or age > 2:
                 # A stale partial cannot erase a newer observed speaker state.
@@ -349,6 +359,7 @@ class ListeningCoordinator:
                         state.completed = ""
                         state.waiting_count = 0
                         state.waiting_first = -math.inf
+                        state.waiting_reservation = None
                         state.substantive_since_user = False
                     state.text, state.partial_event = "", -math.inf
                     state.segment = ""
@@ -457,9 +468,46 @@ class ListeningCoordinator:
         if reason != "eligible":
             return False
         state = self.calls[call_id]
+        state.waiting_reservation={"count":state.waiting_count,"first":state.waiting_first,
+            "at":self.clock(),"revision":state.user_revision,"speech":state.assistant_observations,
+            "stamp":None,"abandoned":False}
         if not state.waiting_count:
             state.waiting_first = self.clock()
         state.waiting_count += 1
+        return True
+
+    def track_waiting(self, call_id, session_id, stamp, *, abandoned=False):
+        state=self.calls.get(call_id)
+        if state is None or state.closed or state.session_id!=session_id or state.waiting_reservation is None:return False
+        item=state.waiting_reservation
+        if abandoned:
+            if item['stamp']!=stamp:return False
+            item['abandoned']=True
+        else:
+            if item['stamp'] is not None:return False
+            item['stamp']=stamp
+        return True
+
+    def refundable_waiting(self, call_id, session_id):
+        state=self.calls.get(call_id)
+        if state is None or state.closed or state.session_id!=session_id or state.caller or state.assistant:return None
+        item=state.waiting_reservation
+        # Require a cancelled uncompleted generation, subsequent caller speech
+        # and stop, and a full event-lateness grace interval. Any observed
+        # assistant audio/transcript permanently retains this reservation.
+        if (not item or not item['abandoned'] or item['stamp'] is None
+                or state.user_revision<=item['revision'] or self.clock()-item['at']<2.1
+                or state.assistant_observations!=item['speech']
+                or state.waiting_count!=item['count']+1 or not math.isfinite(state.waiting_stopped)):
+            return None
+        return item['stamp']
+
+    def reclaim_waiting(self, call_id, session_id, stamp):
+        if stamp is None or self.refundable_waiting(call_id,session_id)!=stamp:return False
+        state=self.calls[call_id];item=state.waiting_reservation
+        state.waiting_count,state.waiting_first=item['count'],item['first']
+        state.waiting_reservation=None
+        self.record(call_id,'waiting_reclaimed','cancelled_without_observed_speech')
         return True
 
     def fallback_ready(self, call_id, session_id, text):
