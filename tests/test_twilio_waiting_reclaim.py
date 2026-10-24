@@ -57,7 +57,7 @@ def test_only_the_same_abandoned_reservation_can_restore_both_budgets(lane_app):
         assert lane.commit_waiting('fixture-call','session')
         assert c.track_waiting('fixture-call','session',stamp,abandoned=False)
         clock.now+=.1;event('speech-update','user',status='started');clock.now+=3
-        event('speech-update','user',status='stopped');clock.now+=.8
+        event('speech-update','user',status='stopped');clock.now+=1.1
         assert lane.waiting_status('fixture-call','session')[1]=='turn_already_acknowledged'
         assert c.track_waiting('fixture-call','session',stamp,abandoned=True)
         assert lane.waiting_status('fixture-call','session')[1]=='eligible'

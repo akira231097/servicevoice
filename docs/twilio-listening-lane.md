@@ -49,6 +49,13 @@ interrupted cues, unknown/completed generations and stale reservation stamps kee
 their allowance consumed. Reclaiming is not based on HTTP cancellation alone.
 The private-address filter also avoids interpreting mileage followed by ordinary
 driving prose as a street address; real contact/address dictation stays excluded.
+The repeat still exposed an approximately 0.8-second clause pause: Vapi briefly
+reported assistant speech before cancelling it, so the conservative ledger
+correctly refused a refund. Long explanations (at least eight seconds) now use
+a one-second quiet window, versus .75 seconds for short replies. This adds up
+to .25 seconds to a long turn's hold in exchange for avoiding that observed
+clause-pause race. Longer ambiguous pauses remain possible; this is not prosodic
+endpointing or proof of pause-free conversation.
 
 An isolated-only delivery instruction targets one idea and about 20 words, with
 complete readbacks, references and option lists taking priority. Automatic reviews
