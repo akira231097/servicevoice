@@ -16,8 +16,8 @@ The user confirmed Vapi's shared account allowance is four, so the main and test
 lines cannot assume four slots each at the provider. Startup refuses an application
 call cap below four. The local readiness endpoint reports the relevant ceilings.
 
-The independent lifetime prototype quota is now **60 calls**, raised from 50 so
-the remaining three admissions would not prevent four callers from connecting.
+The independent lifetime prototype quota is now **100 calls**, raised from 60 at
+the user's request to allow more testing. This total does not reset daily.
 Admission history is retained; no counters are reset. These are configured and
 offline-tested limits, not a four-caller live audio performance claim.
 

@@ -5,4 +5,4 @@ The finite lifetime prototype quota remains separate from concurrent capacity.
 """
 
 MAX_CONCURRENT_CALLS = 4
-MAX_PROTOTYPE_CALLS = 60
+MAX_PROTOTYPE_CALLS = 100

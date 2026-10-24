@@ -54,7 +54,7 @@ def test_four_authenticated_calls_keep_distinct_sessions_and_fifth_is_refused(la
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=lane_app),base_url='http://127.0.0.1') as client:
             readiness=(await client.get('/api/twilio/readiness')).json()
             assert readiness['max_concurrent_calls']==readiness['application_call_capacity']==readiness['listening_classifier_capacity']==4
-            assert readiness['prototype_call_limit']==60
+            assert readiness['prototype_call_limit']==100
         await lane.close()
     asyncio.run(run())
 
@@ -105,7 +105,7 @@ def test_interrupting_one_listener_does_not_cancel_other_three():
 
 def test_lifetime_quota_is_separate_bounded_and_durable(tmp_path):
     now=[1000];store=BridgeStore(tmp_path/'bridge.sqlite3',clock=lambda:now[0])
-    for index in range(60):
+    for index in range(100):
         now[0]+=61;row=store.allocate('CA'+f'{index:032x}');store.end(row['id'],verified=True)
     assert store.active()==[]
     with pytest.raises(BridgeError,match='bridge_test_budget'):
