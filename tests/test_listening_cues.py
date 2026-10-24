@@ -116,19 +116,22 @@ async def drain(coordinator):
 
 
 def test_waiting_cues_require_observed_quiet_and_invalidate_on_resumed_speech():
-    c, clock, _, _, _, event, _ = setup()
-    ticket, reason = c.waiting_status("fixture-call", "session")
-    assert reason == "caller_speaking"
-    event("transcript", "user", transcriptType="final", transcript=TEXT)
-    assert c.waiting_status("fixture-call", "session")[1] == "caller_speaking"
-    event("speech-update", "user", status="stopped")
-    clock.now += .74
-    assert c.waiting_status("fixture-call", "session") == (ticket, "caller_pause_too_short")
-    clock.now += .02
-    assert c.waiting_status("fixture-call", "session") == (ticket, "eligible")
-    event("speech-update", "user", status="started")
-    changed, reason = c.waiting_status("fixture-call", "session")
-    assert changed != ticket and reason == "caller_speaking"
+    async def run():
+        c, clock, _, _, _, event, _ = setup()
+        ticket, reason = c.waiting_status("fixture-call", "session")
+        assert reason == "caller_speaking"
+        event("transcript", "user", transcriptType="final", transcript=TEXT)
+        assert c.waiting_status("fixture-call", "session")[1] == "caller_speaking"
+        event("speech-update", "user", status="stopped")
+        clock.now += .74
+        assert c.waiting_status("fixture-call", "session") == (ticket, "caller_pause_too_short")
+        clock.now += .02
+        assert c.waiting_status("fixture-call", "session") == (ticket, "eligible")
+        event("speech-update", "user", status="started")
+        changed, reason = c.waiting_status("fixture-call", "session")
+        assert changed != ticket and reason == "caller_speaking"
+        await c.close()
+    asyncio.run(run())
 
 
 def test_waiting_cues_fail_closed_on_missing_state_and_stale_boundary():
@@ -141,21 +144,24 @@ def test_waiting_cues_fail_closed_on_missing_state_and_stale_boundary():
 
 
 def test_waiting_quiet_window_uses_receipt_and_recent_partial_and_keeps_tool_followup():
-    c, clock, _, _, _, event, _ = setup()
-    event("speech-update", "user", status="stopped", timestamp=(clock.wall()-1)*1000)
-    assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
-    clock.now += .6
-    event("transcript", "user", transcriptType="partial", transcript=TEXT)
-    clock.now += .3
-    assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
-    clock.now += .5
-    assert c.waiting_status("fixture-call", "session")[1] == "eligible"
-    event("speech-update", "assistant", status="started")
-    assert c.waiting_status("fixture-call", "session")[1] == "assistant_speaking"
-    clock.now += .2
-    event("speech-update", "assistant", status="stopped")
-    event("tool-calls")
-    assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+    async def run():
+        c, clock, _, _, _, event, _ = setup()
+        event("speech-update", "user", status="stopped", timestamp=(clock.wall()-1)*1000)
+        assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
+        clock.now += .6
+        event("transcript", "user", transcriptType="partial", transcript=TEXT)
+        clock.now += .3
+        assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
+        clock.now += .5
+        assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+        event("speech-update", "assistant", status="started")
+        assert c.waiting_status("fixture-call", "session")[1] == "assistant_speaking"
+        clock.now += .2
+        event("speech-update", "assistant", status="stopped")
+        event("tool-calls")
+        assert c.waiting_status("fixture-call", "session")[1] == "eligible"
+        await c.close()
+    asyncio.run(run())
 
 
 def test_waiting_cue_cannot_overlap_recent_listening_clip():
@@ -175,7 +181,7 @@ def test_listening_and_waiting_phrase_sets_are_disjoint():
     assert set(LISTENING_PHRASES.values()) == {"Mm-hmm.", "I hear you."}
 
 
-@pytest.mark.parametrize("gap,assistant,expected",[(1.2,False,True),(1.6,False,False),(.5,True,False)])
+@pytest.mark.parametrize("gap,assistant,expected",[(1.2,False,True),(1.6,False,True),(.5,True,False)])
 def test_brief_caller_pause_preserves_explanation_but_not_a_new_turn(gap,assistant,expected):
     async def run():
         c,clock,p,sent,_,event,_=setup()
@@ -196,17 +202,17 @@ def test_brief_caller_pause_preserves_explanation_but_not_a_new_turn(gap,assista
     asyncio.run(run())
 
 
-def test_brief_pause_does_not_replenish_three_cue_utterance_budget():
+def test_brief_pause_does_not_replenish_bounded_utterance_budget():
     async def run():
         c,clock,p,sent,_,event,_=setup()
-        for i in range(4):
+        for i in range(13):
             event("transcript","user",transcriptType="partial",transcript=TEXT+" again"*i)
             await drain(c)
             clock.now+=6.8
             event("speech-update","user",status="stopped")
             clock.now+=.5
             event("speech-update","user",status="started")
-        assert len(sent)==3
+        assert len(sent)==12
         await c.close()
     asyncio.run(run())
 
@@ -360,31 +366,33 @@ def test_partial_fragments_keep_context_without_speaking_on_final_or_stale_event
         event("speech-update","assistant",status="started")
         clock.now+=.1
         event("transcript","user",transcriptType="final",transcript="old caller content")
-        assert c.calls["fixture-call"].completed==""
+        # Speech-start alone may be a waiting cue. It must not erase the
+        # explanation; the stale final still must not append any new words.
+        assert c.calls["fixture-call"].completed=="My car has a rattling noise."
         await c.close()
     asyncio.run(run())
 
 
-def test_private_final_cannot_be_forgotten_by_the_next_short_fragment():
+def test_private_final_can_release_only_after_clear_new_vehicle_clause():
     async def run():
         c,clock,p,sent,events,event,_=setup()
         event("transcript","user",transcriptType="final",transcript="My phone number is five one two.")
         clock.now+=.2
         event("transcript","user",transcriptType="partial",transcript=TEXT)
         await drain(c)
-        assert not sent
-        assert events[-1][-1]=="context_changed"
+        assert sent
+        assert events[-1][-1]=="accepted_unverified"
         await c.close()
     asyncio.run(run())
 
 
-def test_earlier_opportunity_still_obeys_cooldown_and_three_cue_limit():
+def test_earlier_opportunity_still_obeys_five_second_cooldown():
     async def run():
         c,clock,p,sent,_,event,_=setup()
         for tick in (3.1,4.7,8.2,9.8,13.3,18.4):
             clock.now=tick
             event("transcript","user",transcriptType="partial",transcript=TEXT+" words"*int(tick))
             await drain(c)
-        assert len(sent)==3
+        assert len(sent)==4
         await c.close()
     asyncio.run(run())

@@ -138,6 +138,9 @@ def test_unknown_create_result_closes_owned_conference_without_redial(lane_app):
         row = lane.store.allocate("CA"+"1"*32)
         lane.store.claim_dial(row["id"], "CF"+"2"*32, row["caller_sid"])
         await lane.dial(row["id"])
+        # The apology owns the caller until its TwiML completes. This fake
+        # reports it completed on the next cleanup pass.
+        await lane.finish(row["id"])
         assert "/Conferences/CF"+"2"*32+".json" in provider.ends
         assert provider.adds == 1 and lane.store.get(row["id"])["state"] == "ended"
         await lane.close()
@@ -289,17 +292,30 @@ def test_telephone_clip_wraps_exact_warmed_pcm_without_synthesis(lane_app, tmp_p
 
 def test_listening_clip_selection_is_signed_closed_set_and_requires_joined_caller(lane_app):
     async def run():
+        import io
+        import wave
         lane=lane_app.state.twilio_lane;lane.client=Provider()
         row=lane.store.allocate("CA"+"1"*32)
         lane.store.claim_dial(row["id"],"CF"+"2"*32,row["caller_sid"])
-        with lane.store.db() as db:db.execute("UPDATE twilio_bridges SET state='joined' WHERE id=?",(row["id"],))
-        lane.wav=b"neutral";lane.wav_sha="a"*64
-        lane.clips={"neutral_ack":(lane.wav,lane.wav_sha),"acknowledge":(b"attention","b"*64)}
+        with lane.store.db() as db:db.execute("UPDATE twilio_bridges SET state='joined',provider_call_id='fixture' WHERE id=?",(row["id"],))
+        stream=io.BytesIO()
+        with wave.open(stream,"wb") as audio:
+            audio.setnchannels(1);audio.setsampwidth(2);audio.setframerate(8000);audio.writeframes(b'\0'*8000)
+        lane.wav=stream.getvalue();lane.wav_sha="a"*64
+        lane.clips={"neutral_ack":(lane.wav,lane.wav_sha),"acknowledge":(lane.wav,"b"*64)}
+        lane.coordinator.register("fixture","session")
+        state=lane.coordinator.calls["fixture"]
+        state.caller=True;state.assistant=False;state.received=lane.coordinator.clock()
+        lane.announcements["ticket"]={"call_id":"fixture","bridge_id":row["id"],"epoch":state.epoch,
+            "expires":lane.coordinator.clock()+.75,"phrase_id":"acknowledge"}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_public_app(lane_app)),base_url="https://test") as client:
-            suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&cue=acknowledge"
+            suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&cue=acknowledge&ticket=ticket"
             headers={"x-twilio-signature":signature(lane.config.auth_token,lane.config.url(suffix),[])}
             response=await client.get("/twilio/"+suffix,headers=headers)
-            assert response.status_code==200 and response.content==b"attention"
+            assert response.status_code==200 and response.content==lane.wav
+            assert response.headers["cache-control"]=="no-store"
+            assert state.clip_until>lane.coordinator.clock()+.5
+            assert (await client.get("/twilio/"+suffix,headers=headers)).status_code==410
             assert (await client.get("/twilio/"+suffix.replace("cue=acknowledge","cue=neutral_ack"),headers=headers)).status_code==401
             for query in ("cue=booked","cue=acknowledge&cue=neutral_ack"):
                 suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&"+query

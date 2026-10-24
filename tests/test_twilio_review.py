@@ -57,3 +57,17 @@ def test_listening_diagnostics_and_metrics_never_claim_audio_pass():
     assert feedback["listening_cues_safe"]["score"] is None
     assert safe_attributes({"listening_reason":"approved", "transcript":"private caller words", "credential":"private"}) == {"listening_reason":"approved"}
     assert listening_summary({"events": rows}, "b"*64) is None
+
+
+def test_review_retains_real_phrase_and_media_health_measurements():
+    key="a"*64;start=1_700_000_000
+    def event(component,name,second,**attrs):
+        return {"component":component,"event":name,"call_key":key,"start_unix":start+second,"attributes":attrs}
+    rows=[event("twilio_bridge","speaker_started",0,listening_reason="caller"),
+        event("twilio_bridge","speaker_stopped",10,listening_reason="caller"),
+        event("listening_cue","clip_fetched",4,backchannel_phrase="uh_huh_1"),
+        event("twilio_bridge","media_suspected",12,listening_reason="caller_energy_without_words")]
+    result=listening_summary({"events":rows},key)
+    assert result["timeline"][0]["phrase"]=="Uh-huh."
+    assert result["caller_energy_seconds"]==10 and result["clip_fetches_per_10s_caller_energy"]==1
+    assert result["silent_opening_detections"]==1 and result["audible_playback"]=="unverified"

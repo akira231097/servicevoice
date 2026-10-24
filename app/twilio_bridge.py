@@ -6,10 +6,12 @@ never retried: an ambiguous response is reconciled by ending the owned room.
 from __future__ import annotations
 
 import base64
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import hmac
+from email.utils import parsedate_to_datetime
 import re
 import secrets
 import sqlite3
@@ -19,11 +21,13 @@ from uuid import UUID
 import xml.etree.ElementTree as ET
 
 import httpx
+from .listening_audio import VARIATIONS
 
 
 class BridgeError(Exception):
-    def __init__(self, code, status=409):
+    def __init__(self, code, status=409, *, definitive=False):
         self.code, self.status = code, status
+        self.definitive = definitive
         super().__init__(code)
 
 
@@ -122,7 +126,7 @@ def conference_twiml(config, bridge_id):
         startConferenceOnEnter="true", endConferenceOnExit="true", maxParticipants="2",
         jitterBufferSize=config.jitter, participantLabel="caller",
         statusCallback=config.url("conference-status"), statusCallbackMethod="POST",
-        statusCallbackEvent="start end join leave announcement")
+        statusCallbackEvent="start end join leave speaker announcement")
     node.text = "sv-" + bridge_id
     ET.SubElement(response, "Hangup")
     return xml_response(response)
@@ -163,6 +167,14 @@ silently retired while provider legs might still be billable.
                 dial_pending INTEGER NOT NULL DEFAULT 0)""")
             if "dial_pending" not in {row[1] for row in db.execute("PRAGMA table_info(twilio_bridges)")}:
                 db.execute("ALTER TABLE twilio_bridges ADD COLUMN dial_pending INTEGER NOT NULL DEFAULT 0")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(twilio_bridges)")}
+            for name, declaration in (("apology_until", "REAL NOT NULL DEFAULT 0"),
+                    ("recovery_count", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE twilio_bridges ADD COLUMN {name} {declaration}")
+            db.execute("""CREATE TABLE IF NOT EXISTS twilio_retired_legs (
+                bridge_id TEXT NOT NULL, call_sid TEXT PRIMARY KEY,
+                provider_call_id TEXT, session_id TEXT, retired REAL NOT NULL)""")
 
     @contextmanager
     def db(self):
@@ -182,6 +194,44 @@ silently retired while provider legs might still be billable.
     def active(self):
         with self.db() as db:
             return [dict(row) for row in db.execute("SELECT * FROM twilio_bridges WHERE cleanup_verified=0")]
+
+    def resolve_dial(self, bridge_id):
+        """Only a definitive rejection or provider reconciliation calls this."""
+        with self.db() as db:
+            db.execute("UPDATE twilio_bridges SET dial_pending=0 WHERE id=?", (bridge_id,))
+
+    def apology(self, bridge_id, until):
+        with self.db() as db:
+            db.execute("UPDATE twilio_bridges SET apology_until=? WHERE id=?", (until, bridge_id))
+
+    def claim_recovery(self, bridge_id):
+        with self.db() as db:
+            return bool(db.execute("""UPDATE twilio_bridges SET recovery_count=1,state='recovering'
+                WHERE id=? AND state='joined' AND recovery_count=0 AND dial_pending=0
+                AND vapi_leg_sid IS NOT NULL AND session_id IS NOT NULL""", (bridge_id,)).rowcount)
+
+    def retired_leg(self, bridge_id, call_sid):
+        with self.db() as db:
+            return bool(db.execute("SELECT 1 FROM twilio_retired_legs WHERE bridge_id=? AND call_sid=?",
+                (bridge_id, call_sid)).fetchone())
+
+    def abort_recovery(self, bridge_id):
+        with self.db() as db:
+            db.execute("UPDATE twilio_bridges SET state='joined' WHERE id=? AND state='recovering'", (bridge_id,))
+
+    def reset_recovered_leg(self, bridge_id):
+        # Caller may invoke only after old provider leg and local session are
+        # independently verified ended. Persist old identity against callbacks.
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM twilio_bridges WHERE id=?", (bridge_id,)).fetchone()
+            if not row or row["state"] != "recovering" or row["recovery_count"] != 1:
+                raise BridgeError("recovery_state_conflict")
+            db.execute("INSERT INTO twilio_retired_legs VALUES (?,?,?,?,?)", (bridge_id, row["vapi_leg_sid"],
+                row["provider_call_id"], row["session_id"], self.clock()))
+            db.execute("""UPDATE twilio_bridges SET state='dialing',dial_pending=1,vapi_leg_sid=NULL,
+                provider_call_id=NULL,session_id=NULL,proof_hash=NULL,proof_expiry=? WHERE id=?""",
+                (max(int(self.clock())+60, row["proof_expiry"]+1), bridge_id))
 
     def allocate(self, caller_sid):
         if not sid(caller_sid, "CA"):
@@ -261,7 +311,7 @@ silently retired while provider legs might still be billable.
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM twilio_bridges WHERE id=?", (bridge_id,)).fetchone()
-            if not row or row["state"] == "ended" or not hmac.compare_digest(self.proof(config, row).encode(), supplied.encode()):
+            if not row or row["state"] in {"ended", "recovering"} or not hmac.compare_digest(self.proof(config, row).encode(), supplied.encode()):
                 raise BridgeError("invalid_bridge_proof", 403)
             if row["provider_call_id"] not in (None, call_id):
                 raise BridgeError("replayed_bridge_proof", 403)
@@ -311,17 +361,18 @@ class TwilioClient:
         if self.owns_client:
             await self.client.aclose()
 
-    async def request(self, method, path, data=None):
+    async def request(self, method, path, data=None, *, max_bytes=65536):
         try:
             async with self.client.stream(method, self.base + path, data=data,
                     auth=(self.config.api_key_sid, self.config.api_key_secret), follow_redirects=False) as response:
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
                     body.extend(chunk)
-                    if len(body) > 65536:
+                    if len(body) > max_bytes:
                         raise BridgeError("twilio_response_bounds", 502)
                 if response.status_code not in (200, 201):
-                    raise BridgeError("twilio_request_failed", 502)
+                    raise BridgeError("twilio_request_failed", response.status_code,
+                        definitive=response.status_code in {400, 401, 403, 404, 405, 409, 422, 429})
             import json
             result = json.loads(body)
             if not isinstance(result, dict):
@@ -335,14 +386,77 @@ class TwilioClient:
             "From": self.config.phone_number, "To": target, "Label": "vapi", "Beep": "false",
             "EarlyMedia": "false", "EndConferenceOnExit": "true", "JitterBufferSize": self.config.jitter,
             "Timeout": "15", "TimeLimit": "600", "StatusCallbackMethod": "POST",
-            "StatusCallback": self.config.url("participant-status") + "?bridge=" + row["id"],
+            "StatusCallback": self.config.url("participant-status") + "?" + urlencode({"bridge": row["id"], "epoch": row.get("proof_expiry", 0)}),
             "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"]})
 
-    async def announce(self, row, phrase_id="neutral_ack"):
-        if phrase_id not in {"neutral_ack", "acknowledge"}:
+    async def announce(self, row, phrase_id="neutral_ack", *, ticket=None):
+        if phrase_id not in {"neutral_ack", "acknowledge", *VARIATIONS}:
             raise BridgeError("cue_not_approved")
+        try:
+            async with asyncio.timeout(.4):
+                return await self.request("POST", f"/Conferences/{row['conference_sid']}/Participants/{row['caller_sid']}.json",
+                    {"AnnounceUrl": self.config.url("clip/neutral_ack.wav") + "?" + urlencode({
+                        "bridge": row["id"], "cue": phrase_id, **({"ticket": ticket} if ticket else {})}),
+                     "AnnounceMethod": "GET"})
+        except TimeoutError:
+            # Timeout is ambiguous: it does not cancel audio already accepted.
+            raise BridgeError("announcement_outcome_unknown", 504) from None
+
+    async def pending_leg(self, row):
+        """Look up the participant by its label inside this owned conference."""
+        try:
+            value = await self.request("GET", f"/Conferences/{row['conference_sid']}/Participants/vapi.json")
+        except BridgeError as exc:
+            if exc.status == 404 and exc.definitive:
+                return None
+            raise
+        call = value.get("call_sid")
+        if not sid(call, "CA") or value.get("conference_sid") != row["conference_sid"]:
+            raise BridgeError("participant_reconciliation_invalid", 502)
+        return call
+
+    async def detach_agent(self, row):
+        path = f"/Conferences/{row['conference_sid']}/Participants/{row['vapi_leg_sid']}.json"
+        await self.request("POST", path, {"EndConferenceOnExit": "false"})
+        value = await self.request("GET", path)
+        if value.get("end_conference_on_exit") is not False:
+            raise BridgeError("recovery_detach_unverified", 502)
+        await self.end_call(row["vapi_leg_sid"])
+        value = await self.request("GET", f"/Calls/{row['vapi_leg_sid']}.json")
+        if value.get("status") not in {"completed", "failed", "busy", "no-answer", "canceled"}:
+            raise BridgeError("recovery_leg_unverified", 502)
+
+    async def recovery_announcement(self, row, ticket):
         return await self.request("POST", f"/Conferences/{row['conference_sid']}/Participants/{row['caller_sid']}.json",
-            {"AnnounceUrl": self.config.url("clip/neutral_ack.wav") + "?bridge=" + row["id"] + "&cue=" + phrase_id, "AnnounceMethod": "GET"})
+            {"AnnounceUrl": self.config.url("clip/neutral_ack.wav") + "?" + urlencode({
+                "bridge": row["id"], "recovery": "1", "ticket": ticket}), "AnnounceMethod": "GET"})
+
+    async def dial_quiescent(self, row):
+        """Conservative fallback after the room ended and its label disappeared.
+
+        Never terminate an unbound call from a broad list. Any possibly-related
+        live call or incomplete page keeps reconciliation pending for the sweeper.
+        The dedicated SIP target, owned From and bounded time window establish
+        the search scope; an empty/terminal result is useful only after the room
+        has independently been confirmed ended and no local create is in flight.
+        """
+        query = urlencode({"To": self.config.sip_uri, "From": self.config.phone_number, "PageSize": 100})
+        value = await self.request("GET", "/Calls.json?"+query, max_bytes=1024*1024)
+        calls = value.get("calls")
+        if not isinstance(calls, list) or value.get("next_page_uri"):
+            return False
+        for call in calls:
+            if (not isinstance(call, dict) or call.get("account_sid") != self.config.account_sid
+                    or call.get("to") != self.config.sip_uri or call.get("from") != self.config.phone_number):
+                return False
+            try:
+                created = parsedate_to_datetime(call["date_created"]).timestamp()
+            except (ValueError, TypeError, KeyError):
+                return False
+            if row["created"]-2 <= created <= row["proof_expiry"]+30:
+                if call.get("status") not in {"completed", "failed", "busy", "no-answer", "canceled"}:
+                    return False
+        return True
 
     async def end_conference(self, conference_sid):
         return await self.request("POST", f"/Conferences/{conference_sid}.json", {"Status": "completed"})

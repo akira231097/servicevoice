@@ -574,13 +574,15 @@ def create_app(db_path=None):
         lane=app.state.twilio_lane
         early_body=None
         if lane is not None:
-            if lane.closing:
-                raise HTTPException(503,"Isolated lane is closing.")
             try:
                 early_body=await asyncio.wait_for(read_webhook_json(request),timeout=2)
             except TimeoutError:
                 raise HTTPException(408,"Webhook body deadline exceeded.") from None
             early_message=early_body.get("message") if isinstance(early_body,dict) else None
+            if hasattr(ingress, "authenticate_message"):
+                ingress.authenticate_message(early_message, authorization)
+            if lane.closing and lane.owns_message(early_message):
+                raise HTTPException(503,"Isolated lane is closing.")
             if isinstance(early_message,dict) and lane.fast_event(early_message):
                 return {"ok":True}
         marker=object()

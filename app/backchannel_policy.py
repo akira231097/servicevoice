@@ -75,6 +75,23 @@ class BackchannelDecision:
     content_confidence: float | None = None
 
 
+def guarded_waiting_fallback(decision, state, context):
+    """Content eligibility only; caller-end evidence belongs to the coordinator.
+
+    A valid uncertain *ordinary* classification can earn a neutral hold. Missing
+    models, invalid answers, explicit exclusions, names and pending actions cannot.
+    """
+    return (decision.reason == "classification_uncertain"
+        and decision.probability is not None and decision.probability > .5
+        and decision.language_choice == "cache_compatible"
+        and decision.language_probability is not None and decision.language_probability >= .99
+        and decision.content_kind in {"information_question", "scheduling_request", "ordinary_detail"}
+        and decision.content_probability is not None and decision.content_probability >= .8
+        and isinstance(state, dict) and not state.get("neutral_confirmation") and not state.get("requested_name")
+        and isinstance(context, dict) and all(context.get(key) is False for key in
+            ("active_confirmation", "has_pending_proposal", "has_pending_operation", "ended")))
+
+
 def waiting_state(messages, context=None):
     """Neutral holds may follow ordinary corrections; they never approve them."""
     # This flag is produced only by the gateway's scoped booking-state read.

@@ -55,7 +55,7 @@ _ENUMS = {
         "upstream_unavailable", "superseded", "superseded_after_release", "supersession_wait_expired"}),
     "status": frozenset({"passed", "failed", "pending", "error", "incomplete", "not_run", "completed", "ready"}),
     "mode": frozenset({"model", "contracts", "validate", "smoke", "trace_smoke", "setup"}),
-    "model": frozenset({"gemini-3.8-flash", "gemini-3.5-flash", "jev-gem"}),
+    "model": frozenset({"gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "jev-gem"}),
     "tool_name": TOOLS,
     "error_code": ERROR_CODES,
 }
@@ -568,7 +568,7 @@ def safe_backchannel_timing(cue):
         "content_kind":"backchannel_content_kind", "content_probability":"backchannel_content_probability",
         "content_confidence":"backchannel_content_confidence",
         "refunded":"backchannel_refunded", "refund_reason":"backchannel_refund_reason",
-        "follow_up":"backchannel_follow_up"}
+        "follow_up":"backchannel_follow_up", "guarded_fallback":"backchannel_guarded_fallback"}
     attributes = safe_attributes({target:cue.get(source) for source,target in fields.items()})
     return {**{source:attributes[target] for source,target in fields.items() if target in attributes},
         "evidence_scope":"gateway_yield_not_audible_playback"}
@@ -588,6 +588,10 @@ def safe_timing_row(row):
         return None
     safe = {"request_id": request_id, "call_key": call_key, "started_at_unix": started,
             "route": row["route"], "outcome": row["outcome"]}
+    if row.get("model") in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}:
+        safe["model"] = row["model"]
+    if row.get("reasoning_effort") in {"low", "minimal"}:
+        safe["reasoning_effort"] = row["reasoning_effort"]
     for key in ("narration_reason", "jev_reason", "eof_drain_outcome"):
         safe[key] = safe_timing_decision_code(row.get(key))
     for key in ("system_prompt_sha256", "source_result_sha256", "output_text_sha256"):

@@ -34,8 +34,9 @@ class EvaluationFailure(Exception):
 
 
 class Conversation:
-    def __init__(self, client, store, key, budget):
+    def __init__(self, client, store, key, budget, *, model=MODEL, reasoning_effort="low"):
         self.client, self.store, self.key, self.budget = client, store, key, budget
+        self.model, self.reasoning_effort = model, reasoning_effort
         self.sid = store.create_session("live")["id"]
         self.harness = ToolHarness(store)
         prompt = render_system_prompt()
@@ -63,7 +64,7 @@ class Conversation:
             self.budget[0] -= 1
             started = time.perf_counter()
             response = await self.client.post(URL, headers={"Authorization": "Bearer " + self.key}, json={
-                "model": MODEL, "reasoning_effort": "low", "max_tokens": MAX_OUTPUT_TOKENS,
+                "model": self.model, "reasoning_effort": self.reasoning_effort, "max_tokens": MAX_OUTPUT_TOKENS,
                 "messages": self.messages, "tools": TOOL_SCHEMAS,
             })
             if not response.is_success:
@@ -76,7 +77,7 @@ class Conversation:
                       "model_returned": data.get("model"), "finish_reason": choice.get("finish_reason"),
                       "usage": {k: data.get("usage", {}).get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}}
             self.metrics.append(metric)
-            if data.get("model") != MODEL:
+            if data.get("model") != self.model:
                 raise EvaluationFailure("Returned model did not match exact requested identity.")
             if choice.get("finish_reason") == "length":
                 raise EvaluationFailure("Model response exhausted its output budget.")
@@ -111,9 +112,9 @@ class Conversation:
         raise EvaluationFailure("No proposal was prepared within the clarification limit.")
 
 
-async def run(key, output, max_requests):
+async def run(key, output, max_requests, *, model=MODEL, reasoning_effort="low"):
     budget = [max_requests]
-    report = {"model_requested": MODEL, "reasoning_effort": "low", "prompt_version": SYSTEM_PROMPT_VERSION,
+    report = {"model_requested": model, "reasoning_effort": reasoning_effort, "prompt_version": SYSTEM_PROMPT_VERSION,
               "prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(), "date": today().isoformat(),
               "evidence_kind": "real_gemini_text_and_disposable_local_tools", "cases": [],
               "limitations": ["No audio, Vapi transport, acoustic latency or production DMS is exercised.",
@@ -123,7 +124,7 @@ async def run(key, output, max_requests):
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for scenario in ("book_move_cancel", "correction_then_decline", "human_request"):
                 store = Store(Path(directory) / (scenario + ".sqlite3"))
-                conversation = Conversation(client, store, key, budget)
+                conversation = Conversation(client, store, key, budget, model=model, reasoning_effort=reasoning_effort)
                 case = {"scenario": scenario, "passed": False}
                 case["prompt_context"] = conversation.prompt_metadata
                 report["cases"].append(case)

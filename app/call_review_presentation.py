@@ -379,19 +379,47 @@ def diagnostic_events(diagnostics, call_key):
 
 
 def listening_summary(diagnostics, call_key):
-    rows = [row for row in diagnostic_events(diagnostics, call_key) if row["component"] == "listening_cue"]
-    if not rows:
+    from .listening_audio import VARIATIONS
+    from .backchannel_catalog import PHRASES
+    all_rows = diagnostic_events(diagnostics, call_key)
+    rows = [row for row in all_rows if row["component"] == "listening_cue"]
+    bridge = [row for row in all_rows if row["component"] == "twilio_bridge"]
+    if not rows and not bridge:
         return None
     allowed = {"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"}
     rows = [row for row in rows if row["event"] in allowed]
+    phrases = {**PHRASES, **VARIATIONS}
+    intervals, opened = [], None
+    speaker_rows = sorted((r for r in bridge if r["attributes"].get("listening_reason") == "caller"
+        and r["start_unix"] is not None and r["event"] in {"speaker_started", "speaker_stopped"}), key=lambda r:r["start_unix"])
+    for row in speaker_rows:
+        if row["event"] == "speaker_started" and opened is None: opened = row["start_unix"]
+        elif row["event"] == "speaker_stopped" and opened is not None:
+            if 0 <= row["start_unix"]-opened <= 120: intervals.append((opened, row["start_unix"]))
+            opened = None
+    seconds = sum(stop-start for start, stop in intervals)
+    waiting = [r for r in all_rows if r["component"] == "gateway" and r["event"] == "backchannel.emitted"]
+    by_turn = {}
+    for row in waiting:
+        if row["turn_id"]: by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
+    fetched = sum(row["event"] == "clip_fetched" for row in rows)
     return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
-                         "phrase": "Mm-hmm.", "reason": row["attributes"].get("listening_reason", "unknown")}
+                         "phrase": phrases.get(row["attributes"].get("backchannel_phrase"), "unknown"),
+                         "reason": row["attributes"].get("listening_reason", "unknown")}
                         for row in rows],
             "dispatched": sum(row["event"] == "dispatched" for row in rows),
             "clip_fetches": sum(row["event"] == "clip_fetched" for row in rows),
             "announcement_failures": sum(row["event"] == "announcement_fail" for row in rows),
+            "caller_energy_seconds": round(seconds, 3) if intervals else None,
+            "clip_fetches_per_10s_caller_energy": round(fetched*10/seconds, 3) if seconds > 0 else None,
+            "waiting_dispatches_during_caller_energy": sum(any(start <= row["start_unix"] < stop for start, stop in intervals)
+                for row in waiting if row["start_unix"] is not None) if intervals else None,
+            "duplicate_waiting_dispatches_by_gateway_turn": sum(max(0, count-1) for count in by_turn.values()),
+            "silent_opening_detections": sum(row["event"] == "media_suspected" for row in bridge),
+            "opening_recovery_redials": sum(row["event"] == "media_recovery_redial" for row in bridge),
+            "guarded_waiting_fallbacks": sum(row["attributes"].get("backchannel_guarded_fallback") is True for row in waiting),
             "audible_playback": "unverified",
-            "scope": "Caller-only announcement dispatch and fetch evidence. Captured caller audio is required to verify audibility, overlap and preserved words."}
+            "scope": "Caller-only announcement dispatch/fetch and received Twilio speaker-event evidence. Energy is not recognized speech. Gateway turns can split a caller's thought. Captured caller audio is required to verify audibility, audible overlaps, duplicate phrases and preserved words."}
 
 
 def condense_diagnostics(diagnostics, call_key):
@@ -1117,11 +1145,19 @@ def feedback_rows(run_id, report):
     """Feedback a person can scan: checks score 1/0, flags, coverage, metric_* values."""
     listening = report.get("listening_cues")
     if isinstance(listening, dict):
-        for key, source in (("metric_listening_cues", "dispatched"), ("metric_listening_clip_fetches", "clip_fetches")):
+        for key, source in (("metric_listening_cues", "dispatched"), ("metric_listening_clip_fetches", "clip_fetches"),
+                ("metric_silent_opening_detections", "silent_opening_detections"), ("metric_opening_recovery_redials", "opening_recovery_redials"),
+                ("metric_waiting_dispatch_overlap", "waiting_dispatches_during_caller_energy"),
+                ("metric_duplicate_waiting_dispatches", "duplicate_waiting_dispatches_by_gateway_turn"),
+                ("metric_guarded_waiting_fallbacks", "guarded_waiting_fallbacks")):
             value = listening.get(source)
             if type(value) is int and value >= 0:
                 yield {"key": key, "score": value, "value": value,
                        "comment": "Measurement of provider acceptance or clip fetch, not proof of audible playback."}
+        value = listening.get("clip_fetches_per_10s_caller_energy")
+        if type(value) in (int, float) and 0 <= value < 99999:
+            yield {"key": "metric_listening_cues_per_10s_energy", "score": value, "value": value,
+                "comment": "Clip fetches per 10s of caller energy from received Twilio speaker events; not an acoustic speech or naturalness grade."}
     checks = report.get("checks") or {}
     for key, item in checks.items():
         if not isinstance(item, dict):

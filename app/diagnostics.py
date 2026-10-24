@@ -64,6 +64,7 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
 EVENTS |= frozenset({"decision", "suppressed", "dispatched", "clip_fetched", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
+EVENTS |= frozenset({"background_failure", "dial_failed", "listening_unavailable"})
 _ENUM_ATTRIBUTES = {
     "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),
     "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment","one_sec","just_a_sec","let_me_see","checking","taking_a_look"}),
@@ -104,8 +105,16 @@ _ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverifi
     "private_content", "sensitive_prior_turn", "question", "policy_unavailable", "provider_unavailable",
     "invalid_response", "classifier_silence", "speaker_priority", "speech_too_short", "stale_partial",
     "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity"})
+_ENUM_ATTRIBUTES["model"] |= frozenset({"gemini-3.5-flash-lite"})
+_ENUM_ATTRIBUTES["backchannel_phrase"] |= frozenset({f"{name}_{take}" for name in ("uh_huh", "yeah", "okay", "right") for take in (1, 2)})
+EVENTS |= frozenset({"caller_words_observed", "media_suspected", "media_recovery_started", "media_recovery_aborted",
+    "media_recovery_failed", "media_recovery_redial", "speaker_started", "speaker_stopped"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_energy_without_words", "opening_only", "words_resumed", "caller", "agent"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"fallback_turn_unverified"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
+_FLAGS |= frozenset({"backchannel_guarded_fallback"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
 _HASHES = frozenset({"cache_asset_id","cache_request_sha256","cache_manifest_sha256","input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
 
