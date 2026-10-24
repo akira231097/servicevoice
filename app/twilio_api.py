@@ -19,7 +19,7 @@ from collections import Counter, deque
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate, neutral_listening_only, LISTENING_PHRASES
+from .listening_cues import CueNotSent, ListeningCoordinator, ListeningPolicy, listening_gate, neutral_listening_only, LISTENING_PHRASES
 from .telephony_ingress import IngressError, IngressConfig, TelephonyIngress
 from .phone_ingress_router import PhoneIngressRouter
 from .twilio_media_health import OpeningMedia
@@ -357,7 +357,7 @@ class TwilioLane:
     async def dispatch(self, call_id):
         binding = self.bindings.get(call_id)
         if not binding or self.closing:
-            raise BridgeError("bridge_ended")
+            raise CueNotSent("bridge_ended")
         row = await asyncio.to_thread(self.store.get, binding[0])
         context = await self.context(binding[1], call_id)
         state = self.coordinator.calls.get(call_id)
@@ -365,7 +365,7 @@ class TwilioLane:
                 or not self.coordinator.listening_window(state)
                 or self.coordinator.clock()-state.assistant_stopped < 1.5
                 or listening_gate(state.text, state.previous, context) != "eligible"):
-            raise BridgeError("cue_superseded")
+            raise CueNotSent("cue_superseded")
         # The HTTP deadline is not remote cancellation. A late clip fetch is
         # separately rejected below, and the guard follows its expected end.
         now = self.coordinator.clock()

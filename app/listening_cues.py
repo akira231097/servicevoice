@@ -23,7 +23,7 @@ from .backchannel_catalog import PHRASES
 from .listening_audio import VARIATIONS, ROTATION
 from .jev_classifier import ClassificationUnavailable, JEV_MODEL, JEV_URL, MAX_RESPONSE_BYTES, parse_choice
 
-_CONTROL = re.compile(r"\b(?:confirm|confirmed|confirmation|approve|approved|cancel|bye|goodbye|"
+_CONTROL = re.compile(r"\b(?:i meant|confirm|confirmed|confirmation|approve|approved|cancel|bye|goodbye|"
     r"correction|unless|only if|provided that|hang up|go ahead|"
     r"stop (?:talking|speaking|listening|that|it|please)|wait (?:a|one|just|please)|"
     r"(?:don't|do not) (?:book|schedule|proceed|continue|speak)|(?:book|schedule|reserve) (?:it|that|this))\b", re.I)
@@ -40,6 +40,10 @@ MIN_SPEECH_SECONDS = 3
 MIN_PARTIAL_WORDS = 6
 DECISION_RETRY_SECONDS = 1.5
 WAITING_QUIET_SECONDS = .75
+
+
+class CueNotSent(Exception):
+    """A local dispatch veto before any request crossed the provider boundary."""
 
 
 def neutral_listening_only(state):
@@ -335,6 +339,11 @@ class ListeningCoordinator:
             self._invalidate(state)
             state.user_revision += 1
             state.waiting_stopped = -math.inf
+            # A correction is a fresh explanation for listening classification,
+            # but it must not refill either waiting-cue allowance.
+            state.completed = state.text = state.segment = ""
+            state.caller_started = now
+            state.last_attempt_text = ""
         elif kind == "transcript":
             value = cue_text(message.get("transcript"))
             if not isinstance(value, str) or len(value) > 1600:
@@ -524,6 +533,7 @@ class ListeningCoordinator:
                 return
             # Reserve before crossing the provider boundary. No blind refunds or
             # retries: even a timeout may have played the participant announcement.
+            previous_reservation = (state.count, state.turn_count, state.last_cue)
             state.count += 1
             state.turn_count += 1
             state.last_cue = self.clock()
@@ -547,8 +557,19 @@ class ListeningCoordinator:
                 state.phrase_id = ("acknowledge" if not neutral and state.phrase_id != "acknowledge"
                     and _PROBLEM.search(state.text) else "neutral_ack")
             self.record(call_id, "decision", "approved")
+            reserved_count, reserved_turn, reserved_at = state.count, state.turn_count, state.last_cue
             async def send():
-                await self.dispatch(call_id)
+                try:
+                    await self.dispatch(call_id)
+                except CueNotSent:
+                    # Only the dispatcher's explicit pre-HTTP veto qualifies.
+                    # Cancellation, timeout or a failed REST response never do.
+                    if state.count == reserved_count and state.last_cue == reserved_at:
+                        state.count, _, state.last_cue = previous_reservation
+                        if state.turn_count == reserved_turn:
+                            state.turn_count = previous_reservation[1]
+                    self.record(call_id, "decision", "not_dispatched")
+                    return
                 self.record(call_id, "dispatched", "accepted_unverified")
             task = asyncio.create_task(send())
             self.tasks.add(task)

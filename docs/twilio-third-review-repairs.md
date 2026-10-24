@@ -71,3 +71,18 @@ approved clips and Vapi speaking intervals. The separate LangSmith project remai
 
 Model/prompt speed work is intentionally a separate next step. These repairs do
 not promise pause-free speech or reduce the model's measured generation time.
+
+## Findings from the first repair call
+
+The `e54a978` synthetic call passed transport/audio-attribution checks, but its
+timing review found a neutral cue during “Actually, I meant Wednesday, not
+Tuesday.” An interruption now clears the prior explanation from listening
+classification and restarts its three-second warm-up without refilling either
+waiting-cue allowance. The explicit correction phrase “I meant” is excluded.
+
+One abandoned decision also left a long audible gap. A dispatch veto proven to
+occur **before any provider request** now restores the listening reservation.
+Cancellation, a timeout, or an ambiguous REST response never qualify. This is
+separate from the waiting-cue ledger and cannot re-enable duplicate waiting cues.
+The first capture alone does not prove the outcome of every abandoned REST
+request; new `not_dispatched` diagnostics make proven local vetoes distinguishable.

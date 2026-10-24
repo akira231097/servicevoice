@@ -179,3 +179,57 @@ def test_signed_fetch_rotates_actual_pause_audio_and_reports_expiry(lane_app):
             assert list(lane.clip_outcomes) == [False,False,False,False,True]
         await lane.close()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('local_veto', [True, False])
+def test_only_proven_pre_request_veto_restores_listening_budget(local_veto):
+    from app.listening_cues import CueNotSent
+    from app.twilio_bridge import BridgeError
+    from test_listening_cues import setup, TEXT, drain
+    async def run():
+        c, clock, _, _, events, _, _ = setup()
+        state = c.calls['fixture-call'];state.text = TEXT;state.received = clock.now
+        async def dispatch(*args):
+            raise CueNotSent('local veto') if local_veto else BridgeError('announcement_outcome_unknown')
+        c.dispatch = dispatch
+        await c._decide('fixture-call', state, state.epoch, TEXT)
+        await drain(c)
+        assert state.count == (0 if local_veto else 1)
+        assert state.turn_count == (0 if local_veto else 1)
+        assert (state.last_cue < 0) is local_veto
+        assert any(e[-1]=='not_dispatched' for e in events) is local_veto
+        await c.close()
+    asyncio.run(run())
+
+
+def test_cancelled_decision_with_local_dispatch_veto_does_not_burn_cooldown():
+    from app.listening_cues import CueNotSent
+    from test_listening_cues import setup, TEXT, drain
+    async def run():
+        c, clock, _, _, _, event, _ = setup()
+        started, release = asyncio.Event(), asyncio.Event()
+        async def dispatch(*args):
+            started.set(); await release.wait(); raise CueNotSent('local veto')
+        c.dispatch = dispatch
+        event('transcript', 'user', transcriptType='partial', transcript=TEXT)
+        await started.wait()
+        event('user-interrupted')
+        release.set(); await drain(c)
+        state = c.calls['fixture-call']
+        assert state.count == 0 and state.turn_count == 0 and state.last_cue < 0
+        await c.close()
+    asyncio.run(run())
+
+
+def test_interruption_clears_old_classification_context_without_refilling_waiting_budget():
+    from app.listening_cues import listening_gate
+    from test_listening_cues import setup, TEXT, SAFE
+    c, clock, _, _, _, event, _ = setup()
+    s = c.calls['fixture-call'];s.completed = s.text = TEXT;s.waiting_count = 2
+    s.waiting_first = 1
+    event('user-interrupted')
+    assert s.text == s.completed == s.segment == ''
+    assert s.waiting_count == 2 and s.waiting_first == 1
+    assert s.caller_started == clock.now
+    for prefix in ('Actually, I meant Wednesday', 'Actually, I meant Wednesday, not Tuesday.'):
+        assert listening_gate(TEXT+' '+prefix, 'Tell me about your car.', SAFE) == 'control_content'

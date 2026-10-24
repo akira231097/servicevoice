@@ -107,7 +107,7 @@ _ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverifi
     "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity", "silent_refusal"})
 EVENTS |= frozenset({"answer_released"})
-_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"fetched_clip_active"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"fetched_clip_active", "not_dispatched"})
 EVENTS |= frozenset({"clip_refusal_alert"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"prefer_pause", "excess_clip_refusals", "recovery_disabled",
     "clip_unavailable", "invalid_selection", "bridge_unavailable", "ticket_missing", "binding_mismatch",
