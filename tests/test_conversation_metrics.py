@@ -21,3 +21,10 @@ def test_greeting_and_hold_do_not_lower_reply_length_and_only_verified_readbacks
 
 def test_missing_replies_are_unknown_not_perfect():
     assert reply_lengths({})['within_20_words_fraction'] is None
+
+def test_idle_checkins_are_not_counted_as_additional_answer_words():
+    evidence={'turn:1':{'role':'user','text':'Hello','sequence':0},
+        'turn:2':{'role':'assistant','text':'How can I help?','sequence':1},
+        'turn:3':{'role':'assistant','text':"Take your time, I'm still here.",'sequence':2},
+        'turn:4':{'role':'assistant','text':'Are you still there?','sequence':3}}
+    assert reply_lengths(evidence)['maximum_words']==4
