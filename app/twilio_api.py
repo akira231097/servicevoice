@@ -1,8 +1,8 @@
 """Experimental HTTP integration for a separate Twilio phone line.
 
 Only dedicated phone admission can register a listening session. Partial events
-use that in-memory binding, not the scheduler worker pool. No route is live with
-the feature disabled, and no production environment can enable this prototype.
+use that in-memory binding, not the scheduler worker pool. Disabled announcement
+routes return inert silence; no production environment can enable this prototype.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import wave
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate, LISTENING_PHRASES
+from .listening_cues import ListeningCoordinator, ListeningPolicy, listening_gate, neutral_listening_only, LISTENING_PHRASES
 from .telephony_ingress import IngressError, IngressConfig, TelephonyIngress
 from .phone_ingress_router import PhoneIngressRouter
 from .twilio_media_health import OpeningMedia
@@ -32,6 +32,15 @@ TWILIO_PATHS = frozenset({"/twilio/voice", "/twilio/conference-status", "/twilio
     "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav", "/twilio/tester/fixture.wav", CAPTURE_PATH})
 FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
+
+
+def silent_announcement():
+    """A refused announcement must never trigger Twilio's spoken HTTP error."""
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as audio:
+        audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(8000)
+        audio.writeframes(bytes(640*2))  # 80 ms of valid PCM silence.
+    return Response(stream.getvalue(), media_type="audio/wav", headers={"Cache-Control": "no-store"})
 
 
 def load_test_fixture(path, expected):
@@ -318,16 +327,16 @@ class TwilioLane:
             remaining = min(state.clip_until-self.coordinator.clock(), deadline-time.perf_counter())
             await asyncio.sleep(max(.016, remaining))
 
-    def waiting_status(self, call_id, session_id):
+    def waiting_status(self, call_id, session_id, follow_up=False):
         binding = self.bindings.get(call_id)
         if self.closing or binding is None or binding[1] != session_id:
             return None, "speaker_state_unavailable"
-        return self.coordinator.waiting_status(call_id, session_id)
+        return self.coordinator.waiting_status(call_id, session_id, follow_up)
 
-    def commit_waiting(self, call_id, session_id):
-        if self.waiting_status(call_id, session_id)[1] != "eligible":
+    def commit_waiting(self, call_id, session_id, follow_up=False):
+        if self.waiting_status(call_id, session_id, follow_up)[1] != "eligible":
             return False
-        return self.coordinator.commit_waiting(call_id, session_id)
+        return self.coordinator.commit_waiting(call_id, session_id, follow_up)
 
     def fallback_ready(self, call_id, session_id, text):
         return self.coordinator.fallback_ready(call_id, session_id, text)
@@ -336,7 +345,7 @@ class TwilioLane:
         return await asyncio.to_thread(self.app.state.gemini_gateway._backchannel_context, session_id, call_id)
 
     def observe(self, call_id, event, reason, phrase_id=None):
-        component = "listening_cue" if event in {"decision", "suppressed", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"} else "twilio_bridge"
+        component = "listening_cue" if event in {"decision", "suppressed", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail"} else "twilio_bridge"
         state = self.coordinator.calls.get(call_id)
         phrase_id = phrase_id or (state.phrase_id if state else "neutral_ack")
         self.app.state.diagnose(component, event, "observed", call_id=call_id,
@@ -642,8 +651,7 @@ def install_twilio(app, settings):
             lane.spawn(lane.finish(row["id"]))
         return Response("<Response><Hangup /></Response>", media_type="application/xml")
 
-    @app.get("/twilio/clip/{phrase_id}.wav")
-    async def clip(phrase_id: str, request: Request):
+    async def approved_clip(phrase_id: str, request: Request):
         await authenticated(request)
         if phrase_id == "neutral_ack" and request.query_params.get("recovery") == "1":
             ticket = request.query_params.get("ticket", "")
@@ -673,9 +681,16 @@ def install_twilio(app, settings):
         if (len(request.query_params.getlist("ticket")) != 1 or item is None or state is None
                 or item["bridge_id"] != row["id"] or item["call_id"] != row["provider_call_id"]
                 or item["phrase_id"] != selection or item["expires"] <= now
-                or item["epoch"] != state.epoch or state.assistant or state.answer_ready
-                or not lane.coordinator.listening_window(state, delivery=True)):
+                or state.closed or state.assistant or state.answer_ready):
             raise HTTPException(410, "Cue expired.")
+        # A caller may begin a pause during the short provider fetch interval.
+        # Keep approved attention, but replace an agreement-sounding token with
+        # a closed neutral clip rather than reject ordinary speaker-state churn.
+        if neutral_listening_only(state) and selection not in {"neutral_ack", "uh_huh_1", "uh_huh_2"}:
+            selection = next((key for key in ("uh_huh_1", "uh_huh_2", "neutral_ack") if key in lane.clips), None)
+            if selection is None:
+                return silent_announcement()
+            state.phrase_id = selection
         lane.observe(row["provider_call_id"] or row["id"], "clip_fetched", "accepted_unverified", selection)
         wav, sha = lane.clips[selection]
         with wave.open(io.BytesIO(wav), "rb") as audio:
@@ -684,6 +699,22 @@ def install_twilio(app, settings):
         state.clip_until = now+duration+.25
         return Response(wav, media_type="audio/wav", headers={
             "Cache-Control": "no-store", "ETag": '"' + sha + '"'})
+
+    @app.get("/twilio/clip/{phrase_id}.wav")
+    async def clip(phrase_id: str, request: Request):
+        try:
+            return await approved_clip(phrase_id, request)
+        except Exception:
+            # Authentication/ownership still gate all real audio and mutations.
+            # Even unavailable, stale, replayed or invalid requests get inert
+            # media rather than an error Twilio could speak into a live call.
+            if lane is not None:
+                bridge = request.query_params.get("bridge", "")
+                bound = next((cid for cid, value in lane.bindings.items() if value[0] == bridge), None)
+                if bound is not None:
+                    requested = request.query_params.get("cue", "neutral_ack")
+                    lane.observe(bound, "clip_silenced", "silent_refusal", requested if requested in lane.clips else "silence")
+            return silent_announcement()
 
     @app.get("/api/twilio/readiness")
     async def local_readiness():

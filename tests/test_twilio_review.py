@@ -71,3 +71,15 @@ def test_review_retains_real_phrase_and_media_health_measurements():
     assert result["timeline"][0]["phrase"]=="Uh-huh."
     assert result["caller_energy_seconds"]==10 and result["clip_fetches_per_10s_caller_energy"]==1
     assert result["silent_opening_detections"]==1 and result["audible_playback"]=="unverified"
+
+
+def test_intended_tool_followup_is_not_a_duplicate_but_extra_cues_are():
+    key='a'*64
+    rows=[{'component':'twilio_bridge','event':'call_admitted','call_key':key,'attributes':{}}]
+    def add(followup):
+        rows.append({'component':'gateway','event':'backchannel.emitted','call_key':key,
+            'turn_id':'fixture','attributes':{'backchannel_follow_up':followup}})
+    add(False);add(True)
+    assert listening_summary({'events':rows},key)['duplicate_waiting_dispatches_by_gateway_turn']==0
+    add(True)
+    assert listening_summary({'events':rows},key)['duplicate_waiting_dispatches_by_gateway_turn']==1

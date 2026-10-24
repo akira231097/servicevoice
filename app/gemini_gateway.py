@@ -1369,11 +1369,11 @@ class GeminiGateway:
                 f"SELECT provider_call_id FROM sessions WHERE provider_call_id IN ({marks}) AND (ended!=0 OR created<?)",
                 (*call_ids,time.time()-4*3600)))
 
-    def _waiting_status(self, call_id, sid, ticket):
+    def _waiting_status(self, call_id, sid, ticket, follow_up=False):
         if self.waiting_cue_state is None:
             return "eligible"
         try:
-            current, reason = self.waiting_cue_state(call_id, sid)
+            current, reason = self.waiting_cue_state(call_id, sid, *([True] if follow_up else []))
             if current is None or ticket is None:
                 return "speaker_state_unavailable"
             return reason if current == ticket else "caller_resumed"
@@ -1389,7 +1389,7 @@ class GeminiGateway:
             await self.before_answer(timing.diagnostic_context["call_id"], timing.correlation)
             self._checkpoint(timing)
 
-    async def _wait_for_caller_pause(self, primary, call_id, sid, ticket):
+    async def _wait_for_caller_pause(self, primary, call_id, sid, ticket, follow_up=False):
         # Bounded, optional wait concurrent with the main answer. Caller events
         # arrive on the same event loop; no locks, provider calls or disk reads.
         deadline = time.monotonic()+1.25
@@ -1397,7 +1397,7 @@ class GeminiGateway:
             if primary.done():
                 primary.result()
                 return "primary_ready"
-            reason = self._waiting_status(call_id, sid, ticket)
+            reason = self._waiting_status(call_id, sid, ticket, follow_up)
             if reason in {"eligible", "caller_resumed", "speaker_state_unavailable", "turn_already_acknowledged"}:
                 return reason
             remaining = deadline-time.monotonic()
@@ -1499,11 +1499,11 @@ class GeminiGateway:
                 record["reason"]="primary_ready"
             elif decision is not None:
                 self._backchannel_observation(timing,"backchannel.selected",None)
-                fallback = (scoped_waiting and config.get("SERVICEVOICE_TWILIO_WAITING_FALLBACK") == "on"
+                fallback = (not follow_up and scoped_waiting and config.get("SERVICEVOICE_TWILIO_WAITING_FALLBACK") == "on"
                     and self.waiting_fallback_ready is not None
                     and guarded_waiting_fallback(decision, waiting_state(policy_messages, selection_context)[0], selection_context))
                 if fallback or decision.phrase_id in WAITING_PHRASE_IDS and decision.reason=="eligible_classification":
-                    speaker_reason = (await self._wait_for_caller_pause(primary, call_id, sid, speaker_ticket)
+                    speaker_reason = (await self._wait_for_caller_pause(primary, call_id, sid, speaker_ticket, follow_up)
                                       if scoped_waiting else "eligible")
                     # Never wait for this optional fresh read ahead of a ready
                     # main answer. A context change cannot grant new authority.
@@ -1523,7 +1523,7 @@ class GeminiGateway:
                     # Recheck after the asynchronous context read. This check,
                     # budget reservation and SSE yield have no intervening await.
                     if speaker_reason == "eligible" and scoped_waiting:
-                        speaker_reason = self._waiting_status(call_id, sid, speaker_ticket)
+                        speaker_reason = self._waiting_status(call_id, sid, speaker_ticket, follow_up)
                     if speaker_reason != "eligible":
                         state,reason = None,speaker_reason
                     if state is not None and fallback and not self.waiting_fallback_ready(call_id, sid, state["utterance"]):
@@ -1540,7 +1540,7 @@ class GeminiGateway:
                         allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up)
                         record["reason"]=reason
                         if allowed:
-                            if scoped_waiting and self.waiting_cue_commit is not None and not self.waiting_cue_commit(call_id, sid):
+                            if scoped_waiting and self.waiting_cue_commit is not None and not self.waiting_cue_commit(call_id, sid, *([True] if follow_up else [])):
                                 allowed = False
                                 record["reason"] = "turn_already_acknowledged"
                         if allowed:

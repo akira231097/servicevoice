@@ -259,7 +259,7 @@ def test_disabled_routes_and_no_extra_database(tmp_path, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_public_app(app)), base_url="https://test") as client:
             for path in ("voice", "conference-status", "participant-status", "dial-ended", "caller-status"):
                 assert (await client.post("/twilio/"+path)).status_code == 404
-            assert (await client.get("/twilio/clip/neutral_ack.wav")).status_code == 404
+            assert (await client.get("/twilio/clip/neutral_ack.wav")).status_code == 200  # inert announcement media
     asyncio.run(run())
 
 
@@ -315,12 +315,15 @@ def test_listening_clip_selection_is_signed_closed_set_and_requires_joined_calle
             assert response.status_code==200 and response.content==lane.wav
             assert response.headers["cache-control"]=="no-store"
             assert state.clip_until>lane.coordinator.clock()+.5
-            assert (await client.get("/twilio/"+suffix,headers=headers)).status_code==410
-            assert (await client.get("/twilio/"+suffix.replace("cue=acknowledge","cue=neutral_ack"),headers=headers)).status_code==401
+            replay=await client.get("/twilio/"+suffix,headers=headers)
+            assert replay.status_code==200 and replay.content!=lane.wav
+            denied=await client.get("/twilio/"+suffix.replace("cue=acknowledge","cue=neutral_ack"),headers=headers)
+            assert denied.status_code==200 and denied.content==replay.content
             for query in ("cue=booked","cue=acknowledge&cue=neutral_ack"):
                 suffix="clip/neutral_ack.wav?bridge="+row["id"]+"&"+query
                 headers={"x-twilio-signature":signature(lane.config.auth_token,lane.config.url(suffix),[])}
-                assert (await client.get("/twilio/"+suffix,headers=headers)).status_code==404
+                refused=await client.get("/twilio/"+suffix,headers=headers)
+                assert refused.status_code==200 and refused.content==replay.content
         await lane.close()
     asyncio.run(run())
 

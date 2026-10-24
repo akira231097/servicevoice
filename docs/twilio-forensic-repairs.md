@@ -113,3 +113,28 @@ waiting dispatches during caller energy, duplicate dispatches by gateway turn,
 guarded fallbacks and suspected media failures. Dispatch/fetch and speaker events
 are not proof of what a person heard. The reviewer never treats ungraded calls as
 passing calls.
+# Second review: rejected announcement audio and tool follow-up
+
+The 961f08c interruption capture was not a clean acceptance result. Twilio fetched
+an invalidated Okay ticket, received HTTP 410 and spoke its application-error
+goodbye. A prior advisory audio review missed it. The revised verification gate
+reproduces both the caller-leg 11200 notification and unexplained output audio.
+
+Announcement refusals now return HTTP 200 with an 80 ms silent WAV and no caching.
+Authentication still gates every real clip and mutation. Expiry, ownership,
+single-use, closed-session and main-speaker priority remain enforced; ordinary
+ASR revisions and pauses do not expire an approved clip. Pause/request delivery
+uses only Mm-hmm/Uh-huh, including a neutral substitution if a pause begins during
+fetch. Each call samples a starting rotation offset.
+
+The logical turn permits one initial waiting cue and one verified-tool-result
+follow-up, separated by at least 2.5 seconds. Neither is refunded when generation
+is cancelled. The metric distinguishes this deliberate follow-up from duplicates.
+
+`scripts/verify_twilio_probe.py` fails on any Twilio notification or speech-like
+output attributable to neither an approved clip match nor Vapi speaking intervals.
+Missing evidence fails closed. It records detector thresholds and transport
+tolerances; it is not a naturalness score. Owned-call collection and waveform
+auditing invoke these checks automatically. The separate retired-ticket live probe
+must verify silent handling before handset acceptance. Main remains unchanged.
+

@@ -12,6 +12,7 @@ from datetime import datetime
 import json
 import math
 import re
+import secrets
 import time
 
 import httpx
@@ -40,6 +41,11 @@ MIN_PARTIAL_WORDS = 6
 DECISION_RETRY_SECONDS = 1.5
 CUE_COOLDOWN_SECONDS = 5
 WAITING_QUIET_SECONDS = .75
+
+
+def neutral_listening_only(state):
+    return (not state.caller or bool(re.search(
+        r"\b(?:i (?:need|want|would like)|can you|could you|please|book|schedule|reserve)\b", state.text, re.I)))
 MAX_DECISIONS_PER_CALL = 64
 LISTENING_PHRASES = {"neutral_ack": "Mm-hmm.", "acknowledge": "I hear you."}
 _PROBLEM = re.compile(r"\b(?:noise|sounds?|rattl\w*|shak\w*|grind\w*|issue|problem|worr\w*)\b", re.I)
@@ -203,6 +209,8 @@ class ListeningState:
     waiting_stopped: float = -math.inf
     user_revision: int = 0
     waiting_count: int = 0
+    waiting_first: float = -math.inf
+    rotation_start: int = field(default_factory=lambda: secrets.randbelow(len(ROTATION)))
     substantive_since_user: bool = True
     clip_until: float = -math.inf
     clip_pending_until: float = -math.inf
@@ -305,6 +313,7 @@ class ListeningCoordinator:
                         state.caller_started, state.turn_count = now-max(0, age), 0
                         state.completed = ""
                         state.waiting_count = 0
+                        state.waiting_first = -math.inf
                         state.substantive_since_user = False
                     state.text, state.partial_event = "", -math.inf
                     state.segment = ""
@@ -373,7 +382,7 @@ class ListeningCoordinator:
             state.caller = False
             state.caller_stopped = -math.inf
 
-    def waiting_status(self, call_id, session_id):
+    def waiting_status(self, call_id, session_id, follow_up=False):
         """Read-only permission for the separate, post-turn waiting stream.
 
         A generation request or a final ASR clause is not an end-of-turn signal.
@@ -388,8 +397,10 @@ class ListeningCoordinator:
             return ticket, "caller_speaking"
         if state.assistant:
             return ticket, "assistant_speaking"
-        if state.waiting_count:
+        if state.waiting_count and (not follow_up or state.waiting_count >= 2):
             return ticket, "turn_already_acknowledged"
+        if state.waiting_count and self.clock()-state.waiting_first < 2.5:
+            return ticket, "cooldown"
         if not math.isfinite(state.waiting_stopped):
             return ticket, "caller_end_unobserved"
         now = self.clock()
@@ -401,11 +412,14 @@ class ListeningCoordinator:
             return ticket, "listening_clip_pending"
         return ticket, "eligible"
 
-    def commit_waiting(self, call_id, session_id):
-        _, reason = self.waiting_status(call_id, session_id)
+    def commit_waiting(self, call_id, session_id, follow_up=False):
+        _, reason = self.waiting_status(call_id, session_id, follow_up)
         if reason != "eligible":
             return False
-        self.calls[call_id].waiting_count += 1
+        state = self.calls[call_id]
+        if not state.waiting_count:
+            state.waiting_first = self.clock()
+        state.waiting_count += 1
         return True
 
     def fallback_ready(self, call_id, session_id, text):
@@ -511,15 +525,19 @@ class ListeningCoordinator:
             state.last_cue = self.clock()
             # The classifier has already approved the whole partial. Style adds
             # no authority: both cached clips acknowledge attention only.
-            rotation = [key for key in ROTATION if key in self.available_phrases]
+            # Pauses and plain service requests must not sound like assent.
+            neutral = neutral_listening_only(state)
+            rotation = [key for key in ROTATION if key in self.available_phrases
+                and (not neutral or key == "neutral_ack" or key.startswith("uh_huh_"))]
             if any(key in self.available_phrases for key in VARIATIONS):
                 # All choices express attention only. No free text or guessed
                 # task progress is inserted. Do not repeat the previous token.
                 previous_text = VARIATIONS.get(state.phrase_id, LISTENING_PHRASES.get(state.phrase_id))
                 choices = [key for key in rotation if VARIATIONS.get(key, LISTENING_PHRASES.get(key)) != previous_text]
-                state.phrase_id = choices[(state.count-1) % len(choices)]
+                choices = choices or rotation
+                state.phrase_id = choices[(state.rotation_start+state.count-1) % len(choices)]
             else:
-                state.phrase_id = ("acknowledge" if state.phrase_id != "acknowledge"
+                state.phrase_id = ("acknowledge" if not neutral and state.phrase_id != "acknowledge"
                     and _PROBLEM.search(state.text) else "neutral_ack")
             self.record(call_id, "decision", "approved")
             async def send():

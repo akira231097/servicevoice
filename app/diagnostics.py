@@ -62,7 +62,7 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
-EVENTS |= frozenset({"decision", "suppressed", "dispatched", "clip_fetched", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
+EVENTS |= frozenset({"decision", "suppressed", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
 EVENTS |= frozenset({"background_failure", "dial_failed", "listening_unavailable"})
 _ENUM_ATTRIBUTES = {
@@ -105,7 +105,7 @@ _ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverifi
     "private_content", "sensitive_prior_turn", "question", "policy_unavailable", "provider_unavailable",
     "invalid_response", "classifier_silence", "speaker_priority", "speech_too_short", "stale_partial",
     "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
-_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity", "silent_refusal"})
 _ENUM_ATTRIBUTES["model"] |= frozenset({"gemini-3.5-flash-lite"})
 _ENUM_ATTRIBUTES["backchannel_phrase"] |= frozenset({f"{name}_{take}" for name in ("uh_huh", "yeah", "okay", "right") for take in (1, 2)})
 EVENTS |= frozenset({"caller_words_observed", "media_suspected", "media_recovery_started", "media_recovery_aborted",

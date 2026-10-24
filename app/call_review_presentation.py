@@ -388,7 +388,7 @@ def listening_summary(diagnostics, call_key):
     bridge = [row for row in all_rows if row["component"] == "twilio_bridge"]
     if not rows and not bridge:
         return None
-    allowed = {"decision", "dispatched", "clip_fetched", "announcement_end", "announcement_fail"}
+    allowed = {"decision", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail"}
     rows = [row for row in rows if row["event"] in allowed]
     phrases = {**PHRASES, **VARIATIONS}
     intervals, opened = [], None
@@ -401,9 +401,12 @@ def listening_summary(diagnostics, call_key):
             opened = None
     seconds = sum(stop-start for start, stop in intervals)
     waiting = [r for r in all_rows if r["component"] == "gateway" and r["event"] == "backchannel.emitted"]
-    by_turn = {}
+    by_turn, followups = {}, {}
     for row in waiting:
-        if row["turn_id"]: by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
+        if row["turn_id"]:
+            by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
+            if row["attributes"].get("backchannel_follow_up") is True:
+                followups[row["turn_id"]] = followups.get(row["turn_id"], 0)+1
     fetched = sum(row["event"] == "clip_fetched" for row in rows)
     return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
                          "phrase_id": row["attributes"].get("backchannel_phrase") if row["attributes"].get("backchannel_phrase") in phrases else None,
@@ -417,7 +420,7 @@ def listening_summary(diagnostics, call_key):
             "clip_fetches_per_10s_caller_energy": round(fetched*10/seconds, 3) if seconds > 0 else None,
             "waiting_dispatches_during_caller_energy": sum(any(start <= row["start_unix"] < stop for start, stop in intervals)
                 for row in waiting if row["start_unix"] is not None) if intervals else None,
-            "duplicate_waiting_dispatches_by_gateway_turn": sum(max(0, count-1) for count in by_turn.values()),
+            "duplicate_waiting_dispatches_by_gateway_turn": sum(max(0, count-1-min(1,followups.get(turn,0))) for turn,count in by_turn.items()),
             "silent_opening_detections": sum(row["event"] == "media_suspected" for row in bridge),
             "opening_recovery_redials": sum(row["event"] == "media_recovery_redial" for row in bridge),
             "guarded_waiting_fallbacks": sum(row["attributes"].get("backchannel_guarded_fallback") is True for row in waiting),
