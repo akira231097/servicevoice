@@ -82,6 +82,8 @@ class TwilioConfig:
         # This first release cannot accidentally enable a production deployment.
         if values.get("SERVICEVOICE_ENVIRONMENT") not in {"local", "development", "staging"}:
             raise ValueError("Twilio listening lane is experimental; isolated environments only.")
+        if flag(values, "SERVICEVOICE_TWILIO_OPENING_RECOVERY"):
+            raise ValueError("Automatic opening recovery is unavailable; keep SERVICEVOICE_TWILIO_OPENING_RECOVERY=off.")
         return cls(*(values.get(k, "") for k in (
             "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_API_KEY_SID",
             "TWILIO_API_KEY_SECRET", "TWILIO_PHONE_NUMBER", "SERVICEVOICE_TWILIO_PUBLIC_BASE_URL",
@@ -353,7 +355,7 @@ class TwilioClient:
         self.config = config
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(3, connect=1),
             follow_redirects=False, trust_env=False,
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=4))
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=4, keepalive_expiry=30))
         self.owns_client = client is None
         self.base = "https://api.twilio.com/2010-04-01/Accounts/" + config.account_sid
 

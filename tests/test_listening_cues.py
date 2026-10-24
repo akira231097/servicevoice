@@ -386,13 +386,19 @@ def test_private_final_can_release_only_after_clear_new_vehicle_clause():
     asyncio.run(run())
 
 
-def test_earlier_opportunity_still_obeys_five_second_cooldown():
+def test_continuous_speech_uses_varied_bounded_spacing(monkeypatch):
     async def run():
         c,clock,p,sent,_,event,_=setup()
-        for tick in (3.1,4.7,8.2,9.8,13.3,18.4):
-            clock.now=tick
-            event("transcript","user",transcriptType="partial",transcript=TEXT+" words"*int(tick))
+        draws=iter((0,1500,500,1000))
+        monkeypatch.setattr('app.listening_cues.secrets.randbelow',lambda n:next(draws))
+        delivered=[]
+        for tick in range(31,201):
+            clock.now=tick/10
+            event("transcript","user",transcriptType="partial",transcript=TEXT+" words"*tick)
             await drain(c)
-        assert len(sent)==4
+            if len(sent)>len(delivered): delivered.append(clock.now)
+        assert len(sent)==3
+        gaps=[b-a for a,b in zip(delivered,delivered[1:])]
+        assert gaps[0] == pytest.approx(5.5) and gaps[1] == pytest.approx(7)
         await c.close()
     asyncio.run(run())

@@ -106,6 +106,12 @@ _ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverifi
     "invalid_response", "classifier_silence", "speaker_priority", "speech_too_short", "stale_partial",
     "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity", "silent_refusal"})
+EVENTS |= frozenset({"answer_released"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"fetched_clip_active"})
+EVENTS |= frozenset({"clip_refusal_alert"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"prefer_pause", "excess_clip_refusals", "recovery_disabled",
+    "clip_unavailable", "invalid_selection", "bridge_unavailable", "ticket_missing", "binding_mismatch",
+    "ticket_expired", "no_neutral_clip", "clip_internal_error", "lane_unavailable"})
 _ENUM_ATTRIBUTES["model"] |= frozenset({"gemini-3.5-flash-lite"})
 _ENUM_ATTRIBUTES["backchannel_phrase"] |= frozenset({f"{name}_{take}" for name in ("uh_huh", "yeah", "okay", "right") for take in (1, 2)})
 EVENTS |= frozenset({"caller_words_observed", "media_suspected", "media_recovery_started", "media_recovery_aborted",

@@ -39,7 +39,6 @@ LANGUAGE_LABELS = ("english", "other", "uncertain")
 MIN_SPEECH_SECONDS = 3
 MIN_PARTIAL_WORDS = 6
 DECISION_RETRY_SECONDS = 1.5
-CUE_COOLDOWN_SECONDS = 5
 WAITING_QUIET_SECONDS = .75
 
 
@@ -226,8 +225,11 @@ class ListeningState:
     epoch: int = 0
     count: int = 0
     phrase_id: str = "neutral_ack"
+    last_delivered_phrase: str = ""
+    neutral_cursor: int = 0
     turn_count: int = 0
     last_cue: float = -math.inf
+    cue_interval: float = 5
     last_attempt: float = -math.inf
     last_attempt_text: str = ""
     decisions: int = 0
@@ -447,8 +449,10 @@ class ListeningCoordinator:
             return "insufficient_words"
         if state.count >= 36 or state.turn_count >= 12:
             return "cue_budget"
-        if now-state.last_cue < CUE_COOLDOWN_SECONDS:
+        if now-state.last_cue < state.cue_interval:
             return "cue_cooldown"
+        if state.caller and now-state.last_cue < state.cue_interval+1.5:
+            return "prefer_pause"
         return "eligible"
 
     def listening_window(self, state, *, delivery=False):
@@ -523,6 +527,9 @@ class ListeningCoordinator:
             state.count += 1
             state.turn_count += 1
             state.last_cue = self.clock()
+            # A pause can use the 4–5.5 s opportunity; continuous speech waits
+            # another 1.5 s. No fixed five-second beat and no unlimited delay.
+            state.cue_interval = 4+secrets.randbelow(1501)/1000
             # The classifier has already approved the whole partial. Style adds
             # no authority: both cached clips acknowledge attention only.
             # Pauses and plain service requests must not sound like assent.

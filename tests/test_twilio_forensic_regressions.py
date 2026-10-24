@@ -209,25 +209,18 @@ def test_opening_recovery_is_once_and_never_replays_business_work(lane_app, outc
         from test_twilio_api import wait_tasks
         await wait_tasks(lane)
         fresh = lane.store.get(row["id"])
-        assert fresh["recovery_count"] == 1
-        if outcome == "redial":
-            assert provider.adds == 1 and fresh["vapi_leg_sid"] == "CA"+"8"*32
-            assert lane.store.retired_leg(row["id"], LEG)
-            assert call["id"] not in lane.bindings
-            with lane_app.state.store.connect() as db:
-                assert db.execute("SELECT ended FROM sessions WHERE id=?", (old_session,)).fetchone()[0] == 1
-        elif outcome == "words_resumed":
-            assert fresh["state"] == "joined" and provider.adds == 0
-            assert call["id"] in lane.bindings
-        else:
-            assert fresh["state"] == "ended" and provider.adds == 0
+        assert fresh["recovery_count"] == 0
+        assert fresh["state"] == "joined" and provider.adds == 0
+        assert call["id"] in lane.bindings
+        with lane_app.state.store.connect() as db:
+            assert db.execute("SELECT ended FROM sessions WHERE id=?", (old_session,)).fetchone()[0] == 0
         await lane.recover_opening(row["id"])
-        assert provider.adds == (1 if outcome == "redial" else 0)
+        assert provider.adds == 0
         await lane.close()
     asyncio.run(run())
 
 
-def test_answer_cancels_unfetched_cue_and_waits_only_for_fetched_audio(lane_app):
+def test_answer_cancels_unfetched_cue_without_delaying_synthesis(lane_app):
     async def run():
         lane = lane_app.state.twilio_lane
         lane.coordinator.register("call", "session")
@@ -239,8 +232,8 @@ def test_answer_cancels_unfetched_cue_and_waits_only_for_fetched_audio(lane_app)
         state.clip_until = lane.coordinator.clock()+.1
         task = asyncio.create_task(lane.before_answer("call", "session"))
         await asyncio.sleep(.01)
-        assert not task.done()
+        assert task.done()
         await task
-        assert lane.coordinator.clock() >= state.clip_until
+        assert lane.coordinator.clock() < state.clip_until
         await lane.coordinator.close()
     asyncio.run(run())

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qsl
 import wave
+from collections import Counter, deque
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -32,6 +33,13 @@ TWILIO_PATHS = frozenset({"/twilio/voice", "/twilio/conference-status", "/twilio
     "/twilio/dial-ended", "/twilio/caller-status", "/twilio/clip/{phrase_id}.wav", "/twilio/tester/fixture.wav", CAPTURE_PATH})
 FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
+CLIP_REFUSALS = frozenset({"recovery_disabled", "clip_unavailable", "invalid_selection", "bridge_unavailable",
+    "ticket_missing", "binding_mismatch", "ticket_expired", "speaker_priority", "no_neutral_clip",
+    "clip_internal_error", "lane_unavailable"})
+
+
+class ClipRefusal(Exception):
+    pass
 
 
 def silent_announcement():
@@ -79,6 +87,11 @@ class TwilioLane:
         self.media = {}
         self.recovery_announcements = {}
         self.caller_left = set()
+        self.cleanup_retry = {}
+        self.media_alerted = set()
+        self.clip_outcomes = deque(maxlen=100)
+        self.clip_refusals = Counter()
+        self.clip_refusal_alert = False
         self.ingress = getattr(app.state.telephony_ingress, "isolated", app.state.telephony_ingress)
         self.phone_identity = self.ingress.config
         self.started = False
@@ -105,19 +118,27 @@ class TwilioLane:
         return self.locks.setdefault(bridge_id, asyncio.Lock())
 
     async def _sweep(self):
+        delay = 2
         while not self.closing:
-            await asyncio.sleep(2)
+            await asyncio.sleep(delay)
             try:
-                rows = await asyncio.to_thread(self.store.active)
-                for row in rows:
-                    if row["state"] == "ended":
-                        await self.finish(row["id"])
-                    elif row["state"] == "joined" and row["recovery_count"] == 0:
-                        media = self.media.get(row["id"])
-                        if media and media.suspicion(self.coordinator.clock()):
-                            await self.recover_opening(row["id"])
+                await self.sweep_once()
+                delay = 2
             except Exception:
+                delay = min(30, delay*2)
                 self.observe("twilio-background", "background_failure", "unavailable")
+
+    async def sweep_once(self):
+        for row in await asyncio.to_thread(self.store.active):
+            try:
+                if row["state"] == "ended":
+                    if self.coordinator.clock() >= self.cleanup_retry.get(row["id"], (0, 0))[1]:
+                        await self.finish(row["id"])
+                elif row["state"] == "joined":
+                    await self.recover_opening(row["id"])
+            except Exception:
+                # One unavailable bridge must not prevent other cleanup work.
+                self.observe(row["provider_call_id"] or row["id"], "background_failure", "unavailable")
 
     async def start(self, settings):
         if self.started:
@@ -246,60 +267,21 @@ class TwilioLane:
                     self.observe(call_id, "caller_words_observed", "approved")
             self.coordinator.event(call_id, message)
 
-    def recovery_safe(self, row):
-        with self.app.state.store.read_connection(.05) as db:
-            return (db.execute("SELECT 1 FROM tool_invocations WHERE session_id=? LIMIT 1", (row["session_id"],)).fetchone() is None
-                and db.execute("SELECT 1 FROM sessions WHERE id=? AND ended=0 AND provider_call_id=?",
-                    (row["session_id"], row["provider_call_id"])).fetchone() is not None)
-
     async def recover_opening(self, bridge_id):
-        redial = False
+        """Observe only: VAD without ASR is not proof of a broken audio path.
+
+        Automatic reconnect is disabled until we have positive media evidence
+        and a recoverable handover. In particular, never detach or hang up a
+        possibly working call because a diagnostic or provider request fails.
+        """
         async with self.lock(bridge_id):
             row = await asyncio.to_thread(self.store.get, bridge_id)
             media = self.media.get(bridge_id)
             if (not row or row["state"] != "joined" or self.closing or bridge_id in self.caller_left
-                    or media is None or not media.suspicion(self.coordinator.clock())):
+                    or bridge_id in self.media_alerted or media is None or not media.suspicion(self.coordinator.clock())):
                 return
-            if not await asyncio.to_thread(self.recovery_safe, row):
-                return
+            self.media_alerted.add(bridge_id)
             self.observe(row["provider_call_id"], "media_suspected", "caller_energy_without_words")
-            if not await asyncio.to_thread(self.store.claim_recovery, bridge_id):
-                return
-            watchdog = self.watchdogs.get(bridge_id)
-            if watchdog and watchdog is not asyncio.current_task():
-                watchdog.cancel()
-            self.observe(row["provider_call_id"], "media_recovery_started", "opening_only")
-            try:
-                ticket = secrets.token_hex(16)
-                self.recovery_announcements[ticket] = (bridge_id, self.coordinator.clock()+5)
-                # Audible explanation uses Twilio's independent caller path.
-                # It has no booking claims and is never injected into Vapi.
-                await self.client.recovery_announcement(row, ticket)
-                await asyncio.sleep(3)
-                if media.words:
-                    await asyncio.to_thread(self.store.abort_recovery, bridge_id)
-                    self.observe(row["provider_call_id"], "media_recovery_aborted", "words_resumed")
-                    return
-                if self.closing or bridge_id in self.caller_left:
-                    raise BridgeError("recovery_caller_ended")
-                caller = await self.client.request("GET", f"/Calls/{row['caller_sid']}.json")
-                if caller.get("status") != "in-progress" or not await asyncio.to_thread(self.recovery_safe, row):
-                    raise BridgeError("recovery_no_longer_safe")
-                await self.client.detach_agent(row)
-                await asyncio.to_thread(self.app.state.telephony_ingress.end_bridge_binding, row["provider_call_id"], row["session_id"])
-                self.coordinator.retire(row["provider_call_id"])
-                self.bindings.pop(row["provider_call_id"], None)
-                self.proofs.pop(row["provider_call_id"], None)
-                await asyncio.to_thread(self.store.reset_recovered_leg, bridge_id)
-                self.media.pop(bridge_id, None)
-                redial = True
-            except Exception:
-                self.observe(row["provider_call_id"], "media_recovery_failed", "unavailable")
-                await self._finish(bridge_id, apology=True)
-        if redial:
-            self.observe(row["provider_call_id"], "media_recovery_redial", "opening_only")
-            self.spawn(self.dial(bridge_id))
-            self.watchdogs[bridge_id] = self.spawn(self._watch(bridge_id))
 
     def owns_message(self, message):
         call = message.get("call") if isinstance(message, dict) else None
@@ -315,17 +297,14 @@ class TwilioLane:
         state.answer_ready = True
         state.answer_ready_at = self.coordinator.wall()
         state.clip_pending_until = 0
-        # Invalidate requests not fetched yet. A fetched announcement cannot be
-        # cancelled by REST, so wait only for its bounded expected audio end.
+        # Give ready answer text to synthesis immediately. Invalidating tickets
+        # prevents any unfetched cue from starting, but is not cancellation of
+        # a clip Twilio already fetched. Keep that estimate for cue gating only.
         for ticket, item in list(self.announcements.items()):
             if item["call_id"] == call_id:
                 self.announcements.pop(ticket, None)
-        deadline = time.perf_counter()+2
-        while state.clip_until > self.coordinator.clock() and time.perf_counter() < deadline:
-            # asyncio timers may wake one clock tick early on Windows. Recheck
-            # the condition instead of treating a sleep as playback completion.
-            remaining = min(state.clip_until-self.coordinator.clock(), deadline-time.perf_counter())
-            await asyncio.sleep(max(.016, remaining))
+        if state.clip_until > self.coordinator.clock():
+            self.observe(call_id, "answer_released", "fetched_clip_active")
 
     def waiting_status(self, call_id, session_id, follow_up=False):
         binding = self.bindings.get(call_id)
@@ -350,6 +329,30 @@ class TwilioLane:
         phrase_id = phrase_id or (state.phrase_id if state else "neutral_ack")
         self.app.state.diagnose(component, event, "observed", call_id=call_id,
             attributes={"listening_reason": reason, "backchannel_phrase": phrase_id if component == "listening_cue" else "silence"})
+
+    def clip_outcome(self, call_id, reason=None):
+        self.clip_outcomes.append(reason is not None)
+        if reason:
+            self.clip_refusals[reason] += 1
+        elevated = len(self.clip_outcomes) >= 10 and sum(self.clip_outcomes) >= 2 and sum(self.clip_outcomes)/len(self.clip_outcomes) > .05
+        if elevated and not self.clip_refusal_alert:
+            self.app.state.diagnose("twilio_bridge", "clip_refusal_alert", "failed", call_id=call_id,
+                attributes={"listening_reason": "excess_clip_refusals"})
+        self.clip_refusal_alert = elevated
+
+    def neutral_clip(self, state):
+        rotation = ("neutral_ack", "uh_huh_1", "neutral_ack", "uh_huh_2")
+        previous = state.last_delivered_phrase
+        choices = [(i, rotation[i % 4]) for i in range(state.neutral_cursor, state.neutral_cursor+4)
+            if rotation[i % 4] in self.clips and rotation[i % 4] != previous]
+        # Prefer different words, while alternating the two Uh-huh recordings.
+        varied = [(i, key) for i, key in choices if not (key.startswith("uh_huh_") and previous.startswith("uh_huh_"))]
+        choices = varied or choices
+        if not choices:
+            return None
+        index, selection = choices[0]
+        state.neutral_cursor = index+1
+        return selection
 
     async def dispatch(self, call_id):
         binding = self.bindings.get(call_id)
@@ -407,7 +410,14 @@ class TwilioLane:
 
     async def finish(self, bridge_id, *, apology=False):
         async with self.lock(bridge_id):
-            await self._finish(bridge_id, apology=apology)
+            try:
+                await self._finish(bridge_id, apology=apology)
+            finally:
+                attempts = self.cleanup_retry.get(bridge_id, (0, 0))[0]+1
+                self.cleanup_retry[bridge_id] = (attempts, self.coordinator.clock()+min(30, 2**min(attempts, 5)))
+                row = await asyncio.to_thread(self.store.get, bridge_id)
+                if row is None or row["cleanup_verified"]:
+                    self.cleanup_retry.pop(bridge_id, None)
 
     async def _finish(self, bridge_id, *, apology=False):
         self.ending.add(bridge_id)
@@ -531,8 +541,6 @@ def install_twilio(app, settings):
     async def authenticated(request):
         if lane is None:
             raise HTTPException(404)
-        if lane.closing or lane.client is None:
-            raise HTTPException(503, "Isolated lane is unavailable.")
         suffix = request.url.path.removeprefix("/twilio/")
         try:
             query = request.scope.get("query_string", b"").decode("ascii")
@@ -562,6 +570,9 @@ def install_twilio(app, settings):
             raise HTTPException(400, "Ambiguous form fields.")
         if request.method == "POST" and fields.get("AccountSid") != config.account_sid:
             raise HTTPException(403, "Wrong Twilio account.")
+        request.state.twilio_clip_authenticated = True
+        if lane.closing or lane.client is None:
+            raise HTTPException(503, "Isolated lane is unavailable.")
         return fields
 
     @app.post("/twilio/voice")
@@ -653,50 +664,53 @@ def install_twilio(app, settings):
 
     async def approved_clip(phrase_id: str, request: Request):
         await authenticated(request)
+        request.state.twilio_clip_authenticated = True
         if phrase_id == "neutral_ack" and request.query_params.get("recovery") == "1":
-            ticket = request.query_params.get("ticket", "")
-            pending = lane.recovery_announcements.pop(ticket, None)
-            bridge_id = request.query_params.get("bridge", "")
-            row = await asyncio.to_thread(lane.store.get, bridge_id)
-            if (len(request.query_params.getlist("ticket")) != 1 or pending is None
-                    or pending[0] != bridge_id or pending[1] <= lane.coordinator.clock()
-                    or not row or row["state"] != "recovering"):
-                raise HTTPException(410, "Recovery announcement expired.")
-            return Response("<Response><Say>Sorry, I'm having trouble hearing you. Let me reconnect.</Say></Response>",
-                media_type="application/xml", headers={"Cache-Control": "no-store"})
+            raise ClipRefusal("recovery_disabled")
         if phrase_id != "neutral_ack" or lane.wav is None:
-            raise HTTPException(404)
+            raise ClipRefusal("clip_unavailable")
         # Keep the existing edge route. Twilio signs the full query, including
         # the closed-set clip selection; arbitrary text/URLs are never accepted.
         selection = request.query_params.get("cue", "neutral_ack")
         if len(request.query_params.getlist("cue")) > 1 or selection not in lane.clips:
-            raise HTTPException(404)
+            raise ClipRefusal("invalid_selection")
         row = await asyncio.to_thread(lane.store.get, request.query_params.get("bridge", ""))
         if row is None or row["state"] != "joined":
-            raise HTTPException(404)
+            raise ClipRefusal("bridge_unavailable")
         ticket = request.query_params.get("ticket", "")
         item = lane.announcements.pop(ticket, None)
         state = lane.coordinator.calls.get(row["provider_call_id"])
         now = lane.coordinator.clock()
-        if (len(request.query_params.getlist("ticket")) != 1 or item is None or state is None
-                or item["bridge_id"] != row["id"] or item["call_id"] != row["provider_call_id"]
-                or item["phrase_id"] != selection or item["expires"] <= now
-                or state.closed or state.assistant or state.answer_ready):
-            raise HTTPException(410, "Cue expired.")
+        if len(request.query_params.getlist("ticket")) != 1 or item is None:
+            raise ClipRefusal("ticket_missing")
+        if (state is None or item["bridge_id"] != row["id"] or item["call_id"] != row["provider_call_id"]
+                or item["phrase_id"] != selection):
+            raise ClipRefusal("binding_mismatch")
+        if item["expires"] <= now:
+            raise ClipRefusal("ticket_expired")
+        if state.closed or state.assistant or state.answer_ready:
+            raise ClipRefusal("speaker_priority")
         # A caller may begin a pause during the short provider fetch interval.
         # Keep approved attention, but replace an agreement-sounding token with
         # a closed neutral clip rather than reject ordinary speaker-state churn.
-        if neutral_listening_only(state) and selection not in {"neutral_ack", "uh_huh_1", "uh_huh_2"}:
-            selection = next((key for key in ("uh_huh_1", "uh_huh_2", "neutral_ack") if key in lane.clips), None)
+        if neutral_listening_only(state):
+            selection = lane.neutral_clip(state)
             if selection is None:
-                return silent_announcement()
+                raise ClipRefusal("no_neutral_clip")
             state.phrase_id = selection
-        lane.observe(row["provider_call_id"] or row["id"], "clip_fetched", "accepted_unverified", selection)
+        elif selection == state.last_delivered_phrase:
+            selection = lane.neutral_clip(state)
+            if selection is None:
+                raise ClipRefusal("no_neutral_clip")
+            state.phrase_id = selection
         wav, sha = lane.clips[selection]
         with wave.open(io.BytesIO(wav), "rb") as audio:
             duration = audio.getnframes()/audio.getframerate()
         state.clip_pending_until = 0
         state.clip_until = now+duration+.25
+        state.last_delivered_phrase = selection
+        lane.clip_outcome(row["provider_call_id"])
+        lane.observe(row["provider_call_id"] or row["id"], "clip_fetched", "accepted_unverified", selection)
         return Response(wav, media_type="audio/wav", headers={
             "Cache-Control": "no-store", "ETag": '"' + sha + '"'})
 
@@ -704,16 +718,22 @@ def install_twilio(app, settings):
     async def clip(phrase_id: str, request: Request):
         try:
             return await approved_clip(phrase_id, request)
-        except Exception:
+        except Exception as exc:
             # Authentication/ownership still gate all real audio and mutations.
             # Even unavailable, stale, replayed or invalid requests get inert
             # media rather than an error Twilio could speak into a live call.
-            if lane is not None:
+            if lane is not None and getattr(request.state, "twilio_clip_authenticated", False):
                 bridge = request.query_params.get("bridge", "")
                 bound = next((cid for cid, value in lane.bindings.items() if value[0] == bridge), None)
-                if bound is not None:
-                    requested = request.query_params.get("cue", "neutral_ack")
-                    lane.observe(bound, "clip_silenced", "silent_refusal", requested if requested in lane.clips else "silence")
+                requested = request.query_params.get("cue", "neutral_ack")
+                reason = str(exc) if isinstance(exc, ClipRefusal) and str(exc) in CLIP_REFUSALS else "clip_internal_error"
+                if isinstance(exc, HTTPException) and exc.status_code == 503:
+                    reason = "lane_unavailable"
+                try:
+                    lane.clip_outcome(bound or "twilio-clip", reason)
+                    lane.observe(bound or "twilio-clip", "clip_silenced", reason, requested if requested in lane.clips else "silence")
+                except Exception:
+                    pass  # Even a diagnostic failure must return silent media.
             return silent_announcement()
 
     @app.get("/api/twilio/readiness")
@@ -723,7 +743,10 @@ def install_twilio(app, settings):
         return {"enabled": True, "prototype": True, "started": lane.started,
                 "observed_proof_paths": lane.observed_proof_paths,
                 "sip_header_path_configured": bool(config.sip_headers_path),
-                "clip_sha256": lane.wav_sha, "listening_enabled": config.listening}
+                "clip_sha256": lane.wav_sha, "listening_enabled": config.listening,
+                "automatic_opening_recovery": False, "media_health_mode": "observe_only",
+                "clip_refusal_alert": lane.clip_refusal_alert, "clip_refusals": dict(lane.clip_refusals),
+                "clip_fetch_window": len(lane.clip_outcomes), "clip_silenced_window": sum(lane.clip_outcomes)}
 
     @app.get("/twilio/tester/fixture.wav")
     async def test_fixture(request: Request):
