@@ -48,6 +48,13 @@ TIMING_CAPACITY = 256
 EOF_DRAIN_SECONDS = 0.05
 EOF_DRAIN_BYTES = 16 * 1024
 ACK_DELAY_SECONDS = 0.55
+SERIAL_TOOL_POLICY = ("\nThis phone transport requires sequential actions: return at most ONE function call per response. "
+    "For multiple requests, choose the next action, wait for its verified result, then handle the remaining request. "
+    "Never combine an advisor request with an intake or booking command in one response.")
+SERIAL_TOOL_RETRY = ("\nYour private candidate contained several function calls. NONE of that candidate's commands "
+    "were issued or executed. Regenerate exactly ONE next function call, or a concise clarification. "
+    "Do not claim that any of those actions succeeded.")
+SERIAL_TOOL_CLARIFICATION = "Let's take those one at a time. Which request would you like me to handle first?"
 
 
 class RequestTiming:
@@ -1192,6 +1199,8 @@ class GeminiGateway:
                                                **({"allow_end_call":True} if closing_enabled(config) else {}))
             selected_model = MODEL
             if self.waiting_cue_assistant and call.get("assistantId") == self.waiting_cue_assistant:
+                diagnostic_context["serial_tools"] = True
+                upstream["messages"][0]["content"] += SERIAL_TOOL_POLICY
                 selected_model = config.get("SERVICEVOICE_TWILIO_MODEL", MODEL)
                 if selected_model not in UPSTREAM_MODELS:
                     raise GatewayError("candidate_model_not_allowed", 503)
@@ -1335,9 +1344,25 @@ class GeminiGateway:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher
+        async def retry_single():
+            retry = deepcopy(upstream)
+            retry["messages"][0]["content"] += SERIAL_TOOL_RETRY
+            retry_request = self.client.build_request("POST", GOOGLE_URL, json=retry, headers={"Authorization": "Bearer " + key})
+            retry_request.extensions["trace"] = timing.transport_event
+            fresh = await self.client.send(retry_request, stream=True)
+            timing.generation.response = fresh
+            try:
+                self._checkpoint(timing)
+                if fresh.status_code != 200 or "text/event-stream" not in fresh.headers.get("content-type", ""):
+                    raise GatewayError("upstream_unavailable", 502)
+                return fresh
+            except BaseException:
+                await fresh.aclose()
+                raise
         return OwnedStream(self._relay(request, response, sid, call_id, started, timing,
                                        issuance_context=user_context(upstream["messages"]),
-                                       allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[]))),
+                                       allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[])),
+                                       serial_tools=timing.diagnostic_context.get("serial_tools", False), retry_single=retry_single),
                            lambda: self._cleanup(response, call_id, timing))
 
     def _backchannel_context(self,sid,call_id):
@@ -1698,7 +1723,8 @@ class GeminiGateway:
         finally:
             self._phase(timing,False)
 
-    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None, allow_end_call=False):
+    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None, allow_end_call=False,
+                     serial_tools=False, retry_single=None, owns_generation=True):
         timing = timing or RequestTiming(call_id, started, self.timings)
         transport = {"iterator": response.aiter_bytes(), "buffer_bytes": 0, "received_bytes": 0}
         assembler = ToolAssembler(self.limits,allow_end_call=allow_end_call)
@@ -1731,6 +1757,36 @@ class GeminiGateway:
                         if time.monotonic() - started >= self.limits.total_seconds:
                             raise TimeoutError()
                         self._checkpoint(timing)
+                        if serial_tools and pending_calls and len(pending_calls) > 1:
+                            # Nothing from this candidate has crossed the tool
+                            # boundary. Replan, never trim or forge a signed group.
+                            if retry_single is not None:
+                                prior_usage = dict(timing.row["usage"])
+                                timing.row["usage"] = {key: None for key in prior_usage}
+                                timing.row["counts"]["serial_tool_replans"] = 1
+                                await response.aclose()
+                                try:
+                                    fresh = await retry_single()
+                                    watch_stop.set(); watcher.cancel()
+                                    with suppress(asyncio.CancelledError):await watcher
+                                    async for part in self._relay(request, fresh, sid, call_id, started, timing,
+                                            issuance_context=issuance_context, allow_end_call=allow_end_call,
+                                            serial_tools=True, owns_generation=False):
+                                        yield part
+                                finally:
+                                    for key, value in prior_usage.items():
+                                        if value is not None:
+                                            timing.row["usage"][key] = value+(timing.row["usage"].get(key) or 0)
+                                return
+                            # A model that ignores the serial rule must not end
+                            # the phone call or authorize part of a hidden batch.
+                            pending_calls = None
+                            text_parts = [SERIAL_TOOL_CLARIFICATION]
+                            text_bytes = len(SERIAL_TOOL_CLARIFICATION.encode())
+                            finish_reason = "stop"
+                            timing.row["counts"]["serial_tool_clarifications"] = 1
+                            timing.row["output_text_source"] = "application_clarification"
+                            timing.row["output_text_sha256"] = hashlib.sha256(SERIAL_TOOL_CLARIFICATION.encode()).hexdigest()
                         if pending_calls:
                             if pending_calls[0]["function"]["name"]==END_CALL:
                                 if not await run_in_threadpool(self.store.end_call_ready,sid):
@@ -1845,7 +1901,10 @@ class GeminiGateway:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher
-            await self._cleanup(response, call_id, timing)
+            if owns_generation:
+                await self._cleanup(response, call_id, timing)
+            else:
+                await response.aclose()
 
 
 class OwnedStream(StreamingResponse):

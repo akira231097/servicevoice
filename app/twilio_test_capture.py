@@ -22,6 +22,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from .twilio_bridge import BridgeError, sid, verify_signature
 
 CAPTURE_PATH = "/twilio/tester/media"
+MAX_CAPTURE_SECONDS = 240  # Owned self-call evidence, never ordinary callers.
 
 
 def capture_proof(secret, nonce, expires):
@@ -58,15 +59,15 @@ class Capture:
         media=message["media"];track=media["track"]
         if track not in self.audio:raise ValueError("wrong_track")
         chunk=int(media["chunk"]);stamp=int(media["timestamp"])
-        if not self.chunks[track]<chunk<=12000 or not 0<=stamp<=90000:raise ValueError("media_bounds")
+        if not self.chunks[track]<chunk<=MAX_CAPTURE_SECONDS*100 or not 0<=stamp<=MAX_CAPTURE_SECONDS*1000:raise ValueError("media_bounds")
         raw=base64.b64decode(media["payload"],validate=True)
-        if not 1<=len(raw)<=1600 or len(self.packets)>=10000:raise ValueError("packet_bounds")
+        if not 1<=len(raw)<=1600 or len(self.packets)>=MAX_CAPTURE_SECONDS*100+100:raise ValueError("packet_bounds")
         offset=stamp*8;audio=self.audio[track]
         if offset<len(audio):raise ValueError("overlapping_media")
         if offset>len(audio):
             self.gaps.append({"kind":"track","track":track,"offset":len(audio),"bytes":offset-len(audio)})
             audio.extend(b"\xff"*(offset-len(audio)))
-        if offset+len(raw)>720000:raise ValueError("capture_bounds")
+        if offset+len(raw)>MAX_CAPTURE_SECONDS*8000:raise ValueError("capture_bounds")
         audio.extend(raw);self.chunks[track]=chunk
         self.packets.append({"track":track,"sequence":sequence,"chunk":chunk,"timestamp_ms":stamp,
                              "received_unix":received,"byte_offset":offset,"bytes":len(raw)})
@@ -157,7 +158,7 @@ class TestCaptureRuntime:
                 folder.mkdir(mode=0o700,exist_ok=False) # A capability is single-use across restarts.
                 capture=Capture(call,stream,version)
             phase="media"
-            async with asyncio.timeout(90):
+            async with asyncio.timeout(MAX_CAPTURE_SECONDS):
                 while True:
                     raw=await socket.receive_text()
                     received=time.time()

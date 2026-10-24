@@ -10,7 +10,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app.twilio_bridge import TwilioConfig, signature
-from app.twilio_test_capture import Capture, capture_proof, valid_proof, install_capture
+from app.twilio_test_capture import MAX_CAPTURE_SECONDS, Capture, capture_proof, valid_proof, install_capture
 
 CALL="CA"+"1"*32
 STREAM="MZ"+"2"*32
@@ -41,8 +41,18 @@ def test_media_bounds(change):
     if change=="track":value["media"]["track"]="unknown"
     if change=="overlap":value["media"]["timestamp"]="0"
     if change=="size":value["media"]["payload"]=base64.b64encode(b"x"*1601).decode()
-    if change=="timestamp":value["media"]["timestamp"]="90001"
+    if change=="timestamp":value["media"]["timestamp"]=str(MAX_CAPTURE_SECONDS*1000+1)
     with pytest.raises(ValueError):c.media(value,2.)
+
+
+def test_owned_capture_keeps_audio_after_three_minutes_but_remains_bounded():
+    c=Capture(CALL,STREAM);c.media(packet(),1.)
+    c.media(packet(3,chunk=2,stamp=181000),182.)
+    assert c.audio["inbound"][181000*8:181000*8+160]==b"\x7f"*160
+    c.media(packet(4,chunk=3,stamp=MAX_CAPTURE_SECONDS*1000-20),240.)
+    assert len(c.audio["inbound"])==MAX_CAPTURE_SECONDS*8000
+    with pytest.raises(ValueError):
+        c.media(packet(5,chunk=4,stamp=MAX_CAPTURE_SECONDS*1000),241.)
 
 
 def test_capture_proof_expiry_and_scope():

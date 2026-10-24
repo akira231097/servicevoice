@@ -18,7 +18,7 @@ SAFE = dict(stage="service", active_confirmation=False, has_pending_proposal=Fal
     "injured", "bleeding", "ignore", "system prompt", "developer", "password", "secret", "token", "api key",
     "instructions", "my name", "my address", "phone number", "mobile number", "email", "credit card",
     "debit card", "account number", "social security", "passcode", "verification code", "payment details",
-    "1234567890", "someone@example.test", "123 Main Street", "can you help?", "speak in Spanish", "espaÃ±ol"])
+    "1234567890", "someone@example.test", "123 Main Street", "speak in Spanish", "espaÃ±ol"])
 def test_sensitive_partial_never_reaches_classifier(content):
     assert listening_gate(TEXT+" "+content, "Tell me about the vehicle.", SAFE) != "eligible"
 

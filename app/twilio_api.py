@@ -19,7 +19,7 @@ from collections import Counter, deque
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .listening_cues import CueNotSent, ListeningCoordinator, ListeningPolicy, listening_gate, neutral_listening_only, LISTENING_PHRASES
+from .listening_cues import CueNotSent, ListeningCoordinator, ListeningPolicy, information_question, listening_gate, neutral_listening_only, LISTENING_PHRASES
 from .telephony_ingress import IngressError, IngressConfig, TelephonyIngress
 from .phone_ingress_router import PhoneIngressRouter
 from .twilio_media_health import OpeningMedia
@@ -35,7 +35,7 @@ FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
 CLIP_REFUSALS = frozenset({"recovery_disabled", "clip_unavailable", "invalid_selection", "bridge_unavailable",
     "ticket_missing", "binding_mismatch", "ticket_expired", "speaker_priority", "no_neutral_clip",
-    "clip_internal_error", "lane_unavailable"})
+    "clip_internal_error", "lane_unavailable", "question_finished"})
 
 
 class ClipRefusal(Exception):
@@ -690,6 +690,8 @@ def install_twilio(app, settings):
             raise ClipRefusal("ticket_expired")
         if state.closed or state.assistant or state.answer_ready:
             raise ClipRefusal("speaker_priority")
+        if not state.caller and information_question(state.text):
+            raise ClipRefusal("question_finished")
         # A caller may begin a pause during the short provider fetch interval.
         # Keep approved attention, but replace an agreement-sounding token with
         # a closed neutral clip rather than reject ordinary speaker-state churn.

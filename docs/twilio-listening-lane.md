@@ -6,6 +6,33 @@ the main Vapi number, assistant and production services remain unchanged. Live
 listening acceptance is outstanding. This is not yet a verified simulated
 full-duplex release.
 
+## October 24 handset regression repairs
+
+The later handset call ended with `pipeline-error-custom-llm-llm-failed`, not a
+three-minute duration limit. The model issued a signed two-tool group, while
+Vapi returned only its first command/result. The gateway rejected that incomplete
+history. The isolated assistant now requests one action per generation. If the
+model still produces a batch, the entire unissued candidate is discarded and
+privately regenerated once. A second batch becomes a clarification with no tool
+issuance. Signatures, observed-result checks and booking requirements stay strict;
+other assistants retain their existing complete-group behavior. Retry usage and
+outcomes remain observable, and cancellation releases the generation's slot.
+
+Long informational questions about services, diagnostic coverage and billing may
+receive neutral listening sounds while the caller speaks. A narrowly recognized
+hypothetical on-site cancellation-policy question is distinct from an actual
+cancellation command. Jev still excludes actual action approvals/corrections,
+private details and sensitive task state. Questions use only the neutral
+Mm-hmm/Uh-huh recordings; their listening opportunity ends at caller stop. They
+do not receive an agreement, a diagnosis or a claim that work has started.
+
+Current listening spacing varies by pause opportunity; caps remain 64 classifier
+decisions and 36 cues per call. Those caps were not exhausted in the failed call.
+Owned synthetic capture can now retain four minutes of evidence; ordinary caller
+capture permissions and phone duration limits are unchanged. The earlier samples
+and timing rules below describe the initial October 23 implementation, not current
+acceptance evidence. Live results for these repairs must be recorded separately.
+
 The separate Twilio line puts the caller and a dedicated Vapi SIP assistant in
 one conference. Jev classifies live partial transcripts; code may request a
 caller-only participant announcement from the approved “Mm-hmm.” / “I hear you.” bank.

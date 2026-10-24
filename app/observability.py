@@ -540,7 +540,8 @@ _TIMING_MILESTONES = frozenset({"preflight", "upstream_headers", "first_upstream
 _TIMING_DURATIONS = frozenset({"tool_signature_persist", "upstream_eof_drain", "jev_route",
                               "jev_classification", "validated_text_hold"})
 _TIMING_COUNTS = frozenset({"history_messages", "history_tool_results", "upstream_events", "text_chunks",
-                          "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests"})
+                          "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests",
+                          "serial_tool_replans", "serial_tool_clarifications"})
 _TIMING_USAGE = frozenset({"input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"})
 
 
@@ -601,7 +602,7 @@ def safe_timing_row(row):
         value = row.get(key)
         safe[key] = value if type(value) is str and pattern.fullmatch(value) else None
     source = row.get("output_text_source")
-    safe["output_text_source"] = source if type(source) is str and source in {"verified_receipt", "static_faq"} else None
+    safe["output_text_source"] = source if type(source) is str and source in {"verified_receipt", "static_faq", "application_clarification"} else None
     safe["jev_model"] = row.get("jev_model") if row.get("jev_model") == "jev-1.13.0" else None
     for key in ("jev_probability", "jev_margin", "jev_language_probability"):
         value = row.get(key)
