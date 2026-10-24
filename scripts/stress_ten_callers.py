@@ -83,7 +83,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
          'VAPI_ASSISTANT_ID':BROWSER,'VAPI_MODEL_PROFILE':'gemini-3.8-flash-custom',
          'VAPI_WEBHOOK_SECRET':'synthetic-browser-only-'+('b'*32),'GEMINI_API_KEY':'synthetic-not-real',
          'GEMINI_GATEWAY_SECRET':GATEWAY_SECRET,'SERVICEVOICE_RECEIPT_NARRATION':'off',
-         'SERVICEVOICE_JEV_FAQ':'off','SERVICEVOICE_LANGSMITH_ENABLED':'off'}
+         'SERVICEVOICE_JEV_FAQ':'off','SERVICEVOICE_LANGSMITH_ENABLED':'off',
+         'SERVICEVOICE_TIMING_PERSISTENCE':'on'}
     with patch.dict(os.environ,env,clear=True),patch.object(dotenv,'load_dotenv',return_value=False),patch.object(dotenv,'dotenv_values',return_value={}):
         module=importlib.import_module('app.main')
         app=module.create_app(directory/'exercise.sqlite3');public=module.create_public_app(app)
@@ -143,6 +144,13 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                 return response
             admission_messages=[{'type':'assistant-request','call':{'id':str(uuid4()),'type':'inboundPhoneCall','orgId':ORG,'phoneNumberId':PHONE}} for _ in range(callers)]
             try:
+                # ASGITransport does not run lifespan. Match the deployed
+                # startup before testing concurrency, including its read-only
+                # WAL anchor; otherwise Windows repeatedly removes/recreates
+                # sidecars between these short-lived database connections.
+                await app.state.startup_resources()
+                progress['gateway_wal_anchor_status']=gateway.wal_anchor_status
+                check(gateway.wal_anchor_status=='ready','Normal gateway startup must establish its WAL anchor')
                 progress['last_phase']='admission'
                 began=time.perf_counter()
                 admissions=await asyncio.gather(*(inbound(value) for value in admission_messages))
@@ -176,8 +184,14 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
 
                 async def tool(index,phase,name,arguments):
                     response=await generation(index,phase,name,arguments)
-                    items=[call for event in parsed_events(response) for call in event.get('choices',[{'delta':{}}])[0]['delta'].get('tool_calls',[])]
-                    check(len(items)==1,'Exactly one signed synthetic command is expected')
+                    events=parsed_events(response)
+                    items=[call for event in events for call in event.get('choices',[{'delta':{}}])[0]['delta'].get('tool_calls',[])]
+                    if len(items)!=1:
+                        failure={'caller':index,'phase':phase,'command_count':len(items),
+                            'error_codes':[e['error'].get('code') for e in events if isinstance(e.get('error'),dict)],
+                            'generation_outcomes':[r['outcome'] for r in gateway.latency_snapshot(calls[index]['id'])]}
+                        progress.setdefault('gateway_failures',[]).append(failure)
+                        raise AssertionError('Exactly one signed synthetic command is expected: '+json.dumps(failure))
                     command=items[0];saved_commands[(index,phase)]=command
                     result=await inbound({'type':'tool-calls','call':calls[index],'toolCallList':[command]})
                     check(result.status_code==200,'Signed command webhook was rejected')
@@ -254,6 +268,7 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                         'production_default_ingress_deadline_seconds':default_ingress_deadline,
                         'exercise_scope':progress['exercise_scope'],
                         'admission_event_retries':0,
+                        'gateway_wal_anchor_status':progress['gateway_wal_anchor_status'],
                         'terminal_event_attempt_statuses':terminal_attempts}
             finally:
                 await app.state.shutdown_resources()
