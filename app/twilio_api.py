@@ -304,15 +304,19 @@ class TwilioLane:
         if state is None or state.session_id != session_id:
             return
         state.answer_ready = True
+        state.answer_ready_at = self.coordinator.wall()
         state.clip_pending_until = 0
         # Invalidate requests not fetched yet. A fetched announcement cannot be
         # cancelled by REST, so wait only for its bounded expected audio end.
         for ticket, item in list(self.announcements.items()):
             if item["call_id"] == call_id:
                 self.announcements.pop(ticket, None)
-        remaining = state.clip_until-self.coordinator.clock()
-        if remaining > 0:
-            await asyncio.sleep(min(remaining, 2))
+        deadline = time.perf_counter()+2
+        while state.clip_until > self.coordinator.clock() and time.perf_counter() < deadline:
+            # asyncio timers may wake one clock tick early on Windows. Recheck
+            # the condition instead of treating a sleep as playback completion.
+            remaining = min(state.clip_until-self.coordinator.clock(), deadline-time.perf_counter())
+            await asyncio.sleep(max(.016, remaining))
 
     def waiting_status(self, call_id, session_id):
         binding = self.bindings.get(call_id)

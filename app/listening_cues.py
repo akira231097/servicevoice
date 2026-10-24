@@ -207,6 +207,7 @@ class ListeningState:
     clip_until: float = -math.inf
     clip_pending_until: float = -math.inf
     answer_ready: bool = False
+    answer_ready_at: float = math.inf
     received: float = -math.inf
     text: str = ""
     segment: str = ""
@@ -340,6 +341,11 @@ class ListeningCoordinator:
                 state.partial_event = timestamp
                 if timestamp <= state.final_event:
                     return
+                if state.caller and timestamp > state.answer_ready_at:
+                    # Continued caller content supersedes an answer prepared
+                    # speculatively before these words. Silence cannot clear it.
+                    state.answer_ready = False
+                    state.answer_ready_at = math.inf
                 if not value.startswith(state.segment):
                     self._invalidate(state)
                 state.segment = value

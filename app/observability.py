@@ -588,9 +588,9 @@ def safe_timing_row(row):
         return None
     safe = {"request_id": request_id, "call_key": call_key, "started_at_unix": started,
             "route": row["route"], "outcome": row["outcome"]}
-    if row.get("model") in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}:
+    if isinstance(row.get("model"), str) and row["model"] in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}:
         safe["model"] = row["model"]
-    if row.get("reasoning_effort") in {"low", "minimal"}:
+    if isinstance(row.get("reasoning_effort"), str) and row["reasoning_effort"] in {"low", "minimal"}:
         safe["reasoning_effort"] = row["reasoning_effort"]
     for key in ("narration_reason", "jev_reason", "eof_drain_outcome"):
         safe[key] = safe_timing_decision_code(row.get(key))

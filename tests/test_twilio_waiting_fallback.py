@@ -74,6 +74,20 @@ def test_partial_cue_prefix_is_not_a_substantive_answer():
     assert substantive_assistant_text("One moment. We can inspect that.")
 
 
+def test_continued_partial_releases_discarded_speculative_answer_gate():
+    async def run():
+        c, clock, _, sent, _, event, _ = setup()
+        state=c.calls["fixture-call"]
+        state.answer_ready=True;state.answer_ready_at=clock.wall()
+        clock.now+=.1
+        assert state.answer_ready  # time/quiet alone cannot release the gate
+        event("transcript","user",transcriptType="partial",transcript=TEXT)
+        await drain(c)
+        assert not state.answer_ready and sent
+        await c.close()
+    asyncio.run(run())
+
+
 def test_current_clause_releases_ordinary_words_but_keeps_real_vetoes():
     for text in ("The brakes squeal really loudly when I stop", "Actually my car rattles in the morning",
             "Can you help? My engine rattles loudly every morning when I start the car.",
