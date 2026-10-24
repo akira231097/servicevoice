@@ -27,6 +27,7 @@ from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evide
     canonical, check, latency, missing_snapshot, read_snapshot, read_timings, readonly)
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
 from .generation_observability import project_gateway_timings
+from .conversation_metrics import reply_lengths
 from .provider_logs import capture_provider_log_sync, safe_provider_capture, validate_trusted_hosts
 from .diagnostics import (REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage,
     turn_identifier, operation_identifier)
@@ -605,6 +606,7 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
         "diagnostics":diagnostics,
         "gateway_generations":gateway_generations,
         "call_summary":call_summary,
+        "reply_length":reply_lengths(package["evidence"]),
         "latency_targets_ms":{"turn_average":config.latency_target_ms,"turn_p95":config.latency_target_ms*1.5,"server_answer_p95":answer_target},
         "evidence_index":index,
         "booking":{"scheduler_evidence_available":state["scheduler_evidence_available"],

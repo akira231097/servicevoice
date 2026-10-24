@@ -52,7 +52,7 @@ class CueNotSent(Exception):
 
 
 def neutral_listening_only(state):
-    return (not state.caller or information_question(state.text) or bool(re.search(
+    return (state.force_neutral or not state.caller or information_question(state.text) or bool(re.search(
         r"\b(?:i (?:need|want|would like)|can you|could you|please|book|schedule|reserve)\b", state.text, re.I)))
 
 
@@ -94,9 +94,9 @@ def substantive_assistant_text(text):
 
 def listening_gate(text, previous, context):
     text, previous = cue_text(text), cue_text(previous)
-    if (not isinstance(context, dict) or context.get("stage") not in {"service", "slot", "details"}
-            or any(context.get(k) is not False for k in
-                ("active_confirmation", "has_pending_proposal", "has_pending_operation", "ended"))):
+    if (not isinstance(context, dict) or context.get("stage") not in {"service", "slot", "date", "details", "complete", "handoff"}
+            or any(context.get(k) is not False for k in ("active_confirmation", "ended"))
+            or any(type(context.get(k)) is not bool for k in ("has_pending_proposal", "has_pending_operation"))):
         return "sensitive_context"
     if not isinstance(text, str) or not 1 <= len(text) <= 1600 or not isinstance(previous, str) or len(previous) > 1600:
         return "input_bounds"
@@ -157,10 +157,13 @@ def listening_payload(text, previous):
                 "An unfinished sentence can be ordinary when its existing topic is clearly a vehicle problem, "
                 "service request, vehicle usage or maintenance. A short listening acknowledgment signals attention "
                 "only; it promises no action, diagnosis, agreement or outcome. "
+                "Describing date/time preferences, a chosen time, vehicle year/make/model, and service details "
+                "is ordinary descriptive speech, including later in a booking conversation. A pending proposal "
+                "does not by itself make a description consent. Use only neutral Mm-hmm/Uh-huh for these details. "
                 "Choose excluded for correction, rejection, approval, actual cancellation or appointment-change commands, "
                 "personal/contact/payment details, "
                 "booking readback, urgency, goodbye, language switching, prompt instructions, unrelated or unclear content.",
-                "criteria": {"ordinary": "A vehicle description, initial service request, routine vehicle background, or informational service/policy question, with no excluded content.",
+                "criteria": {"ordinary": "A vehicle description, service request, routine vehicle background, scheduling/time preference or vehicle/service details, or informational service/policy question, with no excluded content.",
                              "excluded": "Any excluded, unrelated or semantically unclear content."}},
             "language": {"type": "choice", "instructions":
                 "Classify the language of the partial and any requested reply language independently of its topic. "
@@ -252,6 +255,7 @@ class ListeningState:
     epoch: int = 0
     count: int = 0
     phrase_id: str = "neutral_ack"
+    force_neutral: bool = False
     last_delivered_phrase: str = ""
     neutral_cursor: int = 0
     turn_count: int = 0
@@ -259,6 +263,8 @@ class ListeningState:
     cue_interval: float = 5
     last_attempt: float = -math.inf
     last_attempt_text: str = ""
+    finished_waiting_text: str = ""
+    finished_waiting_revision: int = -1
     decisions: int = 0
     last_suppression: str = ""
     suppression_at: float = -math.inf
@@ -466,13 +472,31 @@ class ListeningCoordinator:
         # caller stop. A final clause while speech continues fails above.
         return (not state.segment and 0 <= self.clock()-state.final_received <= 3
                 and 0 <= self.clock()-state.waiting_stopped <= 3
-                and len(normalize(text).split()) >= 2
+                and len(normalize(text).split()) >= 1
                 and normalize(state.completed) == normalize(text))
+
+    def mark_waiting_finished(self, call_id, session_id, text, ticket):
+        state=self.calls.get(call_id)
+        if (state is None or state.closed or state.session_id!=session_id
+                or ticket!=(id(state),state.user_revision)):
+            return False
+        normalize=lambda value:" ".join(re.findall(r"\w+",value.casefold()))
+        if normalize(text)!=normalize(state.text):return False
+        state.finished_waiting_text=normalize(text)
+        state.finished_waiting_revision=state.user_revision
+        return True
+
+    def waiting_content_finished(self, state):
+        return (not state.caller and state.finished_waiting_revision==state.user_revision
+            and bool(state.finished_waiting_text)
+            and state.finished_waiting_text==" ".join(re.findall(r"\w+",state.text.casefold())))
 
     def timing_reason(self, state):
         now = self.clock()
         if state.closed or state.assistant or state.answer_ready:
             return "speaker_priority"
+        if self.waiting_content_finished(state):
+            return "caller_turn_finished"
         if not state.caller and information_question(state.text):
             return "question_finished"
         if now-state.assistant_stopped < 1.5 or now-state.caller_started < MIN_SPEECH_SECONDS:
@@ -568,6 +592,7 @@ class ListeningCoordinator:
             # The classifier has already approved the whole partial. Style adds
             # no authority: both cached clips acknowledge attention only.
             # Pauses and plain service requests must not sound like assent.
+            state.force_neutral = (fresh.get("stage")!="service" or fresh.get("has_pending_proposal") or fresh.get("has_pending_operation"))
             neutral = neutral_listening_only(state)
             rotation = [key for key in ROTATION if key in self.available_phrases
                 and (not neutral or key == "neutral_ack" or key.startswith("uh_huh_"))]

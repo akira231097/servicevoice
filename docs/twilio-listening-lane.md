@@ -23,6 +23,34 @@ offline-tested limits, not a four-caller live audio performance claim.
 
 ## October 24 handset regression repairs
 
+The next conversation-policy candidate separates neutral holds from contextual
+phrases. On the isolated assistant, a completed greeting, short answer, correction,
+contact response or confirmation can receive "One moment", "One sec" or "Just a
+sec". Those sounds confer no business authority. Stop/wait/goodbye, unfinished
+speech, urgency, unrecognized input and meaningful non-English speech remain
+excluded. Contextual lookup phrases retain the stricter content policy. Actual
+caller-stop evidence, the quiet window, primary-answer priority, one hold per
+logical turn and the spaced tool-result follow-up remain in force.
+
+Later vehicle/service/scheduling descriptions can receive neutral listening
+sounds with a pending proposal or operation. Active confirmation answers,
+contact dictation and control/correction phrases remain excluded. A matching
+finished-response classification suppresses a pause acknowledgment so it cannot
+take the waiting cue's place; resumed speech invalidates that match. Fetch refusals
+still return silent HTTP 200. This does not make already-fetched Twilio clips
+instantly cancellable.
+
+An isolated-only delivery instruction targets one idea and about 20 words, with
+complete readbacks, references and option lists taking priority. Automatic reviews
+measure ordinary reply length separately, excluding greetings, approved hold
+prefixes and turns backed by verified readback/options/result tools. This numeric
+score is not a naturalness judgment.
+
+The isolated Vapi assistant's duration was separately raised to 600 seconds;
+Twilio's conference and SIP limits already use 600. Idle-message settings and
+handset/audio results must be read from the deployment evidence, not inferred
+from these policy tests. Main's assistant configuration remains separate.
+
 The later handset call ended with `pipeline-error-custom-llm-llm-failed`, not a
 three-minute duration limit. The model issued a signed two-tool group, while
 Vapi returned only its first command/result. The gateway rejected that incomplete

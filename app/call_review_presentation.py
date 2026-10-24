@@ -100,6 +100,7 @@ CODE_LABELS = {
     "sensitive_context": "sensitive context", "sensitive_utterance": "sensitive wording",
     "sensitive_prior_turn": "sensitive previous turn", "private_detail": "caller gave private details",
     "private_prior_turn": "previous turn had private details", "caller_still_formulating": "caller still formulating",
+    "caller_requested_quiet": "caller asked for quiet or a pause", "caller_turn_finished": "finished response gives priority to the waiting cue",
     "cached_language_unverified": "language not verified for the cached clips", "short_or_ambiguous": "too short or ambiguous",
     "urgent_or_safety": "urgent or safety wording", "classifier_timeout": "classifier timed out",
     "classifier_unavailable": "classifier unavailable", "low_confidence": "classifier not confident",
@@ -1211,7 +1212,11 @@ def feedback_rows(run_id, report):
     details = (report.get("3 Turn-by-turn timeline") or {}).get("details")
     details = [d for d in details if isinstance(d, dict)] if isinstance(details, list) else []
     confidences = [d["asr_confidence"] for d in details if number(d.get("asr_confidence"), 0, 1) is not None]
+    reply_length=report.get("reply_length") or {}
     metrics = [
+        ("metric_reply_words_median", reply_length.get("median_words"), "Median ordinary reply word count; greeting, holds and verified readback/options/result turns excluded."),
+        ("metric_reply_words_max", reply_length.get("maximum_words"), "Longest ordinary reply in words; interrupted replies may be partial."),
+        ("reply_length_within_target", reply_length.get("within_20_words_fraction"), "Fraction of ordinary replies within 20 words. Complete verified readbacks and option lists are exempt; this is not a naturalness score."),
         ("metric_call_seconds", summary.get("duration_seconds"), "Call length in seconds."),
         ("metric_caller_turns", summary.get("caller_utterances"), "Caller utterances in the stored transcript."),
         ("metric_bookings", booking.get("appointment_count"), "Appointments saved on this call."),

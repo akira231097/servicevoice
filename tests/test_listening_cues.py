@@ -37,6 +37,9 @@ def test_normal_description_is_not_a_stop_instruction(text):
 @pytest.mark.parametrize("field", ["active_confirmation", "has_pending_proposal", "has_pending_operation", "ended"])
 @pytest.mark.parametrize("value", [None, True, "false", 0])
 def test_unverified_context_is_silent(field, value):
+    if field in {'has_pending_proposal','has_pending_operation'} and value is True:
+        assert listening_gate(TEXT,"Tell me more.",{**SAFE,field:value})=="eligible"
+        return
     assert listening_gate(TEXT, "Tell me more.", {**SAFE, field: value}) != "eligible"
 
 

@@ -118,6 +118,8 @@ EVENTS |= frozenset({"caller_words_observed", "media_suspected", "media_recovery
     "media_recovery_failed", "media_recovery_redial", "speaker_started", "speaker_stopped"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_energy_without_words", "opening_only", "words_resumed", "caller", "agent"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"fallback_turn_unverified"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_requested_quiet"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_turn_finished"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _FLAGS |= frozenset({"backchannel_guarded_fallback"})

@@ -55,6 +55,10 @@ SERIAL_TOOL_RETRY = ("\nYour private candidate contained several function calls.
     "were issued or executed. Regenerate exactly ONE next function call, or a concise clarification. "
     "Do not claim that any of those actions succeeded.")
 SERIAL_TOOL_CLARIFICATION = "Let's take those one at a time. Which request would you like me to handle first?"
+PHONE_CONVERSATION_POLICY = ("\nPhone delivery: say one idea per turn, normally at most two short sentences and about "
+    "20 words. Ask one question at a time. Do not repeat confirmed details or repeatedly use the caller's name. "
+    "Complete booking readbacks, verified references and a short list of options are exceptions: never omit "
+    "required information for brevity. The separate cue system handles waiting; do not add routine filler.")
 
 
 class RequestTiming:
@@ -802,6 +806,7 @@ class GeminiGateway:
         self.waiting_cue_assistant = None
         self.before_answer = None
         self.waiting_fallback_ready = None
+        self.waiting_content_finished = None
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -1200,7 +1205,7 @@ class GeminiGateway:
             selected_model = MODEL
             if self.waiting_cue_assistant and call.get("assistantId") == self.waiting_cue_assistant:
                 diagnostic_context["serial_tools"] = True
-                upstream["messages"][0]["content"] += SERIAL_TOOL_POLICY
+                upstream["messages"][0]["content"] += SERIAL_TOOL_POLICY + PHONE_CONVERSATION_POLICY
                 selected_model = config.get("SERVICEVOICE_TWILIO_MODEL", MODEL)
                 if selected_model not in UPSTREAM_MODELS:
                     raise GatewayError("candidate_model_not_allowed", 503)
@@ -1472,6 +1477,9 @@ class GeminiGateway:
                 read.add_done_callback(read_done)
                 context,retired=await asyncio.shield(read)
                 self.backchannel_budget.retire_confirmed(retired)
+                if (self.waiting_cue_assistant is not None and scoped_waiting
+                        and config.get("SERVICEVOICE_TWILIO_WAITING_FALLBACK") == "on"):
+                    context={**context,"neutral_waiting":True}
                 return context
         async def prime_answer():
             self._phase(timing,True)
@@ -1486,8 +1494,14 @@ class GeminiGateway:
                 async with asyncio.timeout(.48):
                     selection_context=await read_context()
                     def requested():timing.row["backchannel"]["requests"]+=1
-                    return await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
+                    decision=await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
                         context=selection_context,on_request=requested,native_waiting=True)
+                    if (scoped_waiting and not follow_up and self.waiting_content_finished is not None
+                            and decision.reason=="eligible_classification" and decision.phrase_id in WAITING_PHRASE_IDS):
+                        state,_=waiting_state(policy_messages,selection_context)
+                        if state is not None:
+                            self.waiting_content_finished(call_id,sid,state["utterance"],speaker_ticket)
+                    return decision
             except Exception:
                 return BackchannelDecision(reason="context_unavailable")
         timing.row["backchannel"]={"phrase_id":"silence","reason":"pending","emitted_ms":None,
@@ -1559,7 +1573,7 @@ class GeminiGateway:
                         # A follow-up after a tool result is always a neutral
                         # hold and avoids the phrase the turn already heard.
                         phrase=("one_sec" if fallback else waiting_phrase(decision,state["user_count"],
-                            self.backchannel_budget.previous_phrase(call_id),neutral_only=state["neutral_confirmation"] or follow_up))
+                            self.backchannel_budget.previous_phrase(call_id),neutral_only=state["neutral_confirmation"] or state.get("neutral_only",False) or follow_up))
                         record["phrase_id"]=phrase
                         record["guarded_fallback"]=fallback
                         allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up)

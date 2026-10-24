@@ -36,7 +36,7 @@ FAST_EVENTS = frozenset({"speech-update", "user-interrupted"})
 TERMINAL_CALLS = frozenset({"completed", "canceled", "failed", "busy", "no-answer"})
 CLIP_REFUSALS = frozenset({"recovery_disabled", "clip_unavailable", "invalid_selection", "bridge_unavailable",
     "ticket_missing", "binding_mismatch", "ticket_expired", "speaker_priority", "no_neutral_clip",
-    "clip_internal_error", "lane_unavailable", "question_finished"})
+    "clip_internal_error", "lane_unavailable", "question_finished", "caller_turn_finished"})
 
 
 class ClipRefusal(Exception):
@@ -536,6 +536,7 @@ def install_twilio(app, settings):
             app.state.gemini_gateway.waiting_cue_assistant = lane.phone_identity.assistant_id
             app.state.gemini_gateway.before_answer = lane.before_answer
             app.state.gemini_gateway.waiting_fallback_ready = lane.fallback_ready
+            app.state.gemini_gateway.waiting_content_finished = lane.coordinator.mark_waiting_finished
 
     @app.exception_handler(BridgeError)
     async def bridge_error(request, exc):
@@ -693,6 +694,8 @@ def install_twilio(app, settings):
             raise ClipRefusal("ticket_expired")
         if state.closed or state.assistant or state.answer_ready:
             raise ClipRefusal("speaker_priority")
+        if lane.coordinator.waiting_content_finished(state):
+            raise ClipRefusal("caller_turn_finished")
         if not state.caller and information_question(state.text):
             raise ClipRefusal("question_finished")
         # A caller may begin a pause during the short provider fetch interval.
