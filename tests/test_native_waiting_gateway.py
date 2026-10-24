@@ -16,13 +16,14 @@ from test_native_waiting_policy import CONFIRM, READBACK, SAFE, answer
 from test_pretool_speech_gate import issued, speech
 
 
+@pytest.mark.parametrize("first_malformed",[False,True])
 @pytest.mark.parametrize("text,prior,kind,expected", [
     ("Jamie", "May I have your name?", "ordinary_detail", "One moment."),
     ("My name is Jamie", "May I have your name?", "ordinary_detail", "One moment."),
     ("What services do you offer?", "How can I help?", "information_question", "Let me check that."),
     ("Actually the vehicle is a 2016 sedan.", "Which vehicle?", "factual_correction", "One moment."),
 ])
-def test_real_native_policy_releases_context_appropriate_cached_text_in_owned_stream(tmp_path, monkeypatch, text, prior, kind, expected):
+def test_real_native_policy_releases_context_appropriate_cached_text_in_owned_stream(tmp_path, monkeypatch, text, prior, kind, expected, first_malformed):
     async def scenario():
         release, offered = asyncio.Event(), asyncio.Event()
         class Delayed(httpx.AsyncByteStream):
@@ -31,7 +32,12 @@ def test_real_native_policy_releases_context_appropriate_cached_text_in_owned_st
                 yield frame({"content": "Exact primary answer."}); yield frame(reason="stop"); yield DONE
         app, gateway, _ = setup(tmp_path, lambda r: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Delayed()))
         enable(gateway, monkeypatch)
-        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=answer(kind))))
+        requests=[]
+        def classify(request):
+            requests.append(request)
+            return httpx.Response(200,json={"model":answer(kind)["model"],"answers":{}}
+                                  if first_malformed and len(requests)==1 else answer(kind))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(classify))
         gateway.backchannel_policy = BackchannelPolicy(client=client)
         body = request_body(); body["messages"] = [{"role": "assistant", "content": prior}, {"role": "user", "content": text}]
         task = asyncio.create_task(observed_post(app, body, lambda part: offered.set() if b"<flush />" in part else None))
@@ -39,9 +45,10 @@ def test_real_native_policy_releases_context_appropriate_cached_text_in_owned_st
             await asyncio.wait_for(offered.wait(), 3)
             assert not task.done()
             release.set(); result = await asyncio.wait_for(task, 2)
-            assert speech(result.text) == expected + " <flush /> Exact primary answer."
+            assert speech(result.text) == expected + " <flush />Exact primary answer."
             timing = gateway.latency_snapshot("call-a")[-1]["backchannel"]
             assert timing["content_kind"] == kind and timing["reason"] == "emitted"
+            assert timing["requests"]==len(requests)==1+int(first_malformed)
             assert timing["emitted_ms"] is not None and timing["audible_playback"] == "unverified"
         finally:
             release.set(); await asyncio.gather(task, return_exceptions=True)
@@ -166,7 +173,7 @@ def test_book_it_hold_cannot_publish_tool_prose_or_change_signed_authority(tmp_p
         task = asyncio.create_task(observed_post(app, body, lambda part: cue.set() if b"<flush />" in part else None))
         try:
             await asyncio.wait_for(cue.wait(), 3); release.set(); result = await asyncio.wait_for(task, 2)
-            assert speech(result.text) == "One moment. <flush /> "
+            assert speech(result.text) == "One moment. <flush />"
             assert "UNVERIFIED" not in result.text and "Let me check" not in result.text
             tools = issued(result.text)
             assert len(tools) == 1 and tools[0]["function"] == {"name": "get_appointment", "arguments": "{}"}
@@ -216,7 +223,7 @@ def test_signed_tool_followup_reuses_only_caller_context_and_same_turn_budget(tm
             pending = asyncio.create_task(observed_post(app, body, lambda part: cue.set() if b"<flush />" in part else None))
             await asyncio.wait_for((suppressed if cue_before_tool else cue).wait(), 3)
             second_release.set(); result = await asyncio.wait_for(pending, 2)
-            assert speech(result.text) == ("" if cue_before_tool else "One moment. <flush /> ")+"Exact primary answer."
+            assert speech(result.text) == ("" if cue_before_tool else "One moment. <flush />")+"Exact primary answer."
             assert classified and classified[-1][-1]["content"] == "Find my appointment"
             assert "PRIVATE_RECEIPT" in json.dumps(calls[-1]["messages"])
             assert len(calls) == 2

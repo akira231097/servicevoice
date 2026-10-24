@@ -109,7 +109,8 @@ def blocked_tool_stream(release):
     return Blocked()
 
 
-def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_result_is_answered(tmp_path, monkeypatch):
+@pytest.mark.parametrize('isolated', [False, True])
+def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_result_is_answered(tmp_path, monkeypatch, isolated):
     async def scenario():
         tool_release, answer_release, cue = asyncio.Event(), asyncio.Event(), asyncio.Event()
         count = 0
@@ -122,6 +123,13 @@ def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_resu
         app, gateway, _ = setup(tmp_path, handler)
         enable(gateway, monkeypatch)
         clock = clocked_budget(gateway)
+        if isolated:
+            from app.listening_cues import ListeningCoordinator
+            coordinator=ListeningCoordinator(None, '', None, None, lambda *args: None, clock=lambda:clock[0])
+            coordinator.register('call-a','sid-a')
+            state=coordinator.calls['call-a'];state.assistant=False;state.waiting_stopped=clock[0]-1
+            gateway.waiting_cue_state=coordinator.waiting_status
+            gateway.waiting_cue_commit=coordinator.commit_waiting
         gateway.diagnostics = Diagnostics()
         pending = None
         try:
@@ -137,7 +145,7 @@ def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_resu
             pending = asyncio.create_task(observed_post(app, continuation(), cue_observer(cue)))
             await asyncio.wait_for(cue.wait(), 3); answer_release.set()
             result = await asyncio.wait_for(pending, 3)
-            assert speech(result.text) == PHRASES["one_sec"] + " <flush /> Exact primary answer."
+            assert speech(result.text) == PHRASES["one_sec"] + " <flush />Exact primary answer."
             second = gateway.latency_snapshot("call-a")[-1]
             assert second["backchannel"]["reason"] == "emitted" and second["backchannel"]["follow_up"] is True
             assert second["backchannel"]["phrase_id"] == "one_sec" and "refunded" not in second["backchannel"]
@@ -146,6 +154,10 @@ def test_lookup_turn_receives_a_spaced_neutral_follow_up_cue_while_its_tool_resu
             assert [event[3]["backchannel_phrase"] for event in emitted] == ["moment", "one_sec"]
             assert gateway.backchannel_budget.calls["call-a"][0] == 1 and gateway.backchannel_budget.calls["call-a"][4] == 1
             assert count == 2 and not gateway.active and not gateway.owners
+            if isolated:
+                assert state.waiting_count==2
+                clock[0]+=3
+                assert coordinator.waiting_status('call-a','sid-a',True)[1]=='turn_already_acknowledged'
         finally:
             tool_release.set(); answer_release.set()
             if pending is not None:await asyncio.gather(pending, return_exceptions=True)

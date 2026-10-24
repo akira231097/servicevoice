@@ -6,6 +6,21 @@ import json
 import httpx
 import pytest
 
+
+@pytest.mark.parametrize("text", ["So do.", "Do you.", "The engine makes a noise. And. I.",
+    "The brakes make a noise. So.", "My vehicle is making a noise...", "I need a brake inspection and--"])
+def test_unfinished_asr_clauses_are_not_post_turn_waiting_cues(text):
+    from app.backchannel_policy import waiting_state
+    state, reason = waiting_state([{"role":"user", "content":text}])
+    assert state is None and reason == "caller_still_formulating"
+
+
+@pytest.mark.parametrize("text", ["What can I do?", "What can you do for me?", "My name is Jordan."])
+def test_complete_requests_and_short_details_remain_waiting_eligible(text):
+    from app.backchannel_policy import waiting_state
+    state, reason = waiting_state([{"role":"user", "content":text}])
+    assert state is not None and reason == "eligible"
+
 from app.backchannel_budget import BackchannelBudget
 from app.backchannel_catalog import PHRASES
 from app.backchannel_policy import (BackchannelDecision, BackchannelPolicy, CONTENT_LABELS,
@@ -23,9 +38,65 @@ def messages(text, prior="How can I help?"):
     return [{"role": "assistant", "content": prior}, {"role": "user", "content": text}]
 
 
+@pytest.mark.parametrize("text", ["Are there any other—uh. Availabilities?", "Yeah, I have October—27 in mind.",
+    "I’m looking for an oil change… next week."])
+def test_asr_typography_is_not_a_language_veto(text):
+    state,reason=waiting_state(messages(text),SAFE)
+    assert reason=="eligible" and state["utterance"].isascii()
+    assert messages(text)[-1]["content"]==text  # Main conversation stays verbatim.
+
+
+@pytest.mark.parametrize("text", ["Sí, necesito ayuda.", "నా కారు", "Car\u200b service", "Ａppointment please"])
+def test_typography_normalization_does_not_transliterate_or_hide_unicode(text):
+    assert waiting_state(messages(text),SAFE)[1]=="cached_language_unverified"
+
+
 def answer(kind="information_question"):
     return {"model": JEV_MODEL, "answers": {"acknowledgment": choice("ordinary_content", WAITING_LABELS),
         "delivery_language": choice("cache_compatible", LANGUAGE_LABELS), "content_kind": choice(kind, CONTENT_LABELS)}}
+
+
+def test_invalid_waiting_response_gets_one_retry_with_existing_semantic_checks():
+    async def run():
+        seen=[]
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200,json={"model":JEV_MODEL,"answers":{}} if len(seen)==1 else answer())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            observed=[]
+            result=await BackchannelPolicy(client=client).choose(messages("What services do you offer?"),"fixture",
+                context=SAFE,native_waiting=True,on_request=lambda:observed.append(True))
+            assert result.phrase_id=="moment" and result.requests==len(observed)==len(seen)==2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("veto",["excluded","language"])
+def test_valid_veto_is_never_resampled(veto):
+    async def run():
+        seen=[];value=answer()
+        if veto=="excluded":value["answers"]["acknowledgment"]=choice("excluded_content",WAITING_LABELS)
+        else:value["answers"]["delivery_language"]=choice("not_compatible",LANGUAGE_LABELS)
+        def handler(request):seen.append(request);return httpx.Response(200,json=value)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result=await BackchannelPolicy(client=client).choose(messages("What services do you offer?"),"fixture",context=SAFE,native_waiting=True)
+            assert result.phrase_id=="silence" and result.requests==len(seen)==1
+    asyncio.run(run())
+
+
+def test_invalid_retry_shares_original_deadline_and_releases_capacity():
+    async def run():
+        seen=[];cancelled=asyncio.Event()
+        async def handler(request):
+            seen.append(request)
+            if len(seen)==1:return httpx.Response(200,json={"model":JEV_MODEL,"answers":{}})
+            try:await asyncio.Event().wait()
+            finally:cancelled.set()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            policy=BackchannelPolicy(client=client,timeout_seconds=.05)
+            result=await asyncio.wait_for(policy.choose(messages("What services do you offer?"),"fixture",context=SAFE,native_waiting=True),.5)
+            assert result.reason=="classification_deadline" and result.requests==len(seen)==2
+            assert cancelled.is_set() and policy.active==0
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("text,prior,kind", [

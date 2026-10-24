@@ -104,6 +104,7 @@ class TelephonyIngress:
         self.limits = limits or IngressLimits()
         self.clock, self.monotonic = clock, monotonic
         self.live_admission=live_admission
+        self.admission_guard = None  # Optional isolated SIP proof, after provider identity validation.
         self._workers = threading.BoundedSemaphore(self.limits.workers)
         # Short admission/end writes queue inside the existing deadline instead
         # of ten connections competing through SQLite's 100 ms busy timeout.
@@ -248,6 +249,8 @@ class TelephonyIngress:
         call_id = self._identity(call, message.get("assistant"), assistant_required=False)
         if call.get("status") == "ended" or call.get("endedAt") is not None:
             raise IngressError("telephony_call_ended", 409)
+        if self.admission_guard is not None:
+            self.admission_guard(message)
         # Exact retries are reads. Reuse the original budget across both the
         # read fast path and a possible new atomic admission transaction.
         if deadline is None:deadline=self.monotonic()+self.limits.deadline_seconds
@@ -306,6 +309,19 @@ class TelephonyIngress:
                 raise IngressError("telephony_metadata_mismatch", 403)
             self._live(binding, session, allow_ended=allow_ended)
             return session["id"]
+
+    def end_bridge_binding(self, call_id, session_id):
+        """Internal bridge ownership closes local tools even if the Vapi end webhook is lost.
+
+        No HTTP route exposes this operation. The isolated bridge supplies its
+        persisted call/session pair; neither a caller number nor a payload grants it.
+        """
+        with self._transaction(None) as (db, _):
+            binding, session = self._binding(db, call_id)
+            if session["id"] != session_id:
+                raise IngressError("telephony_binding_conflict", 409)
+            db.execute("UPDATE telephony_bindings SET ended=COALESCE(ended,?) WHERE provider_call_id=?", (self.clock(),call_id))
+            db.execute("UPDATE sessions SET ended=1 WHERE id=? AND tenant=?", (session_id,TENANT))
 
     def end(self, message, authorization, *, deadline=None, abandoned=None):
         self.authenticate(authorization)

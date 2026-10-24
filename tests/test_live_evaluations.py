@@ -393,7 +393,8 @@ def test_hundreds_of_component_children_use_bounded_official_batches_and_two_tra
         assert sink.record('tts','tts.request_started','started',call_id=call['id'],request_id=request,start_unix=start+10+index*.01,duration_ms=0)
         assert sink.record('tts','tts.completed','success',call_id=call['id'],request_id=request,start_unix=start+10+index*.01,duration_ms=5,
             attributes={'cache_hit':index%2==0,'input_characters':12})
-    assert sink.close()
+    # Batch-export correctness needs complete input, not a disk-speed benchmark.
+    assert sink.close(timeout_seconds=10)
     worker,mock,_=worker_fixture(tmp_path,scenario)
     assert worker.tick() and worker.outbox.status()['jobs']=={'complete':1}
     # One speech-synthesis group and 176 synthesis rows; the untimed caller turns stay in the root.
@@ -777,7 +778,7 @@ def test_worker_exports_only_call_scoped_diagnostic_breadcrumbs_and_keeps_unknow
         operation_id=operation,duration_ms=12,attributes={'receipt_present':True,'tool_name':'confirm_action',
             'transcript':'PRIVATE CUSTOMER 5125550142','exception':'PRIVATE API KEY'})
     assert sink.record('gateway','request_finished','failure',call_id=str(uuid4()),duration_ms=50)
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     assert worker.tick()
     with closing(worker.outbox.db()) as db:
         report=json.loads(db.execute('SELECT report FROM jobs').fetchone()[0])
@@ -815,7 +816,7 @@ def record_export_diagnostics(scenario):
     # A breadcrumb without measured duration stays in the root report, with
     # skipped timing coverage rather than an invented child interval.
     assert sink.record('voice_runtime','call_ended','success',call_id=call['id'],start_unix=ended)
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     return path
 
 
@@ -857,7 +858,7 @@ def test_ambiguous_child_upload_retries_same_frozen_ids_without_another_judge_or
     sink=Diagnostics(path)
     assert sink.record('tts','tts.failed','failure',call_id=scenario[1]['id'],duration_ms=1,
         attributes={'error_code':'tts_upstream_rate_limited'})
-    assert sink.close()
+    assert sink.close(timeout_seconds=10)
     now[0]+=901;worker.tick()
     assert worker.outbox.status()['jobs']=={'complete':1} and mock.judge_requests==1
     assert len(mock.run_posts)==len(set(mock.run_posts))==len(mock.runs)

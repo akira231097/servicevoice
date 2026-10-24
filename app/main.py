@@ -38,6 +38,8 @@ from .observability import NullTelemetry, TelemetryConfig, create_telemetry, Nul
 from .diagnostics import NullDiagnostics, create_diagnostics, operation_identifier, turn_identifier
 from .gemini_tts import GeminiTTS, TTSError
 from .diagnostic_http import DiagnosticHTTPMiddleware
+from .twilio_api import install_twilio, TWILIO_PATHS
+from .twilio_bridge import BridgeError
 
 ROOT=Path(__file__).resolve().parent.parent
 load_dotenv(ROOT/".env")
@@ -106,12 +108,16 @@ def create_app(db_path=None):
                 app.state.telemetry_initialized=True
         await app.state.gemini_gateway.start()
         await app.state.gemini_tts.start()
+        if app.state.twilio_lane is not None:
+            await app.state.twilio_lane.start(settings())
     async def shutdown_resources():
         app.state.telephony_http_closing=True
         pending=list(app.state.telephony_http_tasks)
         if pending:
             try:await asyncio.wait_for(asyncio.shield(asyncio.gather(*pending,return_exceptions=True)),timeout=6)
             except asyncio.TimeoutError:pass  # Do not cancel accepted synchronous effects.
+        if app.state.twilio_lane is not None:
+            await app.state.twilio_lane.close()
         try:
             await app.state.gemini_gateway.close()
         finally:
@@ -161,7 +167,7 @@ def create_app(db_path=None):
     @app.middleware("http")
     async def local_console_boundary(request:Request,call_next):
         # Defense in depth. The public listener below has no operator-console routes at all.
-        if request.url.path not in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi"):
+        if request.url.path not in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi") and not request.url.path.startswith("/twilio/"):
             if request.url.hostname not in ("localhost","127.0.0.1","::1","testserver"):
                 return JSONResponse({"detail":"The operator console is local-only."},status_code=403)
             origin=request.headers.get("origin")
@@ -447,6 +453,7 @@ def create_app(db_path=None):
     app.state.telephony_http_lock=threading.Lock()
     app.state.telephony_http_tasks=set()
     app.state.telephony_http_closing=False
+    install_twilio(app, settings())
 
     def tool_may_continue(sid,tid,terminal_metadata=False):
         with store.connect() as db:
@@ -498,6 +505,8 @@ def create_app(db_path=None):
                 raise HTTPException(403,"Phone calls require their dedicated webhook.")
             sid=await run_in_threadpool(bind_provider_call,call,assistant)
         call_id=call["id"]
+        if phone and app.state.twilio_lane is not None:
+            app.state.twilio_lane.event(call_id, message)
         if diagnostic_request is not None:diagnostic_request.state.diagnostic_call_id=call_id
         diagnose("webhook","call_bound","success",call_id=call_id,
             request_id=getattr(getattr(diagnostic_request,"state",None),"diagnostic_request_id",None),
@@ -560,6 +569,22 @@ def create_app(db_path=None):
         ingress=app.state.telephony_ingress
         authorization=request.headers.get("authorization","")
         ingress.authenticate(authorization)  # No DB/body read before authentication.
+        # Authenticated listening traffic has its own in-memory admission path;
+        # hundreds of partials cannot occupy the slots used by scheduling tools.
+        lane=app.state.twilio_lane
+        early_body=None
+        if lane is not None:
+            try:
+                early_body=await asyncio.wait_for(read_webhook_json(request),timeout=2)
+            except TimeoutError:
+                raise HTTPException(408,"Webhook body deadline exceeded.") from None
+            early_message=early_body.get("message") if isinstance(early_body,dict) else None
+            if hasattr(ingress, "authenticate_message"):
+                ingress.authenticate_message(early_message, authorization)
+            if lane.closing and lane.owns_message(early_message):
+                raise HTTPException(503,"Isolated lane is closing.")
+            if isinstance(early_message,dict) and lane.fast_event(early_message):
+                return {"ok":True}
         marker=object()
         with app.state.telephony_http_lock:
             if app.state.telephony_http_closing:
@@ -576,7 +601,7 @@ def create_app(db_path=None):
             if completed is not None:
                 app.state.telephony_http_tasks.discard(completed)
         try:
-            body=await asyncio.wait_for(read_webhook_json(request),timeout=max(0,deadline-time.monotonic()))
+            body=early_body if early_body is not None else await asyncio.wait_for(read_webhook_json(request),timeout=max(0,deadline-time.monotonic()))
             message=body.get("message") if isinstance(body,dict) else None
             if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
             event_type=message.get("type")
@@ -585,6 +610,11 @@ def create_app(db_path=None):
                 # Identity is diagnostic evidence only after ingress validation
                 # succeeds, including work finishing after its HTTP waiter left.
                 verified_call_id=message["call"]["id"]
+                if lane is not None:
+                    if event == "call_bound":
+                        await lane.admitted(message, result)
+                    elif verified_call_id in lane.bindings:
+                        lane.spawn(lane.finish(lane.bindings[verified_call_id][0]))
                 request.state.diagnostic_call_id=verified_call_id
                 diagnose("voice_runtime",event,"success",call_id=verified_call_id,
                     attributes={"evidence_source":"verified_phone_ingress"})
@@ -627,10 +657,11 @@ def create_public_app(console):
     public=FastAPI(docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
     public.add_middleware(DiagnosticHTTPMiddleware,observer=console.state.diagnose)
     for route in console.routes:
-        if getattr(route,"path",None) in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi"):public.router.routes.append(route)
+        if getattr(route,"path",None) in ("/webhooks/vapi","/webhooks/vapi/inbound","/llm/chat/completions","/tts/vapi") or getattr(route,"path",None) in TWILIO_PATHS:public.router.routes.append(route)
     public.add_exception_handler(DomainError,console.exception_handlers[DomainError])
     public.add_exception_handler(IngressError,console.exception_handlers[IngressError])
     public.add_exception_handler(CapacityError,console.exception_handlers[CapacityError])
+    public.add_exception_handler(BridgeError,console.exception_handlers[BridgeError])
     return public
 
 app=create_app()

@@ -55,7 +55,7 @@ _ENUMS = {
         "upstream_unavailable", "superseded", "superseded_after_release", "supersession_wait_expired"}),
     "status": frozenset({"passed", "failed", "pending", "error", "incomplete", "not_run", "completed", "ready"}),
     "mode": frozenset({"model", "contracts", "validate", "smoke", "trace_smoke", "setup"}),
-    "model": frozenset({"gemini-3.8-flash", "gemini-3.5-flash", "jev-gem"}),
+    "model": frozenset({"gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "jev-gem"}),
     "tool_name": TOOLS,
     "error_code": ERROR_CODES,
 }
@@ -540,7 +540,8 @@ _TIMING_MILESTONES = frozenset({"preflight", "upstream_headers", "first_upstream
 _TIMING_DURATIONS = frozenset({"tool_signature_persist", "upstream_eof_drain", "jev_route",
                               "jev_classification", "validated_text_hold"})
 _TIMING_COUNTS = frozenset({"history_messages", "history_tool_results", "upstream_events", "text_chunks",
-                          "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests"})
+                          "text_utf8_bytes", "tool_calls", "tcp_connects", "tls_handshakes", "eof_tail_bytes", "jev_requests",
+                          "serial_tool_replans", "serial_tool_clarifications"})
 _TIMING_USAGE = frozenset({"input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"})
 
 
@@ -568,7 +569,7 @@ def safe_backchannel_timing(cue):
         "content_kind":"backchannel_content_kind", "content_probability":"backchannel_content_probability",
         "content_confidence":"backchannel_content_confidence",
         "refunded":"backchannel_refunded", "refund_reason":"backchannel_refund_reason",
-        "follow_up":"backchannel_follow_up"}
+        "follow_up":"backchannel_follow_up", "guarded_fallback":"backchannel_guarded_fallback"}
     attributes = safe_attributes({target:cue.get(source) for source,target in fields.items()})
     return {**{source:attributes[target] for source,target in fields.items() if target in attributes},
         "evidence_scope":"gateway_yield_not_audible_playback"}
@@ -588,6 +589,10 @@ def safe_timing_row(row):
         return None
     safe = {"request_id": request_id, "call_key": call_key, "started_at_unix": started,
             "route": row["route"], "outcome": row["outcome"]}
+    if isinstance(row.get("model"), str) and row["model"] in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}:
+        safe["model"] = row["model"]
+    if isinstance(row.get("reasoning_effort"), str) and row["reasoning_effort"] in {"low", "minimal"}:
+        safe["reasoning_effort"] = row["reasoning_effort"]
     for key in ("narration_reason", "jev_reason", "eof_drain_outcome"):
         safe[key] = safe_timing_decision_code(row.get(key))
     for key in ("system_prompt_sha256", "source_result_sha256", "output_text_sha256"):
@@ -597,7 +602,7 @@ def safe_timing_row(row):
         value = row.get(key)
         safe[key] = value if type(value) is str and pattern.fullmatch(value) else None
     source = row.get("output_text_source")
-    safe["output_text_source"] = source if type(source) is str and source in {"verified_receipt", "static_faq"} else None
+    safe["output_text_source"] = source if type(source) is str and source in {"verified_receipt", "static_faq", "application_clarification"} else None
     safe["jev_model"] = row.get("jev_model") if row.get("jev_model") == "jev-1.13.0" else None
     for key in ("jev_probability", "jev_margin", "jev_language_probability"):
         value = row.get(key)

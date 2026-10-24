@@ -165,7 +165,7 @@ def synthetic_request(body, secret):
 
 
 class Conversation:
-    def __init__(self, path, key, provider, *, narration="on", jev="off", jev_key=None):
+    def __init__(self, path, key, provider, *, narration="on", jev="off", jev_key=None, model="gemini-3.8-flash"):
         from fastapi import FastAPI, HTTPException
         from app.domain import Store
         from app.gemini_gateway import install_gateway
@@ -190,6 +190,8 @@ class Conversation:
             self.gateway.store.pin_call_policy(self.sid, self.call_id, "synthetic-eval-assistant", self.config)
             return self.sid
         self.gateway = install_gateway(app, lambda: self.config, bind, client=provider)
+        self.gateway.waiting_cue_assistant = "synthetic-eval-assistant"
+        self.config["SERVICEVOICE_TWILIO_MODEL"] = model
         self.provider = provider
         self.harness = ToolHarness(self.store)
 
@@ -401,7 +403,8 @@ async def run(args, key, jev_key=None, *, provider_transport=None, on_checkpoint
     ensure_sqlite()
     report = {"schema_version": 1, "kind": "disposable_real_gateway_streaming_eval", "status": "running",
               "started_at": datetime.now(timezone.utc).isoformat(), "source": {"before": source_manifest()},
-              "configuration": {"model": "gemini-3.8-flash", "reasoning_effort": "low", "concurrency": 1,
+              "configuration": {"model": getattr(args, "model", "gemini-3.8-flash"),
+                                "reasoning_effort": "minimal" if getattr(args, "model", None) == "gemini-3.5-flash-lite" else "low", "concurrency": 1,
                                 "max_requests": args.max_requests, "receipt_narration": args.receipt_narration,
                                 "jev_faq": args.jev_faq, "jev_credential_present": bool(jev_key)},
               "provider_requests": [], "cases": [], "passed": False,
@@ -422,7 +425,8 @@ async def run(args, key, jev_key=None, *, provider_transport=None, on_checkpoint
                                       limits=httpx.Limits(max_connections=4, max_keepalive_connections=4, keepalive_expiry=60))
             provider = measured_provider(client, budget, report["provider_requests"])
             conversation = Conversation(Path(temp) / (name + ".sqlite3"), key, provider,
-                                        narration=args.receipt_narration, jev=args.jev_faq, jev_key=jev_key)
+                                        narration=args.receipt_narration, jev=args.jev_faq, jev_key=jev_key,
+                                        model=getattr(args, "model", "gemini-3.8-flash"))
             try:
                 async with asyncio.timeout(180):
                     await conversation.start()
@@ -469,6 +473,7 @@ async def run(args, key, jev_key=None, *, provider_transport=None, on_checkpoint
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--model", choices=("gemini-3.8-flash", "gemini-3.5-flash-lite"), default="gemini-3.8-flash")
     parser.add_argument("--max-requests", type=int, default=30)
     parser.add_argument("--case", action="append", choices=SCENARIOS, dest="cases")
     parser.add_argument("--receipt-narration", choices=("on", "off"), default="on")

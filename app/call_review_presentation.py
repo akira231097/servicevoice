@@ -315,6 +315,8 @@ def generation_rows(timings):
         generation = source.get("generation_id")
         rows[request] = {
             "request_id": request, "generation_id": generation if isinstance(generation, str) and _UUID.fullmatch(generation) else None,
+            "model": source.get("model") if route == "gemini" and isinstance(source.get("model"), str) and source["model"] in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None,
+            "reasoning_effort": source.get("reasoning_effort") if route == "gemini" and isinstance(source.get("reasoning_effort"), str) and source["reasoning_effort"] in {"low", "minimal"} else None,
             "started_at_unix": started, "total_ms": total, "route": route, "outcome": code(source.get("outcome")) or "unknown",
             "first_text_ms": number(phases.get("first_text")), "tool_emitted_ms": number(phases.get("tool_emitted")),
             "upstream_headers_ms": number(phases.get("upstream_headers")), "preflight_ms": number(phases.get("preflight")),
@@ -376,6 +378,54 @@ def diagnostic_events(diagnostics, call_key):
                      "start_unix": number(row.get("start_unix"), 1_577_836_800, 4_102_444_800),
                      "duration_ms": number(row.get("duration_ms")), "attributes": attributes})
     return rows
+
+
+def listening_summary(diagnostics, call_key):
+    from .listening_audio import VARIATIONS
+    from .backchannel_catalog import PHRASES
+    all_rows = diagnostic_events(diagnostics, call_key)
+    rows = [row for row in all_rows if row["component"] == "listening_cue"]
+    bridge = [row for row in all_rows if row["component"] == "twilio_bridge"]
+    if not rows and not bridge:
+        return None
+    allowed = {"decision", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail"}
+    rows = [row for row in rows if row["event"] in allowed]
+    phrases = {**PHRASES, **VARIATIONS}
+    intervals, opened = [], None
+    speaker_rows = sorted((r for r in bridge if r["attributes"].get("listening_reason") == "caller"
+        and r["start_unix"] is not None and r["event"] in {"speaker_started", "speaker_stopped"}), key=lambda r:r["start_unix"])
+    for row in speaker_rows:
+        if row["event"] == "speaker_started" and opened is None: opened = row["start_unix"]
+        elif row["event"] == "speaker_stopped" and opened is not None:
+            if 0 <= row["start_unix"]-opened <= 120: intervals.append((opened, row["start_unix"]))
+            opened = None
+    seconds = sum(stop-start for start, stop in intervals)
+    waiting = [r for r in all_rows if r["component"] == "gateway" and r["event"] == "backchannel.emitted"]
+    by_turn, followups = {}, {}
+    for row in waiting:
+        if row["turn_id"]:
+            by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
+            if row["attributes"].get("backchannel_follow_up") is True:
+                followups[row["turn_id"]] = followups.get(row["turn_id"], 0)+1
+    fetched = sum(row["event"] == "clip_fetched" for row in rows)
+    return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
+                         "phrase_id": row["attributes"].get("backchannel_phrase") if row["attributes"].get("backchannel_phrase") in phrases else None,
+                         "phrase": phrases.get(row["attributes"].get("backchannel_phrase"), "unknown"),
+                         "reason": row["attributes"].get("listening_reason", "unknown")}
+                        for row in rows],
+            "dispatched": sum(row["event"] == "dispatched" for row in rows),
+            "clip_fetches": sum(row["event"] == "clip_fetched" for row in rows),
+            "announcement_failures": sum(row["event"] == "announcement_fail" for row in rows),
+            "caller_energy_seconds": round(seconds, 3) if intervals else None,
+            "clip_fetches_per_10s_caller_energy": round(fetched*10/seconds, 3) if seconds > 0 else None,
+            "waiting_dispatches_during_caller_energy": sum(any(start <= row["start_unix"] < stop for start, stop in intervals)
+                for row in waiting if row["start_unix"] is not None) if intervals else None,
+            "duplicate_waiting_dispatches_by_gateway_turn": sum(max(0, count-1-min(1,followups.get(turn,0))) for turn,count in by_turn.items()),
+            "silent_opening_detections": sum(row["event"] == "media_suspected" for row in bridge),
+            "opening_recovery_redials": sum(row["event"] == "media_recovery_redial" for row in bridge),
+            "guarded_waiting_fallbacks": sum(row["attributes"].get("backchannel_guarded_fallback") is True for row in waiting),
+            "audible_playback": "unverified",
+            "scope": "Caller-only announcement dispatch/fetch and received Twilio speaker-event evidence. Energy is not recognized speech. Gateway turns can split a caller's thought. Captured caller audio is required to verify audibility, audible overlaps, duplicate phrases and preserved words."}
 
 
 def condense_diagnostics(diagnostics, call_key):
@@ -1015,6 +1065,17 @@ def build_review_children(trace, *, root_run_id, root_dotted_order, project_id, 
                      {"classification": span.get("classification"), "first_token_ms": span.get("first_token_ms"), "duration_ms": span.get("duration_ms"), "gateway_generation_id": None},
                      parent=group, tags=["provider-reported"]) is not None:
                 counts["provider_model_spans"] += 1
+    for index, cue in enumerate(trace.get("listening", [])):
+        if isinstance(cue, dict) and cue.get("event") == "dispatched":
+            # Frozen older exports retain their exact labels for immutable readback.
+            # New timelines carry a closed phrase id; never export arbitrary prose.
+            from .listening_audio import VARIATIONS
+            phrases = {"neutral_ack": "Mm-hmm.", "acknowledge": "I hear you.", **VARIATIONS}
+            phrase = cue.get("phrase_id") if "phrase_id" in cue else "neutral_ack"
+            phrase = phrase if isinstance(phrase, str) and phrase in phrases else None
+            child("listening", index, "listen · " + phrases.get(phrase, "unknown"), cue.get("start_unix"), cue.get("start_unix"),
+                  {"phrase": phrase}, {"status": "accepted_unverified", "scope": "Twilio REST acceptance; caller playback unverified"},
+                  tags=["listening-cue", "experimental"])
     if len(runs) > max_children:
         counts["omitted"] += len(runs) - max_children
         runs = runs[:max_children]
@@ -1063,9 +1124,17 @@ def _generation_children(child, generation, group, counts):
         outputs["usage_metadata"] = {"input_tokens": generation.get("input_tokens") if type(generation.get("input_tokens")) is int else 0,
                                      "output_tokens": generation.get("output_tokens") if type(generation.get("output_tokens")) is int else 0, "total_tokens": tokens}
     generation_id = generation.get("generation_id") if isinstance(generation.get("generation_id"), str) and _UUID.fullmatch(generation["generation_id"]) else None
+    # Missing key denotes a frozen legacy trace. An explicit null means the new
+    # projection did not observe an allowed model; do not guess one in that case.
+    model = generation.get("model", "gemini-3.8-flash") if route == "gemini" else None
+    model = model if isinstance(model, str) and model in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None
+    if "model" in generation:
+        outputs["model"] = model
+        effort = generation.get("reasoning_effort") if route == "gemini" else None
+        outputs["reasoning_effort"] = effort if isinstance(effort, str) and effort in {"low", "minimal"} else None
     if child("generation", request, name, start, end, {"generation_id": generation_id, "route": route}, outputs, parent=group,
              run_type="llm" if route == "gemini" else "chain", tags=["gateway-generation", route],
-             metadata={"generation_id": generation_id, "model": "gemini-3.8-flash" if route == "gemini" else None, "not_an_additional_model_call": True}) is not None:
+             metadata={"generation_id": generation_id, "model": model, "not_an_additional_model_call": True}) is not None:
         counts["generations"] += 1
 
 
@@ -1094,6 +1163,21 @@ def review_metadata(report, *, call_id, environment, latency_target_ms):
 
 def feedback_rows(run_id, report):
     """Feedback a person can scan: checks score 1/0, flags, coverage, metric_* values."""
+    listening = report.get("listening_cues")
+    if isinstance(listening, dict):
+        for key, source in (("metric_listening_cues", "dispatched"), ("metric_listening_clip_fetches", "clip_fetches"),
+                ("metric_silent_opening_detections", "silent_opening_detections"), ("metric_opening_recovery_redials", "opening_recovery_redials"),
+                ("metric_waiting_dispatch_overlap", "waiting_dispatches_during_caller_energy"),
+                ("metric_duplicate_waiting_dispatches", "duplicate_waiting_dispatches_by_gateway_turn"),
+                ("metric_guarded_waiting_fallbacks", "guarded_waiting_fallbacks")):
+            value = listening.get(source)
+            if type(value) is int and value >= 0:
+                yield {"key": key, "score": value, "value": value,
+                       "comment": "Measurement of provider acceptance or clip fetch, not proof of audible playback."}
+        value = listening.get("clip_fetches_per_10s_caller_energy")
+        if type(value) in (int, float) and 0 <= value < 99999:
+            yield {"key": "metric_listening_cues_per_10s_energy", "score": value, "value": value,
+                "comment": "Clip fetches per 10s of caller energy from received Twilio speaker events; not an acoustic speech or naturalness grade."}
     checks = report.get("checks") or {}
     for key, item in checks.items():
         if not isinstance(item, dict):
@@ -1149,6 +1233,9 @@ def feedback_rows(run_id, report):
     ]
     for key, value, comment in metrics:
         if type(value) in (int, float) and math.isfinite(value):
-            # LangSmith accepts at most four decimal places on a feedback score.
+            # LangSmith's score is a bounded decimal, not an arbitrary metric.
+            # Keep large measured counts in value instead of failing the whole
+            # review or clipping the measurement to a misleading maximum.
             value = value if type(value) is int else round(value, 4)
-            yield {"key": key, "score": value, "value": value, "comment": "Measurement, not a score. " + comment}
+            score = value if -99999.9999 <= value <= 99999.9999 else None
+            yield {"key": key, "score": score, "value": value, "comment": "Measurement, not a score. " + comment}

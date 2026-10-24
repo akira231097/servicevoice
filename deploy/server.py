@@ -180,6 +180,7 @@ def main():
             sockets.append(listener(8001))
         deployment = SocketDispatcher(public_app, local)
         server = uvicorn.Server(uvicorn.Config(deployment, host='0.0.0.0', port=8000, proxy_headers=False,
+            ws='wsproto' if os.environ.get('SERVICEVOICE_TWILIO_TESTER')=='on' else 'none', ws_max_size=8192,
             workers=1, access_log=False, timeout_keep_alive=5, timeout_graceful_shutdown=20,
             limit_concurrency=64, backlog=128, h11_max_incomplete_event_size=16384))
         asyncio.run(server.serve(sockets=sockets))
