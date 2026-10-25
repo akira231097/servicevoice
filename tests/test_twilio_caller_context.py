@@ -100,6 +100,16 @@ def test_spoken_number_and_verification_codes():
     ("JOSÉ LOPEZ", None, (None, "unusable")),
     (123, None, (None, "unusable")),
     ("x" * 41, None, (None, "unusable")),
+    ("NOT AVAILABLE", None, (None, "placeholder")),
+    ("NOT PROVIDED", None, (None, "placeholder")),
+    ("JOHN AND MARY", None, (None, "placeholder")),
+    ("NEW YORK", None, (None, "placeholder")),
+    ("SAN ANTONIO", None, (None, "placeholder")),
+    ("OKLAHOMA CY", None, (None, "placeholder")),
+    ("MT VERNON", None, (None, "placeholder")),
+    ("MRS SMITH", None, (None, "unusable")),          # a title is never spoken or guessed
+    ("DR JOHN SMITH", None, ("John Smith", "found")),
+    ("SMITH  JOHNATHA", None, (None, "possibly_truncated")),  # 15 raw characters with a double space
 ])
 def test_caller_name_cleanup_skips_rather_than_guesses(raw, kind, expected):
     assert clean_caller_name(raw, kind) == expected
@@ -279,7 +289,7 @@ def test_prepared_booking_ends_the_caller_id_text():
         {"id": "t1", "type": "function", "function": {"name": "prepare_booking", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "t1", "content": "{}"}]
     block, state = caller_block(OWNER, "Jordan Rivera", history)
-    assert state == "details_saved" and "never shortened" in block
+    assert state == "details_saved" and "never just one part of it" in block
     assert "Jordan" not in block and "405-555-0134" not in block
     assert caller_block(OWNER, None, history) == (None, "details_saved")
 
@@ -339,8 +349,14 @@ def test_withheld_caller_id_is_recorded_without_a_lookup(tmp_path):
     async def run():
         context, _, events, _ = manager(tmp_path)
         context.begin("bridge-1", {"From": "anonymous"})
-        assert context.lookup.calls == [] and not context.calls
-        assert lookup_events(events)[0][3]["caller_lookup_outcome"] == "withheld_or_unsupported"
+        assert context.lookup.calls == [] and lookup_events(events) == []
+        assert context.hint("bridge-1", [], "call-1") is None
+        context.bind("bridge-1", "call-1")
+        reported = lookup_events(events)
+        assert len(reported) == 1 and reported[0][0] == "call-1" and reported[0][2] == "not_applicable"
+        assert reported[0][3]["caller_lookup_outcome"] == "withheld_or_unsupported"
+        context.finish("bridge-1", "call-1")
+        assert len(lookup_events(events)) == 1 and not context.calls
     asyncio.run(run())
 
 
@@ -496,6 +512,7 @@ def enable(monkeypatch, tmp_path, raw=None):
     path.write_bytes(raw or policy_bytes())
     monkeypatch.setenv("SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY", str(path))
     monkeypatch.setenv("SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY", KEY)
+    monkeypatch.setenv("SERVICEVOICE_LISTENING_CUES", "on")
     return path
 
 
@@ -530,11 +547,13 @@ def test_stalled_lookup_never_delays_the_signed_webhook(lane_app, monkeypatch, t
             bridge = next(iter(lane.caller.calls))
             lane.bindings["call-1"] = (bridge, "sid-1")
             lane.caller.bind(bridge, "call-1")
-            assert "I can use the number you're calling from" in lane.caller_hint("call-1", "sid-1", [])
-            assert lane.caller_hint("call-1", "other-session", []) is None
+            hook = app.state.gemini_gateway.caller_hint  # the gateway's own wiring, not the lane method
+            assert hook == lane.caller_hint
+            assert "I can use the number you're calling from" in hook("call-1", "sid-1", [])
+            assert hook("call-1", "other-session", []) is None
             gate.set()
             await asyncio.sleep(0.01)
-            assert "Sergio Suarez" in lane.caller_hint("call-1", "sid-1", [])
+            assert "Sergio Suarez" in hook("call-1", "sid-1", [])
             await lane.finish(bridge)
             assert bridge not in lane.caller.calls
         await lane.close()
@@ -562,6 +581,13 @@ def test_webhook_answers_even_if_caller_context_fails(lane_app, monkeypatch, tmp
 
 def test_no_policy_settings_means_no_caller_context(lane_app):
     assert lane_app.state.twilio_lane.caller_source is None and lane_app.state.twilio_lane.caller is None
+
+
+def test_caller_context_requires_the_listening_conference_lane(lane_app, monkeypatch, tmp_path):
+    enable(monkeypatch, tmp_path)
+    monkeypatch.setenv("SERVICEVOICE_LISTENING_CUES", "off")
+    with pytest.raises(ValueError, match="listening cues"):
+        create_app(tmp_path / "no-listening.sqlite3")
 
 
 def test_half_configured_caller_context_refuses_to_start(lane_app, monkeypatch, tmp_path):
@@ -644,7 +670,7 @@ def hint_event(state, component="twilio_bridge", event="caller_hint"):
 @pytest.mark.parametrize("states,expected", [
     ([], None), (["details_saved"], None), (["number_only"], "number_only"),
     (["number_only", "name_and_number"], "name_and_number"), (["name_asked"], "name_and_number"),
-    (["name_and_number", "name_asked", "details_saved"], "name_and_number")])
+    (["name_and_number", "name_asked", "details_saved"], "name_and_number"), (["number_offered"], "number_only")])
 def test_reviewer_flag_comes_only_from_fixed_hint_codes(states, expected):
     assert caller_id_offer({"events": [hint_event(s) for s in states]}) == expected
 
@@ -668,7 +694,7 @@ def test_reviewer_learns_caller_id_was_available_without_the_values(tmp_path):
     snapshot["caller_id"] = caller_id_offer({"events": [hint_event("name_and_number")]})
     package = build_evidence(call, snapshot)
     assert package["evidence"]["caller_id"]["available_to_assistant"] == "name_and_number"
-    assert "values withheld" in package["evidence"]["caller_id"]["provenance"]
+    assert "does not contain the caller-ID values" in package["evidence"]["caller_id"]["provenance"]
     with sqlite3.connect(store.path) as db:  # the booking database schema is unchanged
         assert db.execute("SELECT 1 FROM sqlite_master WHERE name='caller_id_offers'").fetchone() is None
 
@@ -679,3 +705,132 @@ def test_diagnostics_keep_only_fixed_caller_codes():
     assert kept == {"caller_lookup_outcome": "found", "caller_context_mode": "personalize", "caller_verstat": "passed_a",
                     "caller_hint_state": "name_asked", "caller_policy_status": "loaded"}
     assert safe_attributes({"caller_lookup_outcome": "Sergio Suarez", "caller_hint_state": OWNER}) == {}
+
+
+# ---------------------------------------------------------------- independent review findings
+
+def test_deeply_nested_or_unreadable_policy_fails_closed(tmp_path, monkeypatch):
+    path = tmp_path / "policy.json"
+    source = PolicySource(str(path), KEY)
+    path.write_bytes(policy_bytes())
+    source.refresh()
+    assert source.current.mode == "personalize"
+    path.write_bytes(b"[" * 30000 + b"]" * 30000)  # RecursionError inside json, under the size limit
+    assert source.refresh() and source.current.status == "invalid" and source.current.mode == "off"
+    path.write_bytes(policy_bytes())
+    real = type(path).read_bytes
+    def denied(self):
+        raise PermissionError("transient")
+    monkeypatch.setattr(type(path), "read_bytes", denied)
+    source.refresh()
+    assert source.current.mode == "off" and source.stamp is None
+    monkeypatch.setattr(type(path), "read_bytes", real)
+    assert source.refresh() and source.current.mode == "personalize"  # retried without a file change
+
+
+def test_unexpected_reload_failure_turns_personalization_off(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.caller_context.POLICY_POLL_SECONDS", 0.01)
+    async def run():
+        context, _, events, _ = manager(tmp_path)
+        await context.start()
+        assert context.source.current.mode == "personalize"
+        def explode():
+            raise RuntimeError("unexpected")
+        context.source.refresh = explode
+        for _ in range(200):
+            if context.source.current.mode == "off":
+                break
+            await asyncio.sleep(0.01)
+        await context.close()
+        return context.source.current, [e[3] for e in events if e[1] == "caller_policy"]
+    policy, observed = asyncio.run(run())
+    assert policy.mode == "off" and policy.status == "invalid"
+    assert observed[-1] == {"caller_context_mode": "off", "caller_policy_status": "invalid"}
+
+
+def test_a_late_lookup_never_reopens_the_name_step(tmp_path):
+    async def run():
+        gate = asyncio.Event()
+        context, _, events, tasks = manager(tmp_path, lookup=FakeLookup(gate=gate))
+        context.begin("bridge-1", {"From": OWNER})
+        await asyncio.sleep(0)
+        history = [{"role": "assistant", "content": "May I have your name? I can use the number you're calling from."},
+                   {"role": "user", "content": "It's Sam Lee, and yes, that number."}]
+        assert context.hint("bridge-1", history[:1], "call-1").count("Sergio") == 0
+        gate.set()
+        await asyncio.gather(*tasks)
+        block = context.hint("bridge-1", history, "call-1")
+        assert "Sergio" not in block and "already offered the number" in block and "405-555-0134" in block
+        assert hint_states(events)[-1] == ("call-1", "number_offered")
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("text,name,asked", [
+    ("Will that work for you?", "Will Smith", False),
+    ("Thanks. Will that work?", "Will Smith", False),
+    ("May I have your callback number?", "May Chen", False),
+    ("I can check the price for you.", "Ann Price", False),
+    ("Is this Jordan?", "Jordan Rivera", True),
+    ("Should I put this under jordan rivera?", "Jordan Rivera", True),
+    ("Sure, Mr. Rivera, one moment.", "Jordan Rivera", True),
+])
+def test_already_asked_ignores_ordinary_words(text, name, asked):
+    history = [{"role": "assistant", "content": text}]
+    assert (caller_block(OWNER, name, history)[1] == "name_asked") is asked
+
+
+def test_a_late_duplicate_webhook_never_restarts_an_ended_call(tmp_path):
+    async def run():
+        context, _, _, tasks = manager(tmp_path)
+        context.begin("bridge-1", {"From": OWNER})
+        context.finish("bridge-1", "call-1")
+        context.begin("bridge-1", {"From": OWNER})  # resumed after hang-up cleanup
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert "bridge-1" not in context.calls and len(context.lookup.calls) <= 1
+    asyncio.run(run())
+
+
+def test_never_finished_calls_are_swept_and_reported(tmp_path, monkeypatch):
+    async def run():
+        gate = asyncio.Event()
+        context, _, events, tasks = manager(tmp_path, lookup=FakeLookup(gate=gate))
+        context.begin("bridge-1", {"From": OWNER})
+        context.bind("bridge-1", "call-1")
+        context.calls["bridge-1"].started -= 10_000
+        context._sweep()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert not context.calls and lookup_events(events)[-1][2] == "cancelled"
+    asyncio.run(run())
+
+
+def test_shutdown_reports_calls_still_in_progress(tmp_path):
+    async def run():
+        gate = asyncio.Event()
+        context, _, events, tasks = manager(tmp_path, lookup=FakeLookup(gate=gate))
+        context.begin("bridge-1", {"From": OWNER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.sleep(0)
+        await context.close()
+        assert not context.calls and lookup_events(events)[-1][:3] == ("call-1", "caller_lookup", "cancelled")
+    asyncio.run(run())
+
+
+def test_slow_read_is_a_timeout_not_an_error():
+    def slow(request):
+        raise httpx.ReadTimeout("slow", request=request)
+    async def run():
+        client = lookup_client(slow)
+        result = await client.lookup(OWNER, 5)
+        await client.client.aclose()
+        return result
+    assert asyncio.run(run()).outcome == "timeout"
+
+
+def test_lookup_urls_never_reach_http_client_logs():
+    import logging
+    lookup_client(lambda request: httpx.Response(200))
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1,
+                               "HTTP Request: GET https://lookups.twilio.com/v2/PhoneNumbers/%2B14055550134", None, None)
+    assert not all(f.filter(record) for f in logging.getLogger("httpx").filters)
+    other = logging.LogRecord("httpx", logging.INFO, __file__, 1, "HTTP Request: GET https://api.twilio.com/x", None, None)
+    assert all(f.filter(other) for f in logging.getLogger("httpx").filters)

@@ -225,7 +225,7 @@ def caller_id_offer(diagnostics):
     # The name is withdrawn only after it was offered, so name_asked implies an earlier offer.
     if states & {"name_and_number", "name_asked"}:
         return "name_and_number"
-    return "number_only" if "number_only" in states else None
+    return "number_only" if states & {"number_only", "number_offered"} else None
 
 
 def build_evidence(call, snapshot, tool_ids=None):
@@ -322,7 +322,7 @@ def build_evidence(call, snapshot, tool_ids=None):
     evidence["facts"] = dealership_facts(created.astimezone(TZ).date())
     if snapshot.get("caller_id") in ("number_only", "name_and_number"):
         evidence["caller_id"] = {"available_to_assistant": snapshot["caller_id"],
-            "provenance": "phone network caller ID for this call; unverified; values withheld from this review"}
+            "provenance": "phone network caller ID for this call; unverified; this item does not contain the caller-ID values"}
     evidence["state"] = {"scheduler_evidence_available":snapshot.get("source_available",True),"appointments":snapshot["appointments"],"proposals":snapshot["proposals"],
         "handoffs":snapshot["handoffs"],"pending_operations":[r for r in snapshot["operations"] if r["status"] in {"queued","running","unknown"}]}
     # Do not send DB session ids, fingerprints, tokens or provider signatures.

@@ -123,7 +123,8 @@ def reply_to(text, case, state):
                                   "does that look", "is that correct", "all correct", "sound good")) and state.get("details"):
         state["phase"] = "done"
         return "Yes, please book it."
-    if any(w in lowered for w in ("available", "openings", "offer", "a.m.", "p.m.", "which works", "which time")):
+    if (any(w in lowered for w in ("available", "openings", "offer", "a.m.", "p.m.", "which works", "which time", "either"))
+            or re.search(r"\d(?::\d\d)?\s*(?:a\.?m|p\.?m)\b", lowered)):
         state["details"] = True
         return "The first one works."
     return "Yes."
@@ -145,7 +146,7 @@ def judge(case, conversation, store_state):
     proposal_or_booking = store_state.get("appointment") or store_state.get("proposal")
     customer = (store_state.get("customer") or {}) if isinstance(store_state.get("customer"), dict) else {}
     checks = {"no_titles": not TITLES.search(joined),
-              "name_never_shortened": not re.search(r"Jordan(?! Rivera)", joined),
+              "name_never_shortened": not re.search(r"\bJordan\b(?! Rivera)", joined),
               "name_not_in_first_reply": HINT not in (texts[0] if texts else ""),
               "name_question_at_most_once": sum("put this under" in t.lower() for t in texts) <= 1}
     hint_turns = [i for i, t in enumerate(texts) if HINT in t]

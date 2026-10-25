@@ -385,11 +385,12 @@ responses, explicit stop/end requests and unfinished thoughts remain silent.
 ## Caller-ID name step (October 25)
 
 Optional and off unless both `SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY` and
-`SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY` are set. The private policy file holds
-the mode (`off`, `shadow`, `personalize`) and HMAC-SHA256 digests of allowlisted
-numbers, never the numbers. It is reread every two seconds off the call path;
-a missing or malformed file fails closed to `off`, including for calls already
-in progress.
+`SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY` are set, and then only on the conference
+lane with listening cues (other settings refuse to start). The private policy
+file holds the mode (`off`, `shadow`, `personalize`) and HMAC-SHA256 digests of
+allowlisted numbers, never the numbers. It is reread every two seconds off the
+call path; a missing, unreadable or malformed file fails closed to `off`,
+including for calls already in progress.
 
 For an allowlisted caller, the signed incoming-call webhook starts one Twilio
 Lookup caller-name request (`Fields=caller_name`) on its own four-connection
@@ -399,10 +400,11 @@ that call and are discarded at hang-up. Callers not on the allowlist are never
 looked up. A labelled synthetic name is accepted only for owned test calls.
 
 CNAM listings are at most 15 characters and often placeholders. The cleaner
-rejects business, placeholder, city/state, single-word, initial-only, possibly
-truncated (exactly 15 characters) and instruction-like values. Only an explicit
-comma establishes surname-first order; otherwise the listed order is kept and
-never guessed.
+rejects business, placeholder, place-name, joint, single-word, initial-only,
+possibly truncated (15 characters) and instruction-like values, and drops titles
+and suffixes. Only an explicit comma establishes surname-first order; otherwise
+the listed order is kept and never guessed, so the assistant uses a confirmed
+name in full or not at all.
 
 In `personalize`, the phone assistant receives unverified caller-ID text after
 the policy hash. It replaces the existing name-and-number question with "Should
@@ -410,7 +412,8 @@ I put this under [name], at the number you're calling from?", or, without a
 usable name, "May I have your name? I can use the number you're calling from."
 The question state comes from the call history Vapi reports, so a cancelled
 draft never counts as asked; after the question, the name is withdrawn and only
-a name the caller confirmed or gave is used. Caller ID is never identity,
+a name the caller confirmed or gave is used. A lookup that finishes after the
+number was already offered never reopens the name step. Caller ID is never identity,
 consent or authentication: the readback and explicit later assent still govern
 every booking. `shadow` performs the lookup without changing speech.
 

@@ -99,8 +99,10 @@ booking_accuracy: compare caller intent/corrections, spoken details and referenc
 with proposals, returned receipts and saved appointment. A clean saved record
 alone does not prove the assistant understood or described it correctly. When the
 evidence item caller_id is present, the assistant had the phone network's caller
-ID: a name or callback number the assistant offered from it and the caller then
-accepted is caller-confirmed intake information, not an invented detail. If no
+ID. A name or callback number that the assistant explicitly offered as caller ID
+(for example "the number you're calling from") and the caller then clearly
+accepted is caller-confirmed intake information; any other unsupported name or
+number is still a mismatch. If no
 booking/change was requested or claimed and no appointment exists, not_applicable.
 confirmation_compliance: before EVERY committed booking/change/cancellation,
 require an assistant readback of the exact current proposal and explicit caller

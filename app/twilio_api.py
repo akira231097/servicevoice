@@ -565,6 +565,9 @@ def install_twilio(app, settings):
     lane = TwilioLane(app, config) if config else None
     if lane:
         lane.caller_source = PolicySource.from_settings(settings)
+        if lane.caller_source is not None and not (config.listening and config.topology == "conference"):
+            # Only that lane delivers the name step; elsewhere a lookup would be wasted.
+            raise ValueError("Caller context requires the conference lane with listening cues.")
     app.state.twilio_lane = lane
     install_capture(app,lane)
     if lane:
