@@ -103,7 +103,7 @@ def test_prepare_and_confirmation_skip_google_keep_effects_and_continue_history(
             proposal = await prepare(env, PACIFIC)
             readback = await post(env)
             text = text_of(readback)
-            for value in ("Alex Morgan", "2021 Toyota Camry", "Oil & filter service", "Monday, October 19, 2026", "9 AM Central Daylight Time", "7 AM Pacific Daylight Time", "plus one; five, one, two; five, five, five; zero, one, four, two", "confirm this booking?"):
+            for value in ("Alex Morgan", "2021 Toyota Camry", "Oil & filter service", "Monday, October 19, 2026", "9 AM Central Daylight Time", "7 AM Pacific Daylight Time", "five one two, five five five, zero one four two", "confirm this booking?"):
                 assert value in text
             assert env.store.snapshot(env.sid)["appointment"] is None
             assert not env.sent

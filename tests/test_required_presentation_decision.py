@@ -109,7 +109,7 @@ def test_signed_availability_correction_and_later_confirmation_omit_narration_ro
                 "vehicle": "2022 Toyota Camry", "presentation": PACIFIC})
             assert select(env.store, env.sid, env.cid, old_candidate).text is None
             readback = await speak()
-            for expected in ("Alex Morgan", "2022 Toyota Camry", "five, five, five; zero, one, four, two",
+            for expected in ("Alex Morgan", "2022 Toyota Camry", "five five five, zero one four two",
                              "2 PM Central Daylight Time", "12 PM Pacific Daylight Time", "confirm this booking?"):
                 assert expected in readback
             assert "2021 Toyota Camry" not in readback

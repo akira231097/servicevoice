@@ -23,7 +23,7 @@ from .domain import DomainError, SERVICES, TENANT, TZ, normalize_services, servi
 from .tools import DEFINITIONS, Presentation
 from .issuance_context import user_context, decode_extras
 
-NARRATOR_VERSION = "receipt-en-2026-10-24-8"
+NARRATOR_VERSION = "receipt-en-2026-10-25-9"
 SUPPORTED = {"begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "prepare_reschedule", "prepare_cancellation", "confirm_action", "request_handoff", "withdraw_handoff"}
 _DIGIT_WORDS = dict(zip("0123456789", ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")))
 
@@ -64,15 +64,20 @@ def times(start, presentation):
 def spoken_phone(value):
     """Speak each stored digit; never strip, repair or change the phone value.
 
-    Group the current North American shape without guessing country-code
-    lengths for other international numbers. Unsupported storage shapes use
-    ordinary model narration rather than an incomplete deterministic readback.
+    A North American number is read the way people say one: three, three and
+    four digits, each group as one run, with a pause only between groups and
+    without the implied +1 country code. Other international numbers keep
+    "plus" and every digit, without guessing their group lengths. Unsupported
+    storage shapes use ordinary model narration rather than an incomplete
+    deterministic readback.
     """
     if not isinstance(value, str) or not re.fullmatch(r"\+[1-9][0-9]{1,14}", value):
         return None
     digits = value[1:]
-    groups = (digits[:1], digits[1:4], digits[4:7], digits[7:]) if len(digits) == 11 and digits.startswith("1") else (digits,)
-    return "plus " + "; ".join(", ".join(_DIGIT_WORDS[digit] for digit in group) for group in groups)
+    if len(digits) == 11 and digits.startswith("1"):
+        groups = (digits[1:4], digits[4:7], digits[7:])
+        return ", ".join(" ".join(_DIGIT_WORDS[digit] for digit in group) for group in groups)
+    return "plus " + " ".join(_DIGIT_WORDS[digit] for digit in digits)
 
 
 def candidate(messages):
