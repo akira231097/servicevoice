@@ -48,7 +48,6 @@ MIN_SPEECH_SECONDS = 3
 MIN_PARTIAL_WORDS = 6
 DECISION_RETRY_SECONDS = 1.5
 WAITING_QUIET_SECONDS = .75
-LONG_TURN_WAITING_QUIET_SECONDS = 1.0
 
 
 class CueNotSent(Exception):
@@ -456,12 +455,7 @@ class ListeningCoordinator:
         if not math.isfinite(state.waiting_stopped):
             return ticket, "caller_end_unobserved"
         now = self.clock()
-        # A measured 0.8-second clause pause in a long explanation let Vapi
-        # start/cancel a speculative hold and consume its allowance. Give long
-        # descriptions one extra quarter-second; short answers retain .75 s.
-        quiet = (LONG_TURN_WAITING_QUIET_SECONDS if now-state.caller_started >= 8
-                 else WAITING_QUIET_SECONDS)
-        if now-max(state.waiting_stopped, state.received) < quiet:
+        if now-max(state.waiting_stopped, state.received) < WAITING_QUIET_SECONDS:
             return ticket, "caller_pause_too_short"
         # Give an already-dispatched listening clip time to finish; this is a
         # conservative bound, not an assertion of measured handset playback.
@@ -541,7 +535,14 @@ class ListeningCoordinator:
         return True
 
     def waiting_content_finished(self, state):
-        return (not state.caller and state.finished_waiting_revision==state.user_revision
+        if state.caller:
+            return False
+        # A finalized clause is not authority to emit a hold, but it can revoke
+        # a listening cue. Do this before the gateway's separate classifier
+        # finishes, including when Twilio fetches a previously approved ticket.
+        if state.completed and not state.segment and state.final_event>=state.partial_event:
+            return True
+        return (state.finished_waiting_revision==state.user_revision
             and bool(state.finished_waiting_text)
             and state.finished_waiting_text==" ".join(re.findall(r"\w+",state.text.casefold())))
 

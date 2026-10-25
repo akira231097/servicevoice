@@ -49,13 +49,23 @@ interrupted cues, unknown/completed generations and stale reservation stamps kee
 their allowance consumed. Reclaiming is not based on HTTP cancellation alone.
 The private-address filter also avoids interpreting mileage followed by ordinary
 driving prose as a street address; real contact/address dictation stays excluded.
-The repeat still exposed an approximately 0.8-second clause pause: Vapi briefly
-reported assistant speech before cancelling it, so the conservative ledger
-correctly refused a refund. Long explanations (at least eight seconds) now use
-a one-second quiet window, versus .75 seconds for short replies. This adds up
-to .25 seconds to a long turn's hold in exchange for avoiding that observed
-clause-pause race. Longer ambiguous pauses remain possible; this is not prosodic
-endpointing or proof of pause-free conversation.
+The repeat still exposed a clause pause: Vapi briefly reported assistant speech
+before cancelling it, so the conservative ledger correctly refused a refund.
+A one-second quiet-window trial did not eliminate that live gap and was reverted;
+the quiet window remains .75 seconds. A stopped caller's finalized clause now
+revokes a listening cue before the waiting classifier finishes, including at
+media fetch. A final alone never grants authority to emit a hold, and continuing
+words reopen listening classification. Longer ambiguous pauses remain possible;
+this is not prosodic endpointing or proof of pause-free conversation.
+
+The owned-call acoustic checker retains its original unexplained-audio flags.
+It can additionally align a provider speech interval using at least three nearby
+correlation-matched waiting clips from two phrase IDs. Matching durations, unique
+intervals, a 30-second neighborhood and at most 120 ms lag spread are required;
+unsupported intervals retain the old 350 ms tolerance. This distinguishes audio
+already in transit after an interruption from an unrelated announcement without
+calibrating on the unexplained sound itself. Twilio notifications always fail the
+gate. The original application-error capture still fails under this alignment.
 
 An isolated-only delivery instruction targets one idea and about 20 words, with
 complete readbacks, references and option lists taking priority. Automatic reviews

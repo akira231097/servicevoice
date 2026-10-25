@@ -21,7 +21,7 @@ def assert_silence(response):
 
 @pytest.mark.parametrize('case', ['expired','missing_ticket','replay','duplicate_ticket','duplicate_cue',
     'wrong_phrase','missing_bank','unknown_cue','missing_bridge','recovering','ended','no_state',
-    'assistant','answer_ready','closed','wrong_binding','wrong_selection','invalid_signature',
+    'assistant','answer_ready','closed','finalized_pause','wrong_binding','wrong_selection','invalid_signature',
     'closing','no_client','recovery_expired','recovery_wrong_state','store_failure'])
 def test_all_clip_refusals_return_silent_success(lane_app, case, monkeypatch):
     async def run():
@@ -51,6 +51,9 @@ def test_all_clip_refusals_return_silent_success(lane_app, case, monkeypatch):
             with lane.store.db() as db:db.execute('UPDATE twilio_bridges SET state=? WHERE id=?',(case,row['id']))
         if case=='no_state': lane.coordinator.calls.clear()
         if case in {'assistant','answer_ready','closed'}: setattr(state,case,True)
+        if case=='finalized_pause':
+            state.caller=False;state.completed='I would like a diagnostic visit.'
+            state.segment='';state.final_event=2;state.partial_event=1
         if case=='wrong_binding': item['call_id']='wrong'
         if case=='wrong_selection': item['phrase_id']='wrong'
         if case=='closing': lane.closing=True
