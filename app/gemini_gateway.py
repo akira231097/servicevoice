@@ -1707,7 +1707,7 @@ class GeminiGateway:
         else:return
         # Do not refund the phone lane immediately. It reconciles only after
         # the caller resumed and stopped, a lateness grace elapsed, and no
-        # assistant speech/transcript was observed since this reservation.
+        # meaningful playback was observed. Measured blips keep their spacing.
         if getattr(timing, "waiting_cue_committed", False):
             if self.waiting_cue_track is not None:
                 self.waiting_cue_track(call_id,timing.correlation,stamp,abandoned=True)

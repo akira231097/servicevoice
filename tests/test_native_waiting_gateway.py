@@ -198,6 +198,11 @@ def test_signed_tool_followup_reuses_only_caller_context_and_same_turn_budget(tm
             content = tool_stream() if len(calls) == 1 else frame({"content": "Exact primary answer."})+frame(reason="stop")+DONE
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Delayed(first_release if len(calls) == 1 else second_release, content))
         app, gateway, _ = setup(tmp_path, handle); enable(gateway, monkeypatch)
+        # This case tests an immediate tool continuation, not runner/disk
+        # speed. A slow signature write can legitimately cross the 2.5-second
+        # follow-up threshold and emit a cue instead of the expected suppression.
+        # Spaced follow-ups have separate clock-driven integration coverage.
+        gateway.backchannel_budget.clock = lambda: 100.
         async def choose(history, key, **kwargs):
             assert kwargs["native_waiting"] is True and history[-1]["role"] == "user"
             assert "PRIVATE_RECEIPT" not in json.dumps(history) and all(row["role"] != "tool" for row in history)
