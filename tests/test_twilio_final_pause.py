@@ -19,6 +19,8 @@ def test_final_clause_revokes_only_pause_ack_without_waiting_classifier(stopped)
             assert c.timing_reason(state)=='caller_turn_finished'
             assert c.waiting_status('fixture-call','session')[1]=='caller_pause_too_short'
             clock.now+=.8
+            assert c.waiting_status('fixture-call','session')[1]=='caller_pause_too_short'
+            clock.now+=.71
             assert c.waiting_status('fixture-call','session')[1]=='eligible'
         else:
             assert c.waiting_status('fixture-call','session')[1]=='caller_speaking'

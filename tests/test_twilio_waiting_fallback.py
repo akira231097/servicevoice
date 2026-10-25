@@ -30,6 +30,8 @@ def test_fallback_needs_matching_recent_final_and_real_caller_stop():
         clock.now += .8
         assert not c.fallback_ready("fixture-call", "session", TEXT)  # unfinished ASR
         event("transcript", "user", transcriptType="final", transcript=TEXT)
+        assert not c.fallback_ready("fixture-call", "session", TEXT)  # descriptive pause still short
+        clock.now += .71
         assert c.fallback_ready("fixture-call", "session", TEXT)
         assert not c.fallback_ready("fixture-call", "session", "a different request")
         clock.now += 4
