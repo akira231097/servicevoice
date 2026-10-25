@@ -26,6 +26,7 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
 MAX_TEXT_CHARACTERS = 4000
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_AUDIO_SECONDS = 90
+ATOMIC_FAREWELL = "Thank you for calling. Goodbye."
 
 
 class TTSError(RuntimeError):
@@ -320,6 +321,23 @@ class GeminiTTS:
                     if "text/event-stream" not in upstream.headers.get("content-type", "").lower():
                         raise TTSError("tts_upstream_wrong_content_type")
                     audio = pcm_chunks(upstream, rate, metadata=audio_metadata)
+                if (settings.get("SERVICEVOICE_TTS_ATOMIC_FAREWELL") == "on"
+                        and text.strip() == ATOMIC_FAREWELL):
+                    # Vapi's blocking endCall can resolve on the first tiny
+                    # streamed segment, disconnecting before subsequent speech.
+                    # This exact fixed farewell is bounded and fully validated
+                    # before releasing any bytes; ordinary replies still stream.
+                    chunks=[];size=0
+                    async for chunk in audio:
+                        size+=len(chunk)
+                        if size>rate*2*8:raise TTSError("tts_audio_limit_exceeded")
+                        chunks.append(chunk)
+                    if not size:raise TTSError("tts_upstream_empty_audio")
+                    pcm=b"".join(chunks)
+                    await audio.aclose()
+                    async def complete_farewell():yield pcm
+                    audio=complete_farewell()
+                    audio_metadata["synthesis_source"]="buffered_farewell"
                 first = await anext(audio)
                 first_ms = round((time.perf_counter()-started)*1000, 3)
                 observe("tts.first_audio_ready", first_audio_ms=first_ms)

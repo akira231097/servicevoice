@@ -56,11 +56,11 @@ _APPROVAL = (r"(?:" + _AFFIRMATION + r"|please|that(?:['’]?s| is) (?:correct|r
 _CLEAR_APPROVAL = re.compile(r"^(?:" + _AFFIRMATION + r"[,! .]+)?(?:please[,! .]+)?" + _APPROVAL + r"(?:[,! .]+please)?[.! ]*$", re.I)
 _BOOKING_READBACK = re.compile(r"\b(?:confirm|readback|shall i book|would you like me to book|ready to book)\b", re.I)
 _OTHER_ACTION = re.compile(r"\b(?:cancel(?:lation|led|ing)?|reschedul(?:e|ing)|refund|delete|withdraw|handoff)\b", re.I)
-_HOLD_STOP = re.compile(r"\b(?:goodbye|bye|hang up|hangup|disconnect|stop (?:talking|speaking|listening)|"
+_HOLD_STOP = re.compile(r"\b(?:goodbye|bye|hang up|hangup|disconnect|(?:stop|end) (?:the |this )?call|i['’]?m done|stop (?:talking|speaking|listening)|"
     r"(?:please )?hold on|wait (?:a|one|just|please)|give me (?:a second|a moment|some time)|"
     r"(?:don't|do not) (?:talk|speak|interrupt))\b|^(?:stop|wait|hold on)[.! ,]*$", re.I)
 _EMPTY_RESPONSE = re.compile(r"^(?:(?:uh|um|erm|hmm|ah)[.! ,]*)+$", re.I)
-_GREETING = re.compile(r"^(?:hi|hello|hey|thanks|thank you|good (?:morning|afternoon|evening))[.! ,]*$", re.I)
+_GREETING = re.compile(r"^(?:hi|hello|hey|thanks|thank you|how['’]?s it going|how are you(?: doing)?|good (?:morning|afternoon|evening))[.!?, ]*$", re.I)
 _SPOKEN_CONTACT = re.compile(r"^(?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)[ ,.-]*){7,}$",re.I)
 
 
@@ -88,7 +88,15 @@ def guarded_waiting_fallback(decision, state, context):
     models, invalid answers, explicit exclusions, names and pending actions cannot.
     """
     if isinstance(state, dict) and state.get("neutral_waiting"):
-        return (decision.reason == "classification_uncertain"
+        uncertain = decision.reason == "classification_uncertain"
+        # A weak exclusion can mean the caller is unsure about their vehicle,
+        # not that a neutral hold is unsafe. Require an independently recognized
+        # routine subject; strong exclusions and unavailable/invalid models fail.
+        weak_exclusion = (decision.reason == "classifier_silence"
+            and decision.probability is not None and decision.probability < .90
+            and decision.content_kind in {"information_question", "scheduling_request", "ordinary_detail", "factual_correction"}
+            and decision.content_probability is not None and decision.content_probability >= .80)
+        return ((uncertain or weak_exclusion)
             and decision.probability is not None and decision.probability > .5
             and neutral_language_compatible(decision.language_choice, decision.language_probability, state)
             and isinstance(context, dict) and context.get("allow_turn") is True and context.get("ended") is False)
@@ -242,6 +250,11 @@ def waiting_payload(state):
             "A greeting, name, contact response, yes/no, action approval or rejection, factual correction, "
             "scheduling details and a completed request are compatible with a neutral hold, at every booking stage. "
             "A completed cancellation request is compatible; a request to stop talking or wait is not. "
+            "Not knowing the cause of a vehicle problem, being worried, considering service options, or "
+            "asking for the earliest appointment/as soon as possible are ordinary requests, not emergency "
+            "urgency or an instruction to keep silent. 'I do not know what the issue is, so I want an "
+            "appointment as soon as possible' is complete and compatible. Classify the completed overall "
+            "request, not earlier spoken hesitations or the caller's uncertainty about a diagnosis. "
             "A short answer to the previous question may be complete. Distinguish it from trailing hesitation, "
             "an unfinished thought, a thinking pause or unintelligible noise. Do not treat quiet as a response.",
             "criteria":{"ordinary_content":"A recognizable completed response or request that can receive a neutral pause; no instruction to stay quiet or other exclusion.",

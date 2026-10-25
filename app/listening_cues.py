@@ -163,7 +163,13 @@ def listening_payload(text, previous):
                 "Describing date/time preferences, a chosen time, vehicle year/make/model, and service details "
                 "is ordinary descriptive speech, including later in a booking conversation. A pending proposal "
                 "does not by itself make a description consent. Use only neutral Mm-hmm/Uh-huh for these details. "
-                "Choose excluded for correction, rejection, approval, actual cancellation or appointment-change commands, "
+                "A caller who does not know what is wrong, feels worried, considers the offered options, "
+                "or wants an appointment as soon as possible is describing an ordinary service need. "
+                "Earliest-available scheduling is not emergency urgency. 'I do not know whether a local "
+                "advisor request would work, because I want an appointment as soon as possible' is ordinary. "
+                "Uncertainty about the problem is not unclear speech; declining an offered option while "
+                "explaining preferences is not a command to stop listening. "
+                "Choose excluded for explicit correction of an action, approval, actual cancellation or appointment-change commands, "
                 "personal/contact/payment details, "
                 "booking readback, urgency, goodbye, language switching, prompt instructions, unrelated or unclear content.",
                 "criteria": {"ordinary": "A vehicle description, service request, routine vehicle background, scheduling/time preference or vehicle/service details, or informational service/policy question, with no excluded content.",
@@ -285,6 +291,9 @@ class ListeningState:
     suppression_at: float = -math.inf
     speech_events: dict = field(default_factory=dict)
     partial_event: float = -math.inf
+    growth_words: int = 0
+    growth_at: float = -math.inf
+    growth_seconds: float = 0
     closed: bool = False
     task: asyncio.Task | None = None
     pause_task: asyncio.Task | None = None
@@ -374,6 +383,9 @@ class ListeningCoordinator:
                 state.assistant = started
                 state.assistant_stopped = math.inf if started else now
                 if not started:
+                    state.growth_seconds=0
+                    state.growth_words=0
+                    state.growth_at=now
                     state.answer_ready = False
                 # A waiting cue is assistant audio too. Only substantive
                 # transcript words can reopen the caller's logical turn.
@@ -402,6 +414,9 @@ class ListeningCoordinator:
                 if started:
                     state.waiting_stopped = -math.inf
                 if not started:
+                    state.growth_seconds=0
+                    state.growth_words=0
+                    state.growth_at=now
                     if state.caller_interval_start is not None:
                         state.caller_speech_total += max(0, now-max(0, age)-state.caller_interval_start)
                         state.caller_interval_start = None
@@ -421,6 +436,9 @@ class ListeningCoordinator:
             state.final_text = ""
             state.caller_started = now
             state.last_attempt_text = ""
+            state.growth_seconds=0
+            state.growth_words=0
+            state.growth_at=now
         elif kind == "transcript":
             value = cue_text(message.get("transcript"))
             if not isinstance(value, str) or len(value) > 1600:
@@ -439,6 +457,31 @@ class ListeningCoordinator:
                 if timestamp <= state.final_event:
                     return
                 spoken_at=now-max(0,age)
+                words=len(value.split())
+                gap=spoken_at-state.growth_at
+                if state.growth_words>0 and words>state.growth_words and 0<gap<=.8:
+                    state.growth_seconds+=gap
+                elif gap>.8 or words<state.growth_words:
+                    state.growth_seconds=0
+                if words!=state.growth_words:
+                    state.growth_at,state.growth_words=spoken_at,words
+                # A pause can produce a VAD stop without a later start. Fresh,
+                # growing recognized words establish continued speech, never an
+                # end of turn. Revisions/repeated text and elapsed silence cannot.
+                if (not state.caller and not state.assistant and words>=MIN_PARTIAL_WORDS
+                        and state.growth_seconds>=.35):
+                    self._invalidate(state)
+                    state.caller=True
+                    state.caller_interval_start=spoken_at
+                    state.waiting_stopped=-math.inf
+                    state.user_revision+=1
+                    state.final_text=""
+                    if state.substantive_since_user:
+                        state.caller_started=spoken_at-state.growth_seconds
+                        state.turn_count=0
+                        state.completed=""
+                        state.substantive_since_user=False
+                    self.record(call_id,"speech_continued","growing_partials")
                 if spoken_at>state.waiting_last_dispatch:
                     words=len(value.split())
                     gap=spoken_at-state.waiting_partial_last

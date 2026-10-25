@@ -70,7 +70,7 @@ _ENUM_ATTRIBUTES = {
     "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment","one_sec","just_a_sec","let_me_see","checking","taking_a_look"}),
     "backchannel_content_kind": frozenset({"information_question","scheduling_request","ordinary_detail","factual_correction","other"}),
     "backchannel_reason": frozenset({"emitted","primary_ready","policy_not_ready","context_unavailable","turn_already_acknowledged","cooldown","call_budget","budget_capacity","not_eligible","sensitive_context","sensitive_utterance","sensitive_prior_turn","cached_language_unverified","short_or_ambiguous","urgent_or_safety","untrusted_control_content","classifier_timeout","classifier_unavailable","low_confidence","selected","silence","invalid_context","turn_not_allowed","invalid_messages","not_final_user_turn","input_bounds","prior_context_bounds","credential_missing","classification_capacity","provider_unavailable","invalid_response","response_bounds","model_mismatch","policy_closed","classification_deadline","classifier_silence","classification_uncertain","eligible_classification","classification_unavailable"}),
-    "synthesis_source": frozenset({"pregenerated_cache","live_google"}),
+    "synthesis_source": frozenset({"pregenerated_cache","live_google","buffered_farewell"}),
     "error_code": frozenset({"none", "unknown", "invalid_arguments", "unauthorized", "authentication_rejected", "capacity_rejected", "invalid_history", "invalid_event", "deadline_exceeded", "timeout", "upstream_unavailable", "state_unavailable", "operation_pending", "operation_unknown", "operation_missing", "operation_failed", "idempotency_conflict", "harness_overloaded", "harness_closed", "session_ended", "slot_unavailable", "receipt_missing", "receipt_mismatch", "validation_error", "internal_error", "cancelled", "waiter_interrupted", "budget_exhausted", "missing_evidence", "export_failure", "quota_exhausted", "invalid_audio", "transport_error",
         "tts_resampler_unavailable", "tts_resampling_failed", "tts_upstream_missing_sample_rate", "tts_upstream_wrong_channel_count", "tts_upstream_sample_rate_changed", "tts_upstream_audio_after_completion",
         "classifier_timeout", "classifier_unavailable", "classifier_rate_limited", "classification_deadline",
@@ -120,6 +120,7 @@ _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_energy_without_words"
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"fallback_turn_unverified"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_requested_quiet"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_turn_finished"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"growing_partials"})
 _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"cancelled_without_observed_speech", "cancelled_before_meaningful_speech"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_continuation_too_short", "repeated_phrase"})
 _ENUM_ATTRIBUTES["route"] |= frozenset({"deterministic_closing"})

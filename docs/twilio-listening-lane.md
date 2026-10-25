@@ -352,3 +352,25 @@ remain rejected; the in-memory receipts do not survive a process restart.
 These changes do not switch models, shorten booking checks, or enable the
 prototype on the main number. Endpointing, prompt reduction, speakerphone echo,
 and four simultaneous live callers require separate measurement.
+# Handset regression safeguards (October 24)
+
+The isolated speech service can enable `SERVICEVOICE_TTS_ATOMIC_FAREWELL=on`.
+Only the exact native farewell, “Thank you for calling. Goodbye.”, is buffered
+and validated completely before any audio bytes are returned. The eight-second
+audio bound and the existing request deadline still apply. Ordinary replies
+continue streaming; the main speech service is not opted in. This addresses an
+observed Vapi endCall failure where a five-millisecond first segment was mistaken
+for farewell completion and the real audio began after disconnect.
+
+Fresh growing partial words can restore listening after an omitted VAD start.
+They revoke waiting-cue permission and never establish an end of turn. Repeated
+text, same-length revisions, stale events and elapsed silence cannot do this.
+An observed stop is still required before a waiting cue.
+
+Jev distinguishes routine worry, uncertainty about a vehicle issue and earliest
+appointment requests from emergency urgency and commands to stop. The isolated
+neutral-hold fallback also accepts a weak exclusion (below 0.90) only with an
+independently recognized routine subject, compatible language, fresh matching
+final caller text and observed quiet. Strong exclusions, missing/invalid model
+responses, explicit stop/end requests and unfinished thoughts remain silent.
+
