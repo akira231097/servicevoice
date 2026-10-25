@@ -75,6 +75,7 @@ class TwilioLane:
         self.closing = False
         self.tasks = set()
         self.bindings = {}
+        self.ended_bindings = {}  # Bounded no-op receipts, never live admission.
         self.proofs = {}
         self.watchdogs = {}
         self.ending = set()
@@ -253,6 +254,14 @@ class TwilioLane:
         call_id = ingress._identity(call, message.get("assistant"), assistant_required=True)
         binding = self.bindings.get(call_id)
         overrides = call.get("assistantOverrides")
+        if binding is None and self.ended_bindings.get(call_id) is not None:
+            if (isinstance(overrides, dict)
+                    and overrides.get("variableValues") == {"session_id": self.ended_bindings[call_id]}):
+                # Vapi may finish a transcript after the room has closed. The
+                # HTTP route already authenticated the request; _identity above
+                # checks org, phone and assistant. Never restore listening or
+                # enqueue scheduler work for this exact retired binding.
+                return True
         if binding is None or not isinstance(overrides, dict) or overrides.get("variableValues") != {"session_id": binding[1]}:
             raise IngressError("bridge_event_not_admitted", 403)
         self.event(call_id, message)
@@ -435,6 +444,10 @@ class TwilioLane:
             row = await asyncio.to_thread(self.store.get, bridge_id)
             call_id = row["provider_call_id"]
             if call_id:
+                if row["state"] == "ended" and row["session_id"]:
+                    self.ended_bindings[call_id] = row["session_id"]
+                    while len(self.ended_bindings) > MAX_PROTOTYPE_CALLS:
+                        self.ended_bindings.pop(next(iter(self.ended_bindings)))
                 self.coordinator.retire(call_id)
                 self.bindings.pop(call_id, None)
                 self.proofs.pop(call_id, None)

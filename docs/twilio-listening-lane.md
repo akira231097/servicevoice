@@ -339,7 +339,15 @@ observably stopped and stayed quiet, and no proposal or operation is pending.
 A final-transcript marker is not required. A verified proposal dismissal can reach that path; the
 shortcut itself performs no scheduler action. Bare stop, quoted/conditional
 goodbyes, consent, new requests, uncertainty and other languages keep the model
-path. Native farewell playback and termination still require live verification.
+path. The isolated live repeat reached this path after verified withdrawal;
+its goodbye was audible after 3.20 seconds instead of 5.88 seconds. That still
+includes withdrawal work, and is not an instant-response claim.
+
+Vapi can send an assistant partial after conference cleanup. The lane retains
+at most the prototype lifetime quota of exact ended call/session identities.
+Authenticated fast events for those identities are acknowledged without
+restoring listening, admission or tool work. Unknown or mismatched identities
+remain rejected; the in-memory receipts do not survive a process restart.
 
 These changes do not switch models, shorten booking checks, or enable the
 prototype on the main number. Endpointing, prompt reduction, speakerphone echo,
