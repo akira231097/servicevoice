@@ -343,6 +343,9 @@ def test_completed_earlier_reviews_stay_complete_and_a_restart_never_requeues_th
 
 def test_status_runs_are_rare_and_labelled(scenario,tmp_path):
     worker,mock,now=worker_fixture(tmp_path,scenario)
+    # Status rows are fingerprinted per UTC day. Start just after midnight UTC so
+    # the six-hour step below stays on one day whatever time the suite runs.
+    now[0]=now[0]//86400*86400+60
     worker.heartbeat();first=len(mock.runs)
     now[0]+=1000;worker.heartbeat()
     assert len(mock.runs)==first  # a quarter hour of unchanged status is not a new trace
