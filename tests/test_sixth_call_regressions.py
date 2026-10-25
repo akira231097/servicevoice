@@ -120,9 +120,10 @@ def test_hows_it_going_is_a_greeting_not_language_uncertainty():
     ('So what can you do?',.75),
     ('Because I just want to book an appointment as soon as possible.',.75),
 ])
-def test_long_description_pause_is_not_a_direct_question_handoff(tail,quiet):
+@pytest.mark.parametrize('elapsed',[4,10])
+def test_long_description_pause_is_not_a_direct_question_handoff(tail,quiet,elapsed):
     async def run():
-        c,clock,_,_,_,event,_=setup();clock.now=10
+        c,clock,_,_,_,event,_=setup();clock.now=elapsed
         text='The engine rattles every morning when I drive around my neighborhood. '+tail
         event('transcript','user',transcriptType='final',transcript=text)
         event('speech-update','user',status='stopped')

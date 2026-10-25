@@ -15,6 +15,15 @@ def verify(logs):
     inputs=[r['time'] for r in rows if r.get('body')=='Voice input' and
         (r.get('attributes',{}).get('text') or r.get('attributes',{}).get('input'))=='Thank you for calling. Goodbye.']
     result={'passed':False,'scope':'Provider farewell timing; caller-side audio is verified separately.'}
+    if not inputs:
+        # Current provider logs omit Voice input. A typed native endCall start
+        # can anchor teardown timing, but cannot establish farewell content.
+        inputs=[r['time'] for r in rows if r.get('body')=='Tool execution started'
+            and r.get('attributes',{}).get('toolType')=='endCall'
+            and r.get('attributes',{}).get('toolNames')==['endCall']]
+        result['anchor']='native_end_call_execution'
+    else:
+        result['anchor']='exact_farewell_voice_input'
     if not inputs:return {**result,'reason':'farewell_input_missing'}
     start=inputs[-1];ends=[r['time'] for r in rows if r.get('body')=='call.ended' and r['time']>=start]
     if not ends:return {**result,'reason':'disconnect_evidence_missing'}

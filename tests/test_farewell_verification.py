@@ -20,3 +20,15 @@ def test_complete_farewell_and_end_are_required_in_order():
     assert not verify(rows[:-1])['passed']
     assert not verify([r for r in rows if r['body']!='Bot stopped speaking'])['passed']
     assert not verify([row(3710,'call.ended')])['passed']
+
+
+def test_provider_log_without_voice_input_requires_typed_native_endcall_anchor():
+    start={'time':1000,'body':'Tool execution started',
+        'attributes':{'toolType':'endCall','toolNames':['endCall']}}
+    rows=[start,row(1500,'Bot started speaking'),row(3700,'Bot stopped speaking'),row(3710,'call.ended')]
+    assert verify(rows)['passed']
+    assert verify(rows)['anchor']=='native_end_call_execution'
+    start['attributes']['toolType']='function'
+    assert not verify(rows)['passed']
+    start['attributes']['toolType']='endCall'
+    assert not verify([start,row(1500,'call.ended'),row(1510,'Bot started speaking'),row(3710,'Bot stopped speaking')])['passed']

@@ -56,7 +56,9 @@ def waiting_quiet_seconds(state):
     Short replies and a direct question/request keep the ordinary delay. This
     only raises a timing floor; it never grants speech or classifies consent.
     """
-    if state.caller_stopped-state.caller_started < 8 or len(state.text.split()) <= 12:
+    # A thinking pause can happen early, and Vapi's interruption event can
+    # restart caller_started. Neither is evidence of a completed request.
+    if len(state.text.split()) <= 12:
         return WAITING_QUIET_SECONDS
     tail=re.split(r"[.!?]\s+", state.text.strip())[-1].strip()
     direct=re.match(r"^(?:(?:so|and|because)[, ]+)?(?:what|when|where|why|how|can|could|would|will|do|does|is|are|"

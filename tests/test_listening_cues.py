@@ -123,7 +123,7 @@ def test_waiting_cues_require_observed_quiet_and_invalidate_on_resumed_speech():
         c, clock, _, _, _, event, _ = setup()
         ticket, reason = c.waiting_status("fixture-call", "session")
         assert reason == "caller_speaking"
-        event("transcript", "user", transcriptType="final", transcript=TEXT)
+        event("transcript", "user", transcriptType="final", transcript=TEXT+". What can you do?")
         assert c.waiting_status("fixture-call", "session")[1] == "caller_speaking"
         event("speech-update", "user", status="stopped")
         clock.now += .74
@@ -152,7 +152,7 @@ def test_waiting_quiet_window_uses_receipt_and_recent_partial_and_keeps_tool_fol
         event("speech-update", "user", status="stopped", timestamp=(clock.wall()-1)*1000)
         assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
         clock.now += .6
-        event("transcript", "user", transcriptType="partial", transcript=TEXT)
+        event("transcript", "user", transcriptType="partial", transcript=TEXT+". What can you do?")
         clock.now += .3
         assert c.waiting_status("fixture-call", "session")[1] == "caller_pause_too_short"
         clock.now += .5

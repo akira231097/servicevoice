@@ -369,7 +369,8 @@ They revoke waiting-cue permission and never establish an end of turn. Repeated
 text, same-length revisions, stale events and elapsed silence cannot do this.
 An observed stop is still required before a waiting cue.
 
-A long descriptive turn needs 1.5 seconds of observed quiet before a hold.
+A descriptive passage over twelve words needs 1.5 seconds of observed quiet
+before a hold, including early pauses and after an interruption resets the timer.
 Short replies and a final direct question/request retain the 0.75-second floor.
 This reduces cut-off “Just…”/“One…” fragments during one-second thinking pauses;
 it does not infer an end of turn from silence or delay a ready main answer.
