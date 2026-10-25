@@ -100,9 +100,15 @@ def test_actual_12ms_blip_with_growing_asr_but_no_new_vad_boundary():
                 i+=1
             clock.now=start+now
             if c.waiting_status('fixture-call','session')[1]=='eligible':allowed.append(now)
-        assert allowed and allowed[0]>=4.29 and allowed[0]<=4.32
+        # Growing words restore listening and revoke the old pre-interruption
+        # stop. Neither the final ASR clause nor elapsed time proves a new end.
+        assert not allowed
+        assert c.waiting_status('fixture-call','session')[1]=='caller_speaking'
         assert c.calls['fixture-call'].caller_speech_total==c.calls['fixture-call'].waiting_speech_total
         c.track_waiting('fixture-call','session',123,abandoned=True)
+        assert c.refundable_waiting('fixture-call','session') is None
+        event('speech-update','user',status='stopped');clock.now+=.76
+        assert c.waiting_status('fixture-call','session')[1]=='eligible'
         assert c.refundable_waiting('fixture-call','session')==123
         await c.close()
     asyncio.run(run())
