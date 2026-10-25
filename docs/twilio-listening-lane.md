@@ -381,3 +381,46 @@ neutral-hold fallback also accepts a weak exclusion (below 0.90) only with an
 independently recognized routine subject, compatible language, fresh matching
 final caller text and observed quiet. Strong exclusions, missing/invalid model
 responses, explicit stop/end requests and unfinished thoughts remain silent.
+
+## Caller-ID name step (October 25)
+
+Optional and off unless both `SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY` and
+`SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY` are set. The private policy file holds
+the mode (`off`, `shadow`, `personalize`) and HMAC-SHA256 digests of allowlisted
+numbers, never the numbers. It is reread every two seconds off the call path;
+a missing or malformed file fails closed to `off`, including for calls already
+in progress.
+
+For an allowlisted caller, the signed incoming-call webhook starts one Twilio
+Lookup caller-name request (`Fields=caller_name`) on its own four-connection
+pool with a single total deadline, no retries and no queue. Nothing in call
+admission, the greeting or an answer waits for it. Results live in memory for
+that call and are discarded at hang-up. Callers not on the allowlist are never
+looked up. A labelled synthetic name is accepted only for owned test calls.
+
+CNAM listings are at most 15 characters and often placeholders. The cleaner
+rejects business, placeholder, city/state, single-word, initial-only, possibly
+truncated (exactly 15 characters) and instruction-like values. Only an explicit
+comma establishes surname-first order; otherwise the listed order is kept and
+never guessed.
+
+In `personalize`, the phone assistant receives unverified caller-ID text after
+the policy hash. It replaces the existing name-and-number question with "Should
+I put this under [name], at the number you're calling from?", or, without a
+usable name, "May I have your name? I can use the number you're calling from."
+The question state comes from the call history Vapi reports, so a cancelled
+draft never counts as asked; after the question, the name is withdrawn and only
+a name the caller confirmed or gave is used. Caller ID is never identity,
+consent or authentication: the readback and explicit later assent still govern
+every booking. `shadow` performs the lookup without changing speech.
+
+Diagnostics record fixed codes only (`caller_lookup`, `caller_hint`,
+`caller_policy` on `twilio_bridge`): outcome, mode, STIR/SHAKEN category and
+duration, never the number, name or provider response. The reviewer reads the
+same codes to add a content-free `caller_id` evidence item, so an accepted
+caller-ID name or calling number is not graded as an invented detail. The
+booking database schema is unchanged.
+
+The owner's number returned no CNAM name ("UNDETERMINED"), so live calls from
+it use the number-only question; the name question is exercised with the owned
+test line's labelled synthetic name.

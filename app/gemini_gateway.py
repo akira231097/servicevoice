@@ -821,6 +821,8 @@ class GeminiGateway:
         self.waiting_fallback_ready = None
         self.waiting_content_finished = None
         self.waiting_cue_track = None
+        # Optional, in-memory caller-ID text for the same isolated assistant.
+        self.caller_hint = None
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -1240,6 +1242,12 @@ class GeminiGateway:
         if context:
             diagnostic_context.update(user_count=context["user_count"],turn_id=turn_identifier(call_id,context["user_count"]))
         timing.row["system_prompt_sha256"] = hashlib.sha256(upstream["messages"][0]["content"].encode("utf-8")).hexdigest()
+        if diagnostic_context.get("serial_tools") and self.caller_hint is not None:
+            # Appended after hashing, so the policy hash never covers caller data.
+            # A memory read only: an absent or failed hint leaves the turn unchanged.
+            try:hint=self.caller_hint(call_id,sid,upstream["messages"])
+            except Exception:hint=None
+            if isinstance(hint,str) and hint:upstream["messages"][0]["content"]+=hint
         timing.row["counts"]["history_messages"] = len(upstream["messages"])
         timing.row["counts"]["history_tool_results"] = sum(message["role"] == "tool" for message in upstream["messages"])
         try:

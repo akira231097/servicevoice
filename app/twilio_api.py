@@ -19,6 +19,7 @@ from collections import Counter, deque
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from .caller_context import CallerContext, CallerNameLookup, PolicySource
 from .listening_cues import CueNotSent, ListeningCoordinator, ListeningPolicy, information_question, listening_gate, neutral_listening_only, LISTENING_PHRASES
 from .telephony_ingress import IngressError, IngressConfig, TelephonyIngress
 from .phone_ingress_router import PhoneIngressRouter
@@ -100,6 +101,8 @@ class TwilioLane:
         self.observed_proof_paths = ()
         self.fixture = None
         self.test_capture = None
+        self.caller_source = None  # Optional private caller-ID policy; absent means no lookups.
+        self.caller = None
         self.coordinator = ListeningCoordinator(ListeningPolicy(connection_capacity=MAX_CONCURRENT_CALLS), "",
             self.context, self.dispatch, self.observe)
 
@@ -147,6 +150,11 @@ class TwilioLane:
             return
         if self.client is None:
             self.client = TwilioClient(self.config)
+        if self.caller_source is not None and self.caller is None:
+            self.caller = CallerContext(self.caller_source,
+                CallerNameLookup(self.config.api_key_sid, self.config.api_key_secret),
+                spawn=self.spawn, observe=self.observe_caller)
+            await self.caller.start()
         self.coordinator.key = settings.get("TYPESAFE_API_KEY", "")
         if flag(settings, "SERVICEVOICE_TWILIO_TESTER"):
             self.fixture = await asyncio.to_thread(load_test_fixture,
@@ -193,6 +201,8 @@ class TwilioLane:
         for task in self.watchdogs.values():
             task.cancel()
         await self.coordinator.close()
+        if self.caller:
+            await self.caller.close()
         if self.client:
             for row in await asyncio.to_thread(self.store.active):
                 await self.finish(row["id"])
@@ -231,6 +241,8 @@ class TwilioLane:
                 self.bindings.pop(call_id, None)
                 raise
             self.bindings[call_id] = (bridge_id, session_id)
+            if self.caller:
+                self.caller.bind(bridge_id, call_id)
             self.media.setdefault(bridge_id, OpeningMedia(self.coordinator.clock()))
             if self.config.topology == "direct_sip":
                 with self.store.db() as db:
@@ -336,6 +348,16 @@ class TwilioLane:
 
     async def context(self, session_id, call_id):
         return await asyncio.to_thread(self.app.state.gemini_gateway._backchannel_context, session_id, call_id)
+
+    def observe_caller(self, call_id, event, outcome, attributes, duration_ms=None):
+        self.app.state.diagnose("twilio_bridge", event, outcome, call_id=call_id, duration_ms=duration_ms,
+            attributes=attributes)
+
+    def caller_hint(self, call_id, session_id, messages):
+        binding = self.bindings.get(call_id)
+        if self.caller is None or binding is None or binding[1] != session_id:
+            return None
+        return self.caller.hint(binding[0], messages, call_id)
 
     def observe(self, call_id, event, reason, phrase_id=None):
         component = "listening_cue" if event in {"decision", "suppressed", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail"} else "twilio_bridge"
@@ -452,6 +474,8 @@ class TwilioLane:
                 self.bindings.pop(call_id, None)
                 self.proofs.pop(call_id, None)
             self.media.pop(bridge_id, None)
+            if self.caller:
+                self.caller.finish(bridge_id, call_id)
             verified = not row["dial_pending"]
             local_clean = True
             if call_id and row["session_id"]:
@@ -539,6 +563,8 @@ def install_twilio(app, settings):
             live_admission=app.state.live_admission)
         app.state.telephony_ingress = PhoneIngressRouter(primary, isolated, app.state.store)
     lane = TwilioLane(app, config) if config else None
+    if lane:
+        lane.caller_source = PolicySource.from_settings(settings)
     app.state.twilio_lane = lane
     install_capture(app,lane)
     if lane:
@@ -558,6 +584,7 @@ def install_twilio(app, settings):
             app.state.gemini_gateway.waiting_fallback_ready = lane.fallback_ready
             app.state.gemini_gateway.waiting_content_finished = lane.coordinator.mark_waiting_finished
             app.state.gemini_gateway.waiting_cue_track = lane.coordinator.track_waiting
+            app.state.gemini_gateway.caller_hint = lane.caller_hint
 
     @app.exception_handler(BridgeError)
     async def bridge_error(request, exc):
@@ -614,6 +641,11 @@ def install_twilio(app, settings):
         if row["state"] == "ended":
             return Response("<Response><Hangup /></Response>", media_type="application/xml")
         lane.watch(row)
+        if lane.caller is not None:
+            try:  # Background only; the TwiML below never waits for it or depends on it.
+                lane.caller.begin(row["id"], fields)
+            except Exception:
+                lane.observe_caller(row["id"], "caller_lookup", "failed", {"caller_lookup_outcome": "error"})
         result = (conference_twiml(config, row["id"]) if config.topology == "conference"
                   else direct_twiml(config, row["id"], lane.store.target(config, row)))
         return Response(result, media_type="application/xml")
