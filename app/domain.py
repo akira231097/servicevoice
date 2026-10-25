@@ -285,6 +285,22 @@ class Store:
             "The local advisor request was withdrawn. Its audit record remains; no appointment was changed and no external contact was made."
             if row["status"]=="withdrawn" else "Local queue only; no actual transfer or callback sent."}
 
+    def returning_customer(self, phone):
+        """Read-only: the name and vehicle from this callback number's latest booking.
+
+        A caller-ID hint for an isolated phone line, never identity: no times,
+        references or appointment access. None when the number never booked.
+        """
+        if not isinstance(phone, str) or len(phone) != 12 or not phone.startswith("+1") or not phone[1:].isdigit():
+            return None
+        with self.read_connection(0.2) as db:
+            rows = db.execute("""SELECT customer FROM appointments WHERE tenant=?
+                AND json_extract(customer,'$.phone')=? ORDER BY rowid DESC LIMIT 50""", (TENANT, phone)).fetchall()
+        if not rows:
+            return None
+        latest = json.loads(rows[0]["customer"])
+        return {"name": latest.get("name"), "vehicle": latest.get("vehicle"), "visits": len(rows)}
+
     def appointment(self, db, sid):
         r=db.execute('''SELECT a.*,s.start FROM appointments a JOIN slots s ON a.slot_id=s.id
             WHERE a.session_id=? AND a.tenant=? ORDER BY a.rowid DESC LIMIT 1''',(sid,TENANT)).fetchone()

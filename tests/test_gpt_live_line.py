@@ -356,7 +356,7 @@ OWNER = "+12175550142"
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test", "Jordan Rivera"),)):
+def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test", "Jordan Rivera"),), callers=None):
     allow = []
     for number, label, fixture in entries:
         entry = {"digest": hmac.new(CALLER_KEY.encode(), number.encode(), hashlib.sha256).hexdigest(), "label": label}
@@ -364,8 +364,19 @@ def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test
             entry["fixture_name"] = fixture
         allow.append(entry)
     path = tmp_path / "caller-policy.json"
-    path.write_text(json.dumps({"schema": "servicevoice-caller-context-v1", "mode": mode, "allow": allow}))
+    policy = {"schema": "servicevoice-caller-context-v1", "mode": mode, "allow": allow}
+    if callers:
+        policy["callers"] = callers
+    path.write_text(json.dumps(policy))
     return {"SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY": str(path), "SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY": CALLER_KEY}
+
+
+def settled(app, call_id, seconds=5):
+    """The earlier-booking check and any lookup run in the background; wait for them in tests."""
+    deadline = time.monotonic() + seconds
+    while app.state.caller_context.calls[call_id].outcome == "pending" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return app.state.caller_context.calls[call_id]
 
 
 def test_caller_id_name_rides_on_tool_results_and_is_never_stored(native_app, tmp_path):
@@ -374,6 +385,7 @@ def test_caller_id_name_rides_on_tool_results_and_is_never_stored(native_app, tm
     app, client = native_app(**caller_policy(tmp_path))
     with client:
         call, _ = admit(client, caller=TEST_LINE)
+        assert settled(app, call["id"]).outcome == "fixture"
         context = run_tool(client, call, "get_session_context", {}, "context-1", {"messages": []})
         guidance = context["caller_id_guidance"]
         assert "\"Should I put this under Jordan Rivera, at the number you're calling from?\"" in guidance
@@ -401,6 +413,7 @@ def test_caller_id_guidance_follows_what_was_actually_said(native_app, tmp_path)
     app, client = native_app(**caller_policy(tmp_path))
     with client:
         call, _ = admit(client, caller=TEST_LINE)
+        settled(app, call["id"])
         asked = [bot("Should I put this under Jordan Rivera, at the number you're calling from?", 1_000, 4_000),
                  user("No, it's for my wife, Dana Lee.", 4_500)]
         guidance = run_tool(client, call, "get_session_context", {}, "context-2", {"messages": asked})["caller_id_guidance"]
@@ -415,6 +428,7 @@ def test_a_number_already_offered_never_reopens_the_name_step(native_app, tmp_pa
     app, client = native_app(**caller_policy(tmp_path))
     with client:
         call, _ = admit(client, caller=TEST_LINE)
+        settled(app, call["id"])
         offered = [bot("May I have your name? I can use the number you're calling from.", 1_000, 4_000)]
         guidance = run_tool(client, call, "get_session_context", {}, "context-6", {"messages": offered})["caller_id_guidance"]
         assert "already offered the number they are calling from" in guidance and "Jordan" not in guidance
@@ -454,6 +468,9 @@ def test_caller_name_lookup_never_delays_the_call_and_ends_with_it(native_app, t
         call, _ = admit(client, caller=OWNER)
         assert time.monotonic() - started < 2  # admission never waits for the lookup
         assert "caller_id_guidance" not in run_tool(client, call, "get_session_context", {}, "context-4", {"messages": []})
+        deadline = time.monotonic() + 5
+        while "event" not in gate and time.monotonic() < deadline:
+            time.sleep(0.01)
         gate["loop"].call_soon_threadsafe(gate["event"].set)
         deadline = time.monotonic() + 5
         while app.state.caller_context.calls[call["id"]].outcome == "pending" and time.monotonic() < deadline:
@@ -476,6 +493,7 @@ def test_reviewer_learns_caller_id_reached_the_assistant_without_values():
     assert caller_id_offer(rows("details_saved", "name_asked")) == "name_and_number"
     assert caller_id_offer(rows("name_and_number", component="twilio_bridge")) == "name_and_number"
     assert caller_id_offer(rows("number_only", component="gateway")) is None and caller_id_offer(None) is None
+    assert caller_id_offer(rows("number_only", "returning_name")) == caller_id_offer(rows("returning_asked")) == "returning_customer"
     call = {"artifact": {"messages": [{"role": "bot", "message": "Hi, this is Cedar.", "secondsFromStart": 0.5},
                                       {"role": "user", "message": "Hours?", "secondsFromStart": 2}]}}
     snapshot = {"session": {"id": "sess_1", "created": 1_793_000_000.0, "ended": 1}, "appointments": [], "proposals": [],
@@ -501,3 +519,88 @@ def test_compose_reviewer_health_check_fits_its_cpu_cap_and_caller_policy_is_rea
     business, reviewer = text.split("  gpt-live-reviewer:")
     assert "cpus: 0.15" in reviewer and "timeout: 30s" in reviewer and "interval: 60s" in reviewer
     assert ":/run/caller-context:ro" in business
+
+
+# --- returning callers and every-caller mode (the lane's 04b7113) ---------------
+
+def book_directly(app, name, vehicle, phone):
+    """A completed booking from an earlier call, made through the domain Store."""
+    store = app.state.store
+    sid = store.create_session("voice")["id"]
+    slots = store.dispatch(sid, "begin_service_request", {"service": "oil_change"}, "search-" + name)["slots"]
+    proposal = store.dispatch(sid, "prepare_booking", {"service": "oil_change", "slot_id": slots[0]["id"],
+        "customer_name": name, "phone": phone, "vehicle": vehicle}, "prepare-" + name)
+    assert store.dispatch(sid, "confirm_action", {"proposal_id": proposal["proposal_id"], "confirmed": True}, "confirm-" + name)["ok"]
+
+
+def test_a_returning_caller_is_offered_the_earlier_name_and_then_the_vehicle(native_app, tmp_path):
+    from app.diagnostics import read_review_diagnostics
+    from app.live_eval_evidence import caller_id_offer
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        book_directly(app, "Dana Lee", "2019 Honda Civic", TEST_LINE[2:])
+        call, _ = admit(client, caller=TEST_LINE)
+        assert settled(app, call["id"]).outcome == "returning"  # the earlier booking wins over the test fixture
+        first = run_tool(client, call, "get_session_context", {}, "context-r1", {"messages": []})["caller_id_guidance"]
+        assert "\"Should I put this under Dana Lee again, at the number you're calling from?\"" in first
+        assert "Honda" not in first and "Civic" not in first and "Jordan" not in first  # the vehicle waits for the name
+        asked = [bot("Should I put this under Dana Lee again, at the number you're calling from?", 1_000, 4_000),
+                 user("Yes, that's me.", 4_500)]
+        second = run_tool(client, call, "get_session_context", {}, "context-r2", {"messages": asked})["caller_id_guidance"]
+        assert "Is this for the 2019 Honda Civic again?" in second and "Only if the caller clearly confirmed" in second
+    diagnostics = read_review_diagnostics(Path(app.state.store.path), call["id"])
+    assert caller_id_offer(diagnostics) == "returning_customer"
+    raw = json.dumps(diagnostics)
+    assert "Dana" not in raw and "Civic" not in raw and TEST_LINE not in raw
+
+
+def test_everyone_mode_looks_up_an_unlisted_caller(native_app, tmp_path, monkeypatch):
+    from app import main as main_module
+    from app.caller_context import LookupResult
+    stranger = "+19185550199"
+
+    class NamedLookup:
+        def __init__(self, *args, **kwargs):
+            self.calls = []
+
+        async def lookup(self, number, seconds):
+            self.calls.append(number)
+            return LookupResult("found", "Pat Morgan")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "CallerNameLookup", NamedLookup)
+    app, client = native_app(**caller_policy(tmp_path, callers="everyone"))
+    with client:
+        call, _ = admit(client, caller=stranger)
+        assert settled(app, call["id"]).outcome == "found" and app.state.caller_context.lookup.calls == [stranger]
+        guidance = run_tool(client, call, "get_session_context", {}, "context-e1", {"messages": []})["caller_id_guidance"]
+        assert "Should I put this under Pat Morgan, at the number you're calling from?" in guidance
+    app, client = native_app(**caller_policy(tmp_path))  # allowlist only: the same stranger is never looked up
+    with client:
+        call, _ = admit(client, caller=stranger)
+        assert call["id"] not in app.state.caller_context.calls
+        assert "caller_id_guidance" not in run_tool(client, call, "get_session_context", {}, "context-e2", {"messages": []})
+
+
+def test_store_finds_only_this_numbers_latest_booking_read_only(tmp_path):
+    from app.domain import Store
+    store = Store(tmp_path / "memory.sqlite3")
+    assert store.returning_customer("+14055550134") is None
+    def book(name, vehicle, phone):
+        sid = store.create_session("voice")["id"]
+        slots = store.dispatch(sid, "begin_service_request", {"service": "oil_change"}, "search-" + name)["slots"]
+        proposal = store.dispatch(sid, "prepare_booking", {"service": "oil_change", "slot_id": slots[0]["id"],
+            "customer_name": name, "phone": phone, "vehicle": vehicle}, "prepare-" + name)
+        assert store.dispatch(sid, "confirm_action", {"proposal_id": proposal["proposal_id"], "confirmed": True}, "confirm-" + name)["ok"]
+    book("Alex Morgan", "2019 Honda Civic", "4055550134")
+    book("Jordan Rivera", "2021 Toyota Camry", "4055550134")
+    book("Priya Patel", "2020 Ford Escape", "9185550199")
+    before = Path(store.path).read_bytes()
+    assert store.returning_customer("+14055550134") == {"name": "Jordan Rivera", "vehicle": "2021 Toyota Camry", "visits": 2}
+    assert store.returning_customer("+19185550199")["name"] == "Priya Patel"
+    assert store.returning_customer("+15125550000") is None
+    for bad in (None, "4055550134", "+1405555013", "+1405555013x", "anonymous"):
+        assert store.returning_customer(bad) is None
+    assert Path(store.path).read_bytes() == before

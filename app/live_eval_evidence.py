@@ -227,6 +227,8 @@ def caller_id_offer(diagnostics):
     # The Twilio lane records these on its bridge; the GPT-Live line on its webhook.
     states = {(row.get("attributes") or {}).get("caller_hint_state") for row in rows if isinstance(row, dict)
               and row.get("component") in ("twilio_bridge", "webhook") and row.get("event") == "caller_hint"} if isinstance(rows, list) else set()
+    if states & {"returning_name", "returning_asked"}:
+        return "returning_customer"
     # The name is withdrawn only after it was offered, so name_asked implies an earlier offer.
     if states & {"name_and_number", "name_asked"}:
         return "name_and_number"
@@ -347,7 +349,7 @@ def build_evidence(call, snapshot, tool_ids=None):
         issues.append("no_caller_transcript")
     created = datetime.fromtimestamp(snapshot["session"]["created"],timezone.utc)
     evidence["facts"] = dealership_facts(created.astimezone(TZ).date())
-    if snapshot.get("caller_id") in ("number_only", "name_and_number"):
+    if snapshot.get("caller_id") in ("number_only", "name_and_number", "returning_customer"):
         evidence["caller_id"] = {"available_to_assistant": snapshot["caller_id"],
             "provenance": "phone network caller ID for this call; unverified; this item does not contain the caller-ID values"}
     evidence["state"] = {"scheduler_evidence_available":snapshot.get("source_available",True),"appointments":snapshot["appointments"],"proposals":snapshot["proposals"],

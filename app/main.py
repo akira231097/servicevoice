@@ -124,7 +124,7 @@ def create_app(db_path=None):
             values=settings()
             caller=CallerContext(app.state.caller_source,
                 CallerNameLookup(values.get("TWILIO_API_KEY_SID") or "",values.get("TWILIO_API_KEY_SECRET") or ""),
-                spawn=asyncio.create_task,observe=observe_caller)
+                spawn=asyncio.create_task,observe=observe_caller,recall=app.state.store.returning_customer)
             await caller.start()
             app.state.caller_context=caller
     async def shutdown_resources():

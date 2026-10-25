@@ -91,7 +91,7 @@ def test_packages_match_the_actual_six_dimension_judgment_parser(control):
 
 
 def test_prompt_revision_digest_and_exported_provenance_match_without_caller_text():
-    assert JUDGE_PROMPT_REVISION == "2026-10-25-caller-id-2"
+    assert JUDGE_PROMPT_REVISION == "2026-10-25-caller-id-3"
     assert JUDGE_PROMPT_SHA256 == hashlib.sha256(JUDGE_SYSTEM.encode("utf-8")).hexdigest()
     control = vehicle_grounding_controls()[0]
     original = deepcopy(control["package"])
