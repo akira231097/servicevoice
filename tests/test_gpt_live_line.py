@@ -78,6 +78,7 @@ def test_assistant_payload_shape_and_guards():
     model = payload["model"]
     assert (model["provider"], model["model"]) == ("openai", "gpt-live-1")
     assert model["reasoner"]["model"] == "gpt-5.6-terra" and model["speaker"]["personalityPacks"] == ["eager-listener"]
+    assert model["reasoner"]["reasoningEffort"] == "none"  # "low" measured about 1.5 s slower per lookup
     names = [tool["function"]["name"] for tool in model["tools"] if tool["type"] == "function"]
     assert names == [schema["function"]["name"] for schema in TOOL_SCHEMAS]
     assert all(tool["async"] is False for tool in model["tools"] if tool["type"] == "function")
@@ -88,10 +89,14 @@ def test_assistant_payload_shape_and_guards():
     assert 'transcript[transcriptType="final"]' in payload["serverMessages"] and "tool-calls" in payload["serverMessages"]
     assert [hook["options"]["timeoutSeconds"] for hook in payload["hooks"]] == [8, 20, 45]
     reasoner = model["reasoner"]["instructions"]
-    assert "{{" not in reasoner and "get_dealership_info" in reasoner and "<trusted_dealership_facts>" in reasoner
-    assert '"today"' not in reasoner  # the reasoner fetches the date per call
+    # Vapi fills today's dealership-local date when the call starts; the lookup stays as the fallback.
+    assert 'The current dealership-local date is {{"now" | date: "%A, %Y-%m-%d", "America/Chicago"}}' in reasoner
+    assert "{{current_date}}" not in reasoner and "{{timezone}}" not in reasoner
+    assert "If missing or unresolved, use get_dealership_info" in reasoner and "<trusted_dealership_facts>" in reasoner
+    assert '"today"' not in reasoner  # a date saved with the assistant would go stale
     assert "callback number with its digits grouped" in reasoner  # every readback must let the server verify it
     assert "caller_number" in reasoner and "join the letters" in reasoner
+    assert "spell it in the booking readback" in reasoner and "spelled letter by letter" in model["speaker"]["instructions"]
     speaker = model["speaker"]["instructions"]
     for section in ("Facts you can share without checking:", "Backchannel policy:", "Interruption policy:",
                     "Do not delegate to the backend when:", "While work is running:", "Names and numbers:", "Results:"):

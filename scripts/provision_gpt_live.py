@@ -56,7 +56,8 @@ def main(argv=None):
     parser.add_argument("--openai-credential-id")
     parser.add_argument("--voice", default="gleam")
     parser.add_argument("--reasoner-model", default="gpt-5.6-terra", choices=gpt_live.REASONER_MODELS)
-    parser.add_argument("--reasoning-effort", default="low", choices=gpt_live.REASONING_EFFORTS)
+    parser.add_argument("--reasoning-effort", default="none", choices=gpt_live.REASONING_EFFORTS,
+                        help="'none' measured about 1.5 s faster per lookup than 'low' with no accuracy loss.")
     parser.add_argument("--allow-vapi-billing", action="store_true", help="Proceed without an OpenAI credential (Vapi balance pays GPT-Live).")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--create-server-credential", action="store_true")

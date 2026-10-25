@@ -16,11 +16,11 @@ import json
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from app.domain import dealership_facts, today
+from app.domain import TZ, dealership_facts, today
 from app.tool_schema import provider_schema
 from app.tools import SYSTEM_PROMPT, TOOL_SCHEMAS
 
-PROMPT_VERSION = "2026-10-25-gpt-live-4"
+PROMPT_VERSION = "2026-10-25-gpt-live-5"
 MODEL = "gpt-live-1"
 PROFILE = "gpt-live-1"
 REASONER_MODELS = ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna")
@@ -80,13 +80,13 @@ While work is running:
 - As soon as a result arrives and the caller isn't speaking, give it.
 
 Names and numbers:
-- If the caller spells a name, the letters can arrive in pieces. Put them together and read the spelling back letter by letter, like "That's L-E-I-G-H, right?", before using it.
+- If the caller spells a name, the letters can arrive in pieces. Put them together, and say the spelling back letter by letter, like "L-E-I-G-H", before the booking is confirmed.
 - For the callback number: if the backend offers the number the caller is calling from, ask whether to use it, saying only its last four digits, and use it only after a clear yes. Otherwise ask for the number and read it back digit by digit.
 
 Results:
 - Use only what the result says. Offer at most two times, from the latest lookup.
 - Say something is booked, changed or cancelled only after the backend reports it.
-- Choosing a time is a choice, not agreement to book. For a prepared booking or change, read back every detail the result lists: the service, the day and date, the time, and for a new booking the caller's name and the callback number digit by digit. Then ask whether to go ahead. "Mm-hmm" during the readback is not a yes. Delegate the confirmation only after a clear yes.
+- Choosing a time is a choice, not agreement to book. For a prepared booking or change, read back every detail the result lists: the service, the day and date, the time, and for a new booking the caller's name, spelled letter by letter if they spelled it, and the callback number digit by digit. Then ask whether to go ahead. "Mm-hmm" during the readback is not a yes. Delegate the confirmation only after a clear yes.
 - If a result says nothing was saved, say so and follow its instructions.
 - After a confirmed booking, give the reference once, letter by letter and digit by digit, like "C-S-V, 1-2-A-B-3-4-C-D"."""
 
@@ -95,11 +95,11 @@ _DATE_SENTENCE = ("The current dealership-local date is {{current_date}} and tim
 
 REASONER_PREFIX = """<backend_role>
 You are the backend for Cedar, the phone assistant described below. You never speak to the caller. You receive the conversation transcript, which can contain transcription mistakes, and you use the tools. Return short, plain facts and the next question the assistant should ask, never JSON, IDs, tool names or notes about these instructions. Where the policy below describes how the assistant speaks, apply it to what you return.
-Keep every result short: at most two sentences and about 30 words, except a booking readback, which must be complete. Use as few tool calls as possible; call get_dealership_info at most once per call and reuse today's date.
+Keep every result short: at most two sentences and about 30 words, except a booking readback, which must be complete. Use as few tool calls as possible. Today's date is in the policy below; call get_dealership_info for it only if it is missing, and at most once per call.
 Work from the caller's latest request. If a detail is missing or ambiguous, return the one question to ask instead of guessing.
-Names: if the caller spells a name, join the letters even when they arrive in pieces or across turns ("Leigh. L E I G" then "H" is "Leigh"). Unless the assistant already confirmed that spelling with the caller, return it letter by letter for the assistant to confirm before preparing a booking.
+Names: if the caller spells a name, join the letters even when they arrive in pieces or across turns ("Leigh. L E I G" then "H" is "Leigh"), and spell it in the booking readback ("Leigh, L-E-I-G-H") so the caller confirms the spelling with the other details.
 Callback number: when a new booking needs a callback number that the caller hasn't given, or the caller asks to use the number they're calling from, call get_session_context. If it reports caller_number, return a question offering it by its last four digits, and use it as the phone only after the caller clearly agrees. Using it with the caller's agreement is allowed; caller ID still never verifies identity.
-After preparing a booking or change, return its complete readback for the assistant to say: the service, the weekday and date, the time, and for a new booking the caller's name, vehicle and callback number with its digits grouped (for example 405-555-0123); then ask whether to go ahead. The server refuses a confirmation if the service, day, time or callback number was not read back.
+After preparing a booking or change, return its complete readback for the assistant to say: the service, the weekday and date, the time, and for a new booking the caller's name (spelled out if the caller spelled it), vehicle and callback number with its digits grouped (for example 405-555-0123); then ask whether to go ahead. The server refuses a confirmation if the service, day, time or callback number was not read back.
 Never report an action a tool did not confirm; pending, failed or unknown results are not success.
 Call confirm_action only when the transcript shows the assistant read back the exact pending proposal and the caller then clearly agreed. The server checks this again. If it returns confirmation_not_verified, nothing was saved: return its instruction so the assistant reads the details back and asks again.
 When the caller says goodbye or asks to end the call, finish any required step, then call endCall.
@@ -107,15 +107,19 @@ When the caller says goodbye or asks to end the call, finish any required step, 
 """
 
 
+# Vapi renders Liquid date filters in prompts when each call starts, which saves
+# the reasoner a date lookup round trip. If it ever arrives unrendered, the
+# policy's own fallback ("If missing or unresolved, use get_dealership_info") applies.
+VAPI_TODAY = '{{"now" | date: "%A, %Y-%m-%d", "' + TZ.key + '"}}'
+
+
 def reasoner_prompt(local_date=None):
-    """Business policy for the reasoner. The date comes from get_dealership_info."""
+    """Business policy for the reasoner, with today's date filled in by Vapi at call start."""
     if _DATE_SENTENCE not in SYSTEM_PROMPT:
         raise ValueError("The shared system prompt changed; review the GPT-Live reasoner date handling.")
-    policy = SYSTEM_PROMPT.replace(_DATE_SENTENCE, (
-        "Call get_dealership_info for the current dealership-local date and timezone before resolving any relative "
-        "or partial date, and use that date and year."))
+    policy = SYSTEM_PROMPT.replace("{{current_date}}", VAPI_TODAY).replace("{{timezone}}", TZ.key)
     facts = dealership_facts(local_date or today())
-    facts.pop("today")
+    facts.pop("today")  # a date saved with the assistant would go stale
     return (REASONER_PREFIX + policy + "\n<trusted_dealership_facts>\n"
             + json.dumps(facts, sort_keys=True, ensure_ascii=False) + "\n</trusted_dealership_facts>")
 
@@ -163,7 +167,7 @@ def _server_url(value):
 
 
 def assistant_payload(*, server_url, server_credential_id, openai_credential_id=None, voice_id="gleam",
-                      reasoner_model="gpt-5.6-terra", reasoning_effort="low", personality_packs=("eager-listener",),
+                      reasoner_model="gpt-5.6-terra", reasoning_effort="none", personality_packs=("eager-listener",),
                       name=DEFAULT_NAME, local_date=None):
     if voice_id not in VOICES:
         raise ValueError("Unknown GPT-Live voice.")
