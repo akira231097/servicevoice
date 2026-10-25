@@ -33,11 +33,16 @@ It never changes:
 
    The same phone secret becomes a Vapi `custom-credential` bearer credential, and that credential's ID must be in the assistant's `credentialIds`.
 3. **Start the service.** Run `docker compose --project-name servicevoice-gpt-live-candidate --env-file <release>/settings.env -f <release>/compose.gpt-live.yaml up -d --no-build gpt-live-business`.
-4. **Add the edge route.** Insert `gpt-live-candidate.caddy` inside the HTTPS site before its catch-all, editing the bind-mounted file in place. Then:
-   - validate with `caddy validate` and reload;
-   - keep the main handlers byte-for-byte unchanged;
-   - check the main `/healthz` before and after;
-   - confirm an unauthenticated POST to `/gpt-live/webhooks/vapi/inbound` returns 401.
+4. **Add the edge route.** Insert `gpt-live-candidate.caddy` into the host Caddyfile inside the HTTPS site, before its catch-all.
+
+   **Warning:** the running Caddy container (started 2026-10-19) still has the *original inode* of `/etc/caddy/Caddyfile` mounted, because the host file was later replaced. So `caddy reload --config /etc/caddy/Caddyfile` reloads a stale file that lacks the `/speech-candidate/` routes the main number uses. That briefly took the main number's routes down on 2026-10-25; no calls were affected.
+
+   Always reload from a fresh copy instead:
+   1. `docker cp` the host Caddyfile into `/config/` and make it readable.
+   2. Run `caddy validate`, then `caddy reload --config /config/<copy> --adapter caddyfile`.
+   3. Check that each of these routes still answers 401 when unauthenticated: `/speech-candidate/webhooks/vapi/inbound`, `/webhooks/vapi/inbound`, `/backchannel-candidate/webhooks/vapi/inbound` and `/gpt-live/webhooks/vapi/inbound`.
+
+   The pre-change config stays at `/config/restore-before-gpt-live.caddy` for rollback.
 5. **Create the assistant.** Run `scripts/provision_gpt_live.py --apply`. It refuses without a connected OpenAI credential unless `--allow-vapi-billing` is passed.
 6. **Import the number.** Run `scripts/import_twilio_number.py --apply`. It needs the owner's approval because it creates a dedicated, revocable Twilio API key and gives only that key to Vapi. The number gets no assistant, so every call reaches the authenticated `assistant-request`.
 
@@ -45,6 +50,6 @@ It never changes:
 
 - `scripts/import_twilio_number.py --rollback --receipt <receipt>` deletes the Vapi number and the dedicated key, and restores the Twilio voice settings.
 - Stop this Compose project.
-- Remove the snippet between its BEGIN/END markers, then validate and reload Caddy.
+- Remove the snippet between its BEGIN/END markers in the host Caddyfile, then load a fresh copy as in step 4. Or reload `/config/restore-before-gpt-live.caddy`, which is the exact pre-change config.
 
 Keep the volume until the evidence has been reviewed.

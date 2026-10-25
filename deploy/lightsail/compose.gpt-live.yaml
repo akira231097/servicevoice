@@ -42,7 +42,11 @@ services:
       SERVICEVOICE_EVAL_DIAGNOSTICS_PATH: /evidence/servicevoice-diagnostics.sqlite3
       SERVICEVOICE_EVAL_OUTBOX: /evaluations/outbox.sqlite3
     volumes:
-      - gpt-live-application-data:/evidence:ro
+      # Not :ro on purpose. The scheduler uses SQLite WAL; on this mostly idle
+      # line its -shm file disappears between calls, and a reader on a
+      # read-only mount cannot recreate it ("unable to open database file").
+      # The reviewer still opens the database with mode=ro and query_only.
+      - gpt-live-application-data:/evidence
       - gpt-live-evaluation-data:/evaluations
     # The image's default probe checks the business HTTP port; the reviewer
     # reports its own worker health from the outbox instead.
