@@ -45,10 +45,21 @@ It never changes:
    The pre-change config stays at `/config/restore-before-gpt-live.caddy` for rollback.
 5. **Create the assistant.** Run `scripts/provision_gpt_live.py --apply`. It refuses without a connected OpenAI credential unless `--allow-vapi-billing` is passed.
 6. **Import the number.** Run `scripts/import_twilio_number.py --apply`. It needs the owner's approval because it creates a dedicated, revocable Twilio API key and gives only that key to Vapi. The number gets no assistant, so every call reaches the authenticated `assistant-request`.
+7. **Optional caller-ID name step.** This uses the Twilio lane's `app/caller_context.py` unchanged.
+   - **Policy:** put the private policy at `/opt/servicevoice-gpt-live/caller-context/policy.json`, readable by uid 10001. It holds the mode (`off`, `shadow` or `personalize`) and HMAC digests of allowlisted numbers, never the numbers. It is mounted read-only and reread every 2 s. A missing or broken file means no lookups.
+   - **Env file:** add these settings:
+     - `SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY=/run/caller-context/policy.json`;
+     - `SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY`, the HMAC key;
+     - `TWILIO_API_KEY_SID` and `TWILIO_API_KEY_SECRET`, a dedicated Twilio API key used only for Lookup.
+   - **How it runs:**
+     - Admission starts at most one background caller-name lookup per allowlisted call and never waits for it.
+     - In `personalize` mode the guidance rides on successful tool results to the GPT-5.6 backend as `caller_id_guidance`. It is never written to the booking database or the review evidence.
+     - Diagnostics record fixed codes only.
 
 ## Roll back
 
 - `scripts/import_twilio_number.py --rollback --receipt <receipt>` deletes the Vapi number and the dedicated key, and restores the Twilio voice settings.
+- Caller-ID name step only: set the policy's mode to `off`. That takes effect within about 2 s, with no restart. To retire it, also revoke its dedicated Twilio API key.
 - Stop this Compose project.
 - Remove the snippet between its BEGIN/END markers in the host Caddyfile, then load a fresh copy as in step 4. Or reload `/config/restore-before-gpt-live.caddy`, which is the exact pre-change config.
 

@@ -3,8 +3,12 @@
 Disposable databases and synthetic credentials only; no provider requests.
 """
 from datetime import date, datetime
+import hashlib
+import hmac
 import importlib
 import json
+from pathlib import Path
+import time
 from uuid import uuid4
 
 import dotenv
@@ -97,6 +101,7 @@ def test_assistant_payload_shape_and_guards():
     assert "callback number with its digits grouped" in reasoner  # every readback must let the server verify it
     assert "caller_number" in reasoner and "join the letters" in reasoner
     assert "spell it in the booking readback" in reasoner and "spelled letter by letter" in model["speaker"]["instructions"]
+    assert "caller_id_guidance" in reasoner and "a name from caller ID" in model["speaker"]["instructions"]
     speaker = model["speaker"]["instructions"]
     for section in ("Facts you can share without checking:", "Backchannel policy:", "Interruption policy:",
                     "Do not delegate to the backend when:", "While work is running:", "Names and numbers:", "Results:"):
@@ -342,3 +347,147 @@ def test_lifetime_cap_refuses_politely_without_a_session(native_app):
         assert second == CAP_REFUSAL
         with app.state.store.connect() as db:
             assert db.execute("SELECT COUNT(*) FROM telephony_bindings").fetchone()[0] == 1
+
+# --- caller-ID name step (the Twilio lane's caller_context, unchanged) ----------
+
+CALLER_KEY = "caller-context-test-key-" + "k" * 24
+TEST_LINE = "+14055550177"
+OWNER = "+12175550142"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test", "Jordan Rivera"),)):
+    allow = []
+    for number, label, fixture in entries:
+        entry = {"digest": hmac.new(CALLER_KEY.encode(), number.encode(), hashlib.sha256).hexdigest(), "label": label}
+        if fixture:
+            entry["fixture_name"] = fixture
+        allow.append(entry)
+    path = tmp_path / "caller-policy.json"
+    path.write_text(json.dumps({"schema": "servicevoice-caller-context-v1", "mode": mode, "allow": allow}))
+    return {"SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY": str(path), "SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY": CALLER_KEY}
+
+
+def test_caller_id_name_rides_on_tool_results_and_is_never_stored(native_app, tmp_path):
+    from app.diagnostics import read_review_diagnostics
+    from app.live_eval_evidence import caller_id_offer
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        call, _ = admit(client, caller=TEST_LINE)
+        context = run_tool(client, call, "get_session_context", {}, "context-1", {"messages": []})
+        guidance = context["caller_id_guidance"]
+        assert "\"Should I put this under Jordan Rivera, at the number you're calling from?\"" in guidance
+        assert "405-555-0177" in guidance and "not identity verification" in guidance
+        assert context["caller_number"] == TEST_LINE
+        # Every result carries it, so the backend needs no extra tool round trip.
+        offers = run_tool(client, call, "begin_service_request", {"service": "oil_change"}, "search-1", {"messages": []})
+        assert "Jordan Rivera" in offers["caller_id_guidance"]
+        with app.state.store.connect() as db:
+            stored = [row[0] for row in db.execute("SELECT result FROM tool_results")]
+        assert stored and not any("Jordan" in row or "caller_id_guidance" in row for row in stored)
+    store = Path(app.state.store.path)
+    for path in store.parent.glob(store.name + "*"):
+        assert b"Jordan" not in path.read_bytes(), path.name  # the booking database never holds the name
+    diagnostics = read_review_diagnostics(store, call["id"])
+    assert caller_id_offer(diagnostics) == "name_and_number"
+    codes = [(row["event"], row["attributes"]) for row in diagnostics["events"] if row["event"] in ("caller_lookup", "caller_hint")]
+    assert ("caller_lookup", {"caller_lookup_outcome": "fixture", "caller_context_mode": "personalize",
+                              "caller_verstat": "absent"}) in codes
+    raw = json.dumps(diagnostics)
+    assert "Jordan" not in raw and "405-555-0177" not in raw and TEST_LINE not in raw
+
+
+def test_caller_id_guidance_follows_what_was_actually_said(native_app, tmp_path):
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        call, _ = admit(client, caller=TEST_LINE)
+        asked = [bot("Should I put this under Jordan Rivera, at the number you're calling from?", 1_000, 4_000),
+                 user("No, it's for my wife, Dana Lee.", 4_500)]
+        guidance = run_tool(client, call, "get_session_context", {}, "context-2", {"messages": asked})["caller_id_guidance"]
+        assert "already asked about the caller ID name" in guidance and "Jordan" not in guidance
+        prepared = [*asked, {"role": "tool_calls", "message": "", "toolCalls": [
+            {"id": "prep-9", "type": "function", "function": {"name": "prepare_booking", "arguments": "{}"}}]}]
+        reminder = run_tool(client, call, "get_dealership_info", {}, "info-1", {"messages": prepared})["caller_id_guidance"]
+        assert reminder.startswith("Use any caller name only exactly as the caller confirmed it")
+
+
+@pytest.mark.parametrize("mode,caller", [("personalize", OWNER), ("off", TEST_LINE), ("shadow", TEST_LINE)])
+def test_no_caller_id_guidance_unless_allowlisted_and_personalizing(native_app, tmp_path, mode, caller):
+    app, client = native_app(**caller_policy(tmp_path, mode=mode))
+    with client:
+        call, _ = admit(client, caller=caller)
+        context = run_tool(client, call, "get_session_context", {}, "context-3", {"messages": []})
+        assert "caller_id_guidance" not in context and context["caller_number"] == caller
+
+
+def test_caller_name_lookup_never_delays_the_call_and_ends_with_it(native_app, tmp_path, monkeypatch):
+    import asyncio
+    from app import main as main_module
+    from app.caller_context import LookupResult
+    gate = {}
+
+    class HeldLookup:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def lookup(self, number, seconds):
+            gate["loop"], gate["event"] = asyncio.get_running_loop(), asyncio.Event()
+            await gate["event"].wait()
+            return LookupResult("found", "Pat Morgan")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "CallerNameLookup", HeldLookup)
+    app, client = native_app(**caller_policy(tmp_path, entries=((OWNER, "owner", None),)))
+    with client:
+        started = time.monotonic()
+        call, _ = admit(client, caller=OWNER)
+        assert time.monotonic() - started < 2  # admission never waits for the lookup
+        assert "caller_id_guidance" not in run_tool(client, call, "get_session_context", {}, "context-4", {"messages": []})
+        gate["loop"].call_soon_threadsafe(gate["event"].set)
+        deadline = time.monotonic() + 5
+        while app.state.caller_context.calls[call["id"]].outcome == "pending" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        guidance = run_tool(client, call, "get_session_context", {}, "context-5", {"messages": []})["caller_id_guidance"]
+        assert "Should I put this under Pat Morgan" in guidance
+        held, _ = admit(client, caller=OWNER)  # a second call whose lookup never finishes
+        for ended in (call, held):
+            response = client.post(PATH, headers=PHONE_HEADERS, json={"message": {"type": "end-of-call-report", "call": ended}})
+            assert response.status_code == 200, response.text
+        assert app.state.caller_context.calls == {}
+
+
+def test_reviewer_learns_caller_id_reached_the_assistant_without_values():
+    from app.live_eval_evidence import build_evidence, caller_id_offer
+    def rows(*states, component="webhook"):
+        return {"events": [{"component": component, "event": "caller_hint", "attributes": {"caller_hint_state": s}}
+                           for s in states]}
+    assert caller_id_offer(rows("number_only")) == "number_only"
+    assert caller_id_offer(rows("details_saved", "name_asked")) == "name_and_number"
+    assert caller_id_offer(rows("name_and_number", component="twilio_bridge")) == "name_and_number"
+    assert caller_id_offer(rows("number_only", component="gateway")) is None and caller_id_offer(None) is None
+    call = {"artifact": {"messages": [{"role": "bot", "message": "Hi, this is Cedar.", "secondsFromStart": 0.5},
+                                      {"role": "user", "message": "Hours?", "secondsFromStart": 2}]}}
+    snapshot = {"session": {"id": "sess_1", "created": 1_793_000_000.0, "ended": 1}, "appointments": [], "proposals": [],
+                "results": [], "operations": [], "events": [], "handoffs": [], "signatures": [],
+                "tool_policy": "provider-native", "caller_id": "name_and_number"}
+    item = build_evidence(call, snapshot)["evidence"]["caller_id"]
+    assert item["available_to_assistant"] == "name_and_number" and "values withheld" in item["provenance"]
+    assert "caller_id" not in build_evidence(call, dict(snapshot, caller_id=None))["evidence"]
+
+
+def test_caller_context_settings_are_checked_and_only_used_on_the_gpt_live_line(native_app, tmp_path):
+    with pytest.raises(ValueError):
+        native_app(SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY="relative/policy.json",
+                   SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY=CALLER_KEY)
+    app, _ = native_app(SERVICEVOICE_PHONE_NATIVE_TOOLS="", VAPI_MODEL_PROFILE="gemini-3.8-flash-custom",
+                        SERVICEVOICE_ENVIRONMENT="production", **caller_policy(tmp_path))
+    assert app.state.caller_source is None
+
+
+def test_compose_reviewer_health_check_fits_its_cpu_cap_and_caller_policy_is_read_only():
+    text = (ROOT / "deploy" / "lightsail" / "compose.gpt-live.yaml").read_text()
+    business, reviewer = text.split("  gpt-live-reviewer:")
+    assert "cpus: 0.15" in reviewer and "timeout: 30s" in reviewer and "interval: 60s" in reviewer
+    assert ":/run/caller-context:ro" in business

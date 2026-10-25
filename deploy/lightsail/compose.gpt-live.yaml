@@ -13,6 +13,9 @@ services:
       SERVICEVOICE_DB: /data/servicevoice.sqlite3
     volumes:
       - gpt-live-application-data:/data
+      # Private caller-ID policy (mode and keyed digests, never numbers). A
+      # missing file means no lookups; its HMAC key lives in the env file.
+      - ${SERVICEVOICE_GPT_LIVE_CALLER_POLICY_DIR:-/opt/servicevoice-gpt-live/caller-context}:/run/caller-context:ro
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m
@@ -49,11 +52,13 @@ services:
       - gpt-live-application-data:/evidence
       - gpt-live-evaluation-data:/evaluations
     # The image's default probe checks the business HTTP port; the reviewer
-    # reports its own worker health from the outbox instead.
+    # reports its own worker health from the outbox instead. At 0.15 CPU the
+    # check's Python start-up alone took about 6 s (2026-10-25), so a 5 s
+    # limit marked a working reviewer unhealthy.
     healthcheck:
       test: ["CMD", "python", "-m", "app.live_evaluations", "--health"]
-      interval: 30s
-      timeout: 5s
+      interval: 60s
+      timeout: 30s
       start_period: 60s
       retries: 3
     read_only: true

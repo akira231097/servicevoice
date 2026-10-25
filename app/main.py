@@ -33,6 +33,7 @@ from .jev_faq import FAQ_VERSION
 from .jev_classifier import JEV_MODEL
 from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
+from .caller_context import CallerContext, CallerNameLookup, PolicySource
 from . import native_consent
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
@@ -65,6 +66,18 @@ def _tool_diagnostic_context(diagnostics,call_id,tool_id,contexts):
         return {"call_id":call_id,"turn_id":turn_identifier(call_id,ordinal),"diagnostics":diagnostics}
     except Exception:
         return None  # Missing diagnostic linkage cannot change an accepted effect.
+
+def provider_history(messages):
+    """Vapi's live-call messages in the shape caller_context reads: assistant speech and tool names only."""
+    history=[]
+    for message in messages if isinstance(messages,list) else ():
+        if not isinstance(message,dict):continue
+        if message.get("role")=="bot" and isinstance(message.get("message"),str):
+            history.append({"role":"assistant","content":message["message"]})
+        elif message.get("role")=="tool_calls" and isinstance(message.get("toolCalls"),list):
+            history.append({"role":"assistant","tool_calls":[{"function":{"name":(call.get("function") or {}).get("name")}}
+                for call in message["toolCalls"] if isinstance(call,dict)]})
+    return history
 
 def create_app(db_path=None):
     from dotenv import dotenv_values
@@ -107,12 +120,23 @@ def create_app(db_path=None):
                 app.state.telemetry_initialized=True
         await app.state.gemini_gateway.start()
         await app.state.gemini_tts.start()
+        if app.state.caller_source is not None and app.state.caller_context is None:
+            values=settings()
+            caller=CallerContext(app.state.caller_source,
+                CallerNameLookup(values.get("TWILIO_API_KEY_SID") or "",values.get("TWILIO_API_KEY_SECRET") or ""),
+                spawn=asyncio.create_task,observe=observe_caller)
+            await caller.start()
+            app.state.caller_context=caller
     async def shutdown_resources():
         app.state.telephony_http_closing=True
         pending=list(app.state.telephony_http_tasks)
         if pending:
             try:await asyncio.wait_for(asyncio.shield(asyncio.gather(*pending,return_exceptions=True)),timeout=6)
             except asyncio.TimeoutError:pass  # Do not cancel accepted synchronous effects.
+        caller,app.state.caller_context=app.state.caller_context,None
+        if caller is not None:
+            try:await asyncio.wait_for(caller.close(),timeout=3)
+            except Exception:pass  # In-memory caller ID is discarded either way.
         try:
             await app.state.gemini_gateway.close()
         finally:
@@ -156,6 +180,10 @@ def create_app(db_path=None):
         try:return app.state.diagnostics.record(component,event,outcome,call_id=call_id,**kwargs)
         except Exception:return False
     app.state.diagnose=diagnose
+    def observe_caller(call_id,event,outcome,attributes,duration_ms=None):
+        # caller_context passes fixed codes only, never a number or name.
+        diagnose("webhook",event,outcome,call_id="gpt-live-caller-policy" if call_id=="twilio-caller-policy" else call_id,
+            duration_ms=duration_ms,attributes=attributes)
 
     app.add_middleware(DiagnosticHTTPMiddleware,observer=diagnose)
 
@@ -443,6 +471,12 @@ def create_app(db_path=None):
         limits=IngressLimits(active_calls=capacity.max_live_calls,workers=capacity.phone_workers,
                              admissions_per_window=capacity.phone_admissions_per_minute),
         live_admission=app.state.live_admission)
+    # Optional caller-ID personalization on the GPT-Live line only. Invalid
+    # settings fail startup, as on the Twilio lane; a missing or broken policy
+    # file fails closed to no lookups while running.
+    native=app.state.telephony_ingress.config is not None and app.state.telephony_ingress.config.tool_policy=="provider-native"
+    app.state.caller_source=PolicySource.from_settings(settings()) if native else None
+    app.state.caller_context=None
     app.state.telephony_http_capacity=capacity.phone_http_capacity
     app.state.telephony_http_pending=set()
     app.state.telephony_http_lock=threading.Lock()
@@ -496,6 +530,34 @@ def create_app(db_path=None):
                 "evidence_source":"provider_live_artifact",
                 **{"fact_"+name:bool(ok) for name,ok in evidence["facts"].items()}})
         return None if verified else native_consent.refusal(evidence)
+
+    def caller_context_effect(event,message,result):
+        """Start or finish caller-ID context after verified phone ingress. Never awaits or changes the call."""
+        caller=app.state.caller_context
+        if caller is None:return
+        try:
+            call=message["call"];call_id=call["id"]
+            if event=="call_bound" and isinstance(result,dict) and result.get("assistantId"):
+                customer=call.get("customer") if isinstance(call.get("customer"),dict) else {}
+                caller.begin(call_id,{"From":customer.get("number")})
+                caller.bind(call_id,call_id)
+            elif event=="call_ended":
+                caller.finish(call_id,call_id)
+        except Exception:
+            pass  # Personalization never affects admission or teardown.
+
+    def with_caller_guidance(result,call_id,message):
+        """Add caller-ID guidance to the provider response only; it is never stored or reviewed."""
+        caller=app.state.caller_context
+        if caller is None or not isinstance(result,dict) or result.get("ok") is not True:return result
+        try:
+            state=caller.calls.get(call_id)
+            if state is None or state.outcome=="pending":return result  # not allowlisted, or the lookup is still running
+            artifact=message.get("artifact")
+            block=caller.hint(call_id,provider_history(artifact.get("messages") if isinstance(artifact,dict) else None),call_id)
+        except Exception:
+            return result
+        return {**result,"caller_id_guidance":block.strip()} if isinstance(block,str) and block.strip() else result
 
     async def process_webhook(message, *, phone=False, deadline=None, abandoned=None, diagnostic_request=None):
         if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
@@ -562,6 +624,8 @@ def create_app(db_path=None):
                     # Accepted effects remain committed; an exact retry can
                     # recover their receipt. Never return unverifiable success.
                     raise HTTPException(503,"Tool response evidence could not be saved. Retry the original tool ID.")
+                if native_phone:
+                    result=with_caller_guidance(result,call_id,message)
                 results.append({"toolCallId":tid,"result":json.dumps(result)})
             return {"results":results}
         if event_type=="transcript" and message.get("transcriptType")=="final":
@@ -619,6 +683,7 @@ def create_app(db_path=None):
                 request.state.diagnostic_call_id=verified_call_id
                 diagnose("voice_runtime",event,"success",call_id=verified_call_id,
                     attributes={"evidence_source":"verified_phone_ingress"})
+                caller_context_effect(event,message,result)
                 return result
             if event_type=="assistant-request":
                 coroutine=observe_phone_effect(ingress.admit,"call_bound")
