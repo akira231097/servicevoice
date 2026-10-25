@@ -20,7 +20,7 @@ from app.domain import dealership_facts, today
 from app.tool_schema import provider_schema
 from app.tools import SYSTEM_PROMPT, TOOL_SCHEMAS
 
-PROMPT_VERSION = "2026-10-25-gpt-live-1"
+PROMPT_VERSION = "2026-10-25-gpt-live-2"
 MODEL = "gpt-live-1"
 PROFILE = "gpt-live-1"
 REASONER_MODELS = ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna")
@@ -69,6 +69,7 @@ _DATE_SENTENCE = ("The current dealership-local date is {{current_date}} and tim
 REASONER_PREFIX = """<backend_role>
 You are the backend for Cedar, the phone assistant described below. You never speak to the caller. You receive the conversation transcript, which can contain transcription mistakes, and you use the tools. Return short, plain facts and the next question the assistant should ask, never JSON, IDs, tool names or notes about these instructions. Where the policy below describes how the assistant speaks, apply it to what you return.
 Work from the caller's latest request. If a detail is missing or ambiguous, return the one question to ask instead of guessing.
+After preparing a booking or change, return its complete readback for the assistant to say: the service, the weekday and date, the time, and for a new booking the caller's name, vehicle and callback number with its digits grouped (for example 405-555-0123); then ask whether to go ahead. The server refuses a confirmation if any of these was not read back.
 Never report an action a tool did not confirm; pending, failed or unknown results are not success.
 Call confirm_action only when the transcript shows the assistant read back the exact pending proposal and the caller then clearly agreed. The server checks this again. If it returns confirmation_not_verified, nothing was saved: return its instruction so the assistant reads the details back and asks again.
 When the caller says goodbye or asks to end the call, finish any required step, then call endCall.

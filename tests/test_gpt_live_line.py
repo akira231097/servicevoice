@@ -90,6 +90,7 @@ def test_assistant_payload_shape_and_guards():
     reasoner = model["reasoner"]["instructions"]
     assert "{{" not in reasoner and "get_dealership_info" in reasoner and "<trusted_dealership_facts>" in reasoner
     assert '"today"' not in reasoner  # the reasoner fetches the date per call
+    assert "callback number with its digits grouped" in reasoner  # every readback must let the server verify it
     assert "recorded" in model["speaker"]["instructions"] and "recorded" in payload["firstMessage"]
     with pytest.raises(ValueError):
         gpt_live.assistant_payload(server_url="https://edge.example/webhooks/vapi", server_credential_id=SERVER_CREDENTIAL)
