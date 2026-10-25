@@ -70,3 +70,56 @@ def test_followup_stays_single_even_after_caller_continues():
         assert not c.commit_waiting('fixture-call','session',True)
         await c.close()
     asyncio.run(run())
+
+
+def test_actual_12ms_blip_with_growing_asr_but_no_new_vad_boundary():
+    """Owned 7:23 PM call: sample every 10ms, not only the old emission tick.
+
+    Vapi logged no new User-start event during 3.55 seconds of continuing words.
+    These are provider times, not a claim of exact webhook arrival or audio.
+    """
+    async def run():
+        c,clock,_,_,_,event,_=setup()
+        event('speech-update','user',status='stopped');clock.now+=3.225
+        assert c.commit_waiting('fixture-call','session')
+        c.track_waiting('fixture-call','session',123)
+        start=clock.now
+        events=[(.058,'start',0),(.065,'partial',1),(.070,'stop',0),
+            (.308,'partial',2),(.545,'partial',3),(.785,'partial',4),(.907,'partial',5),
+            (1.028,'partial',6),(1.272,'partial',7),(1.387,'partial',8),(1.630,'partial',9),
+            (1.985,'partial',10),(2.230,'partial',12),(2.475,'partial',13),(2.712,'partial',14),
+            (2.828,'partial',15),(3.185,'partial',16),(3.304,'partial',17),(3.548,'partial',20),
+            (3.551,'final',20)]
+        i=0;allowed=[]
+        for tick in range(451):
+            now=tick/100
+            while i<len(events) and events[i][0]<=now:
+                offset,kind,words=events[i];clock.now=start+offset
+                if kind in {'start','stop'}:event('speech-update','assistant',status='started' if kind=='start' else 'stopped')
+                else:event('transcript','user',transcriptType=kind,transcript=' '.join(['word']*words))
+                i+=1
+            clock.now=start+now
+            if c.waiting_status('fixture-call','session')[1]=='eligible':allowed.append(now)
+        assert allowed and allowed[0]>=4.29 and allowed[0]<=4.32
+        assert c.calls['fixture-call'].caller_speech_total==c.calls['fixture-call'].waiting_speech_total
+        c.track_waiting('fixture-call','session',123,abandoned=True)
+        assert c.refundable_waiting('fixture-call','session')==123
+        await c.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('mode',['repeated_text','revised_text','widely_spaced','stale'])
+def test_idle_or_transcript_churn_does_not_invent_one_second_of_speech(mode):
+    async def run():
+        c,clock,_,_,_,event,_=setup()
+        event('speech-update','user',status='stopped');clock.now+=1
+        assert c.commit_waiting('fixture-call','session')
+        for index in range(8):
+            clock.now+=1 if mode=='widely_spaced' else .3
+            text=('word '+str(index)) if mode=='revised_text' else ' '.join(['word']*(index+1 if mode in {'widely_spaced','stale'} else 2))
+            if mode=='stale':c.event('fixture-call',{'type':'transcript','role':'user','transcriptType':'partial','transcript':text,'timestamp':(clock.wall()-3)*1000})
+            else:event('transcript','user',transcriptType='partial',transcript=text)
+        clock.now+=5
+        assert c.waiting_status('fixture-call','session')[1]=='caller_continuation_too_short'
+        await c.close()
+    asyncio.run(run())

@@ -250,6 +250,9 @@ class ListeningState:
     waiting_last_dispatch: float = -math.inf
     waiting_last_start: float = -math.inf
     waiting_followed: bool = False
+    waiting_partial_last: float = -math.inf
+    waiting_partial_words: int = 0
+    waiting_partial_seconds: float = 0
     rotation_start: int = field(default_factory=lambda: secrets.randbelow(len(ROTATION)))
     substantive_since_user: bool = True
     clip_until: float = -math.inf
@@ -432,6 +435,20 @@ class ListeningCoordinator:
                 state.partial_event = timestamp
                 if timestamp <= state.final_event:
                     return
+                spoken_at=now-max(0,age)
+                if spoken_at>state.waiting_last_dispatch:
+                    words=len(value.split())
+                    gap=spoken_at-state.waiting_partial_last
+                    # Vapi can publish continuing ASR without another VAD start.
+                    # Only growing, fresh word sequences count as continuation;
+                    # idle time, repeated text, revisions, and delayed old ASR do not.
+                    if words>state.waiting_partial_words and 0<gap<=.8:
+                        state.waiting_partial_seconds+=gap
+                    elif gap>.8 or words<state.waiting_partial_words:
+                        state.waiting_partial_seconds=0
+                    if words!=state.waiting_partial_words:
+                        state.waiting_partial_last=spoken_at
+                        state.waiting_partial_words=words
                 if state.caller and timestamp > state.answer_ready_at:
                     # Continued caller content supersedes an answer prepared
                     # speculatively before these words. Silence cannot clear it.
@@ -488,7 +505,7 @@ class ListeningCoordinator:
         elif math.isfinite(state.waiting_last_dispatch):
             if now-max(state.waiting_last_dispatch, state.waiting_last_start) < 4:
                 return ticket, "cooldown"
-            if state.caller_speech_total-state.waiting_speech_total < 1:
+            if max(state.caller_speech_total-state.waiting_speech_total,state.waiting_partial_seconds) < 1:
                 return ticket, "caller_continuation_too_short"
         if not math.isfinite(state.waiting_stopped):
             return ticket, "caller_end_unobserved"
@@ -512,6 +529,9 @@ class ListeningCoordinator:
             "uncertain_speech":False,"transcript_seen":False}
         state.waiting_last_dispatch = self.clock()
         state.waiting_speech_total = state.caller_speech_total
+        state.waiting_partial_last=-math.inf
+        state.waiting_partial_words=0
+        state.waiting_partial_seconds=0
         state.waiting_followed = state.waiting_followed or (follow_up and state.waiting_count > 0)
         if not state.waiting_count:
             state.waiting_first = self.clock()
@@ -538,7 +558,7 @@ class ListeningCoordinator:
         # A measured sub-300ms blip is not a heard phrase. Its start still
         # anchors the four-second spacing rule, preventing immediate repeats.
         if (not item or not item['abandoned'] or item['stamp'] is None
-                or state.user_revision<=item['revision'] or self.clock()-item['at']<2.1
+                or (state.user_revision<=item['revision'] and state.waiting_partial_seconds<1) or self.clock()-item['at']<2.1
                 or item['uncertain_speech'] or item['duration'] >= .3
                 or (item['started'] is not None and not item['stopped'])
                 or (item['transcript_seen'] and item['started'] is None)

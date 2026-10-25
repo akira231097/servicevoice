@@ -318,7 +318,9 @@ References: [Twilio participants](https://www.twilio.com/docs/voice/api/conferen
 
 The isolated lane replaces the logical-turn hold lock with observed spacing:
 four seconds from the last dispatch/observed start and at least one second of
-subsequent caller speech. Repeated holds are neutral and never immediately use
+subsequent caller speech. Sustained, growing fresh ASR can establish that
+continuation when Vapi omits a new speech-start event; repeated/revised text,
+old transcripts and widely spaced fragments cannot. Repeated holds are neutral and never immediately use
 the same phrase. One tool-result follow-up remains available after 2.5 seconds.
 Cancelled, measured speech shorter than 300ms can reclaim a reservation after
 the event-lateness grace; even a blip retains its observed spacing anchor.
