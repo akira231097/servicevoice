@@ -3,7 +3,7 @@ import re
 import statistics
 from .backchannel_catalog import PHRASES
 
-EXEMPT_TOOLS=frozenset({'search_availability','prepare_booking','prepare_first_available_booking',
+EXEMPT_TOOLS=frozenset({'begin_service_request','search_availability','prepare_booking','prepare_first_available_booking',
     'prepare_reschedule','prepare_cancellation','confirm_action'})
 IDLE_MESSAGES=("Take your time, I'm still here.","Are you still there?",
     "I'm still here whenever you're ready.","No rush, I'm listening.","Can you still hear me?",

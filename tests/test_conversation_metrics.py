@@ -1,13 +1,15 @@
 from app.conversation_metrics import reply_lengths
 from app.call_review_presentation import feedback_rows
+import pytest
 
-def test_greeting_and_hold_do_not_lower_reply_length_and_only_verified_readbacks_are_exempt():
+@pytest.mark.parametrize('tool',['prepare_booking','begin_service_request','search_availability'])
+def test_greeting_and_hold_do_not_lower_reply_length_and_only_verified_readbacks_are_exempt(tool):
     data={'turn:1':{'sequence':0,'role':'assistant','text':'Hello, this is the demo.'},
         'turn:2':{'sequence':1,'role':'user','text':'What are your hours?'},
         'turn:3':{'sequence':2,'role':'assistant','text':'One moment.'},
         'turn:4':{'sequence':3,'role':'assistant','text':'We close at five.'},
         'turn:5':{'sequence':4,'role':'user','text':'Please prepare that.'},
-        'tool:1':{'sequence':5,'name':'prepare_booking','gateway_issuance_verified':True,'server_result':{'ok':True}},
+        'tool:1':{'sequence':5,'name':tool,'gateway_issuance_verified':True,'server_result':{'ok':True}},
         'turn:6':{'sequence':6,'role':'assistant','text':'Detail '*40}}
     result=reply_lengths(data)
     assert result['ordinary_replies']==1 and result['median_words']==4
