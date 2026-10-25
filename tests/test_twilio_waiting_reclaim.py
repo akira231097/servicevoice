@@ -58,13 +58,15 @@ def test_only_the_same_abandoned_reservation_can_restore_both_budgets(lane_app):
         assert c.track_waiting('fixture-call','session',stamp,abandoned=False)
         clock.now+=.1;event('speech-update','user',status='started');clock.now+=3
         event('speech-update','user',status='stopped');clock.now+=1.1
-        assert lane.waiting_status('fixture-call','session')[1]=='turn_already_acknowledged'
+        # Continued caller speech plus four seconds now permits a fresh hold
+        # even when the discarded generation has not yet reported cancellation.
+        assert lane.waiting_status('fixture-call','session')[1]=='eligible'
         assert c.track_waiting('fixture-call','session',stamp,abandoned=True)
         assert lane.waiting_status('fixture-call','session')[1]=='eligible'
         assert budget.consume('fixture-call',1,'moment')[0]
         assert lane.commit_waiting('fixture-call','session')
         assert c.track_waiting('fixture-call','session',budget.receipt('fixture-call'))
         assert not c.track_waiting('fixture-call','session',stamp,abandoned=True)
-        assert lane.waiting_status('fixture-call','session')[1]=='turn_already_acknowledged'
+        assert lane.waiting_status('fixture-call','session')[1]=='cooldown'
         await c.close();lane.coordinator=original
     asyncio.run(run())

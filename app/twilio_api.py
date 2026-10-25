@@ -313,7 +313,7 @@ class TwilioLane:
             return None, "speaker_state_unavailable"
         stamp=self.coordinator.refundable_waiting(call_id,session_id)
         if stamp is not None:
-            refunded,_=self.app.state.gemini_gateway.backchannel_budget.refund(call_id,stamp)
+            refunded,_=self.app.state.gemini_gateway.backchannel_budget.refund(call_id,stamp,preserve_phrase=True)
             if refunded:self.coordinator.reclaim_waiting(call_id,session_id,stamp)
         return self.coordinator.waiting_status(call_id, session_id, follow_up)
 
@@ -536,6 +536,8 @@ def install_twilio(app, settings):
         lane.ingress.admission_guard = lane.admission_guard
         if config.listening and config.topology == "conference":
             app.state.gemini_gateway.waiting_cue_state = lane.waiting_status
+            app.state.gemini_gateway.closing_ready = lane.coordinator.closing_ready
+            app.state.gemini_gateway.waiting_neutral_only = lane.coordinator.waiting_neutral_only
             app.state.gemini_gateway.waiting_cue_commit = lane.commit_waiting
             app.state.gemini_gateway.waiting_cue_assistant = lane.phone_identity.assistant_id
             app.state.gemini_gateway.before_answer = lane.before_answer

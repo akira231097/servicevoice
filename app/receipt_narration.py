@@ -23,7 +23,7 @@ from .domain import DomainError, SERVICES, TENANT, TZ, normalize_services, servi
 from .tools import DEFINITIONS, Presentation
 from .issuance_context import user_context, decode_extras
 
-NARRATOR_VERSION = "receipt-en-2026-10-20-7"
+NARRATOR_VERSION = "receipt-en-2026-10-24-8"
 SUPPORTED = {"begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "prepare_reschedule", "prepare_cancellation", "confirm_action", "request_handoff", "withdraw_handoff"}
 _DIGIT_WORDS = dict(zip("0123456789", ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")))
 
@@ -115,7 +115,7 @@ def candidate(messages):
         return Decision("presentation_invalid")
 
 
-def select(store, sid, provider_call_id, prepared):
+def select(store, sid, provider_call_id, prepared, *, phone=False):
     """Read one consistent snapshot and fall back on any uncertain state."""
     if isinstance(prepared, Decision):
         return prepared
@@ -170,6 +170,8 @@ def select(store, sid, provider_call_id, prepared):
                     if fresh["total_matching"] > len(offers):
                         text += "There are more matching times. "
                     text += "These are offers, not reservations. Which works for you?"
+                    if phone:
+                        text = phone_offers(offers, selected, fresh, context)
                 else:
                     if fresh["complete"] is not True or fresh["total_matching"] != 0:
                         return Decision("availability_incomplete")
@@ -249,17 +251,34 @@ def select(store, sid, provider_call_id, prepared):
         return Decision("state_unavailable")
 
 
+def phone_offers(offers, selected, fresh, context):
+    """Shorter wording over the same verified offers and timezone metadata."""
+    local=[datetime.fromisoformat(slot['start']).astimezone(TZ) for slot in offers]
+    if (len(local)==2 and local[0].date()==local[1].date()
+            and context['caller_timezone'] in {'dealership',TZ.key}):
+        # State the date and timezone once, retaining both exact local times.
+        first=times(offers[0]['start'],context)
+        second=local[1]
+        clock=str(second.hour%12 or 12)+(f':{second.minute:02d}' if second.minute else '')+' '+second.strftime('%p')
+        text=f"I can offer {service_names(selected)} on {first}, or {clock} that day. "
+    else:
+        text=f"I can offer {service_names(selected)} on "+' or '.join(times(slot['start'],context) for slot in offers)+'. '
+    if len(selected)>1:text+='One 60-minute intake covers those services; repair completion is not promised. '
+    if fresh['total_matching']>len(offers):text+='Other times are available. '
+    return text+'Which works for you?'
+
+
 class BoundedSelector:
     """Timed-out/cancelled readers retain their worker slot until completion."""
     def __init__(self, store, timeout_seconds=0.25, capacity=4):
         self.store, self.timeout, self.capacity = store, timeout_seconds, capacity
         self.pending = set()
 
-    async def choose(self, sid, call_id, messages):
+    async def choose(self, sid, call_id, messages, *, phone=False):
         prepared = candidate(messages)
         if isinstance(prepared, Decision):return prepared
         if len(self.pending) >= self.capacity:return Decision("read_capacity")
-        task = asyncio.create_task(run_in_threadpool(select, self.store, sid, call_id, prepared))
+        task = asyncio.create_task(run_in_threadpool(select, self.store, sid, call_id, prepared, **({"phone":True} if phone else {})))
         self.pending.add(task)
         def done(value):
             self.pending.discard(value)

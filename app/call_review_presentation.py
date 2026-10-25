@@ -96,6 +96,7 @@ CODE_LABELS = {
     "emitted": "cue played", "primary_ready": "answer ready within the head start",
     "policy_not_ready": "cue policy not ready", "context_unavailable": "call context unavailable",
     "turn_already_acknowledged": "already cued this turn", "cooldown": "too soon after the last cue",
+    "caller_continuation_too_short": "no further caller speech to acknowledge", "repeated_phrase": "avoid repeating the last hold",
     "call_budget": "cue budget for this call used up", "not_eligible": "turn not eligible for a cue",
     "sensitive_context": "sensitive context", "sensitive_utterance": "sensitive wording",
     "sensitive_prior_turn": "sensitive previous turn", "private_detail": "caller gave private details",
@@ -312,7 +313,7 @@ def generation_rows(timings):
         if total is None or started is None:
             continue
         usage = source.get("usage") if isinstance(source.get("usage"), dict) else {}
-        route = source.get("route") if source.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq") else "unknown"
+        route = source.get("route") if source.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing") else "unknown"
         generation = source.get("generation_id")
         rows[request] = {
             "request_id": request, "generation_id": generation if isinstance(generation, str) and _UUID.fullmatch(generation) else None,
@@ -1099,7 +1100,7 @@ def _generation_children(child, generation, group, counts):
                  {"text": cue.get("text"), "yielded_after_ms": cue["emitted_ms"], "classifier_ms": cue.get("classifier_ms"), "follow_up": cue.get("follow_up"), "scope": "gateway yield, not audible playback"},
                  parent=group, tags=["waiting-cue"]) is not None:
             counts["cues"] += 1
-    route = generation.get("route") if generation.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq") else "unknown"
+    route = generation.get("route") if generation.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing") else "unknown"
     outcome = code(generation.get("outcome")) or "unknown"
     first_text, tool_emitted = number(generation.get("first_text_ms")), number(generation.get("tool_emitted_ms"))
     answer = answer_ms({"first_text_ms": first_text, "tool_emitted_ms": tool_emitted})
@@ -1107,6 +1108,8 @@ def _generation_children(child, generation, group, counts):
         name = "receipt readback · verified receipt, no model"
     elif route == "jev_static_faq":
         name = "static faq · Jev classifier, no model"
+    elif route == "deterministic_closing":
+        name = "explicit goodbye · native farewell, no model"
     elif outcome in _SILENT_OUTCOMES and answer is None:
         name = f"gemini · speculative request cancelled ({seconds_text(total)})"
     elif tool_emitted is not None and (first_text is None or tool_emitted <= first_text):

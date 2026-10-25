@@ -49,7 +49,7 @@ ERROR_CODES = frozenset({
     "validation_error", "timeout", "cancelled", "internal_error", "receipt_missing", "waiter_interrupted",
 })
 _ENUMS = {
-    "route": frozenset({"gemini", "deterministic_receipt", "jev_static_faq"}),
+    "route": frozenset({"gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing"}),
     "outcome": frozenset({"completed", "interrupted", "rejected", "state_unavailable",
         "capacity_rejected", "generation_conflict", "cancelled", "stream_unavailable", "error",
         "upstream_unavailable", "superseded", "superseded_after_release", "supersession_wait_expired"}),

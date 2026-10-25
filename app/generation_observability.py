@@ -37,7 +37,7 @@ _GATEWAY_ENUMS = {
     "predecessor_relation": {"queued_successor", "active_or_draining_owner"},
     "supersession_cause": {"newer_local_http_arrival", "gateway_shutdown", "unknown", "predecessor_cleanup_wait_expired"},
     "payload_release_scope": {"gateway_yield_not_provider_receipt_or_playback"},
-    "route": {"gemini", "deterministic_receipt", "jev_static_faq"},
+    "route": {"gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing"},
     "outcome": {"completed", "tool_emitted", "narrated", "interrupted", "rejected", "state_unavailable", "capacity_rejected", "generation_conflict", "cancelled", "stream_unavailable", "error", "upstream_unavailable", "superseded", "superseded_after_release", "supersession_wait_expired"},
 }
 _GATEWAY_ENUMS["generation_terminal_state"] = _GATEWAY_ENUMS["outcome"] | {"superseded_before_release", "downstream_disconnected", "cancelled_unknown_cause"}

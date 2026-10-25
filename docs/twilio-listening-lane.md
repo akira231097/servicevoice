@@ -313,3 +313,31 @@ References: [Twilio participants](https://www.twilio.com/docs/voice/api/conferen
 [API key scopes](https://www.twilio.com/docs/iam/api-keys),
 [Vapi SIP](https://docs.vapi.ai/advanced/sip),
 [Vapi server events](https://docs.vapi.ai/server-url/events).
+
+### Fifth-review repairs (October 24)
+
+The isolated lane replaces the logical-turn hold lock with observed spacing:
+four seconds from the last dispatch/observed start and at least one second of
+subsequent caller speech. Repeated holds are neutral and never immediately use
+the same phrase. One tool-result follow-up remains available after 2.5 seconds.
+Cancelled, measured speech shorter than 300ms can reclaim a reservation after
+the event-lateness grace; even a blip retains its observed spacing anchor.
+Missing or inconsistent speech boundaries do not prove unheard audio.
+
+The isolated prompt explicitly requests the existing typed presentation metadata
+for standalone availability offers and complete preparation readbacks. The same
+signed receipt, current-state, language, timezone and operation checks apply.
+Phone offers consolidate a shared date/timezone; complete consent readbacks are
+unchanged. Extra questions, unsupported languages and stale results use the
+ordinary model path. Metadata is never supplied or altered after tool issuance.
+
+A narrow explicit English goodbye can issue the existing signed native endCall
+without a model pass when observed final speech matches and no proposal or
+operation is pending. A verified proposal dismissal can reach that path; the
+shortcut itself performs no scheduler action. Bare stop, quoted/conditional
+goodbyes, consent, new requests, uncertainty and other languages keep the model
+path. Native farewell playback and termination still require live verification.
+
+These changes do not switch models, shorten booking checks, or enable the
+prototype on the main number. Endpointing, prompt reduction, speakerphone echo,
+and four simultaneous live callers require separate measurement.

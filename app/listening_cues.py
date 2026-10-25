@@ -244,6 +244,12 @@ class ListeningState:
     waiting_first: float = -math.inf
     waiting_reservation: dict | None = None
     assistant_observations: int = 0
+    caller_speech_total: float = 0
+    caller_interval_start: float | None = None
+    waiting_speech_total: float = 0
+    waiting_last_dispatch: float = -math.inf
+    waiting_last_start: float = -math.inf
+    waiting_followed: bool = False
     rotation_start: int = field(default_factory=lambda: secrets.randbelow(len(ROTATION)))
     substantive_since_user: bool = True
     clip_until: float = -math.inf
@@ -321,6 +327,25 @@ class ListeningCoordinator:
         if role=="assistant" and ((kind=="speech-update" and message.get("status")=="started")
                 or (kind=="transcript" and isinstance(message.get("transcript"),str) and message["transcript"].strip())):
             state.assistant_observations+=1
+        item = state.waiting_reservation
+        if item is not None and role == "assistant":
+            # Provider timestamps measure the sound, not webhook delivery time.
+            # Unknown or unmatched boundaries retain the conservative charge.
+            if kind == "speech-update" and message.get("status") in {"started", "stopped"}:
+                if timestamp is None or age < -.1 or age > 2:
+                    item["uncertain_speech"] = True
+                elif message["status"] == "started" and timestamp > state.speech_events.get(role, -math.inf):
+                    if item["started"] is None:
+                        item["started"] = timestamp
+                        state.waiting_last_start = now-max(0, age)
+                elif message["status"] == "stopped" and timestamp > state.speech_events.get(role, -math.inf):
+                    if item["started"] is None:
+                        item["uncertain_speech"] = True
+                    else:
+                        item["duration"] = max(item["duration"], timestamp-item["started"])
+                        item["stopped"] = True
+            elif kind == "transcript" and isinstance(message.get("transcript"), str) and message["transcript"].strip():
+                item["transcript_seen"] = True
         if kind in {"speech-update", "transcript", "user-interrupted"}:
             if timestamp is None or age < -.1 or age > 2:
                 # A stale partial cannot erase a newer observed speaker state.
@@ -329,6 +354,7 @@ class ListeningCoordinator:
                     self._invalidate(state)
                     state.caller = False
                     state.waiting_stopped = -math.inf
+                    state.caller_interval_start = None
                     state.user_revision += 1
                 return
         if kind == "speech-update":
@@ -350,6 +376,7 @@ class ListeningCoordinator:
                 self._invalidate(state)
             elif role == "user":
                 if started and not state.caller:
+                    state.caller_interval_start = now-max(0, age)
                     state.answer_ready = False
                     state.user_revision += 1
                     # Brief endpointing pauses inside an explanation do not
@@ -360,6 +387,7 @@ class ListeningCoordinator:
                         state.waiting_count = 0
                         state.waiting_first = -math.inf
                         state.waiting_reservation = None
+                        state.waiting_followed = False
                         state.substantive_since_user = False
                     state.text, state.partial_event = "", -math.inf
                     state.segment = ""
@@ -369,6 +397,9 @@ class ListeningCoordinator:
                 if started:
                     state.waiting_stopped = -math.inf
                 if not started:
+                    if state.caller_interval_start is not None:
+                        state.caller_speech_total += max(0, now-max(0, age)-state.caller_interval_start)
+                        state.caller_interval_start = None
                     state.caller_stopped = now-max(0, age)
                     # Use receipt time for the quiet window: delayed webhooks
                     # must not grant an already-expired permission to speak.
@@ -448,10 +479,17 @@ class ListeningCoordinator:
             return ticket, "caller_speaking"
         if state.assistant:
             return ticket, "assistant_speaking"
-        if state.waiting_count and (not follow_up or state.waiting_count >= 2):
-            return ticket, "turn_already_acknowledged"
-        if state.waiting_count and self.clock()-state.waiting_first < 2.5:
-            return ticket, "cooldown"
+        now = self.clock()
+        if state.waiting_count and follow_up:
+            if state.waiting_followed:
+                return ticket, "turn_already_acknowledged"
+            if now-max(state.waiting_last_dispatch, state.waiting_last_start) < 2.5:
+                return ticket, "cooldown"
+        elif math.isfinite(state.waiting_last_dispatch):
+            if now-max(state.waiting_last_dispatch, state.waiting_last_start) < 4:
+                return ticket, "cooldown"
+            if state.caller_speech_total-state.waiting_speech_total < 1:
+                return ticket, "caller_continuation_too_short"
         if not math.isfinite(state.waiting_stopped):
             return ticket, "caller_end_unobserved"
         now = self.clock()
@@ -470,7 +508,11 @@ class ListeningCoordinator:
         state = self.calls[call_id]
         state.waiting_reservation={"count":state.waiting_count,"first":state.waiting_first,
             "at":self.clock(),"revision":state.user_revision,"speech":state.assistant_observations,
-            "stamp":None,"abandoned":False}
+            "stamp":None,"abandoned":False,"started":None,"stopped":False,"duration":0,
+            "uncertain_speech":False,"transcript_seen":False}
+        state.waiting_last_dispatch = self.clock()
+        state.waiting_speech_total = state.caller_speech_total
+        state.waiting_followed = state.waiting_followed or (follow_up and state.waiting_count > 0)
         if not state.waiting_count:
             state.waiting_first = self.clock()
         state.waiting_count += 1
@@ -492,12 +534,14 @@ class ListeningCoordinator:
         state=self.calls.get(call_id)
         if state is None or state.closed or state.session_id!=session_id or state.caller or state.assistant:return None
         item=state.waiting_reservation
-        # Require a cancelled uncompleted generation, subsequent caller speech
-        # and stop, and a full event-lateness grace interval. Any observed
-        # assistant audio/transcript permanently retains this reservation.
+        # Require cancellation, resumed caller speech, and a lateness grace.
+        # A measured sub-300ms blip is not a heard phrase. Its start still
+        # anchors the four-second spacing rule, preventing immediate repeats.
         if (not item or not item['abandoned'] or item['stamp'] is None
                 or state.user_revision<=item['revision'] or self.clock()-item['at']<2.1
-                or state.assistant_observations!=item['speech']
+                or item['uncertain_speech'] or item['duration'] >= .3
+                or (item['started'] is not None and not item['stopped'])
+                or (item['transcript_seen'] and item['started'] is None)
                 or state.waiting_count!=item['count']+1 or not math.isfinite(state.waiting_stopped)):
             return None
         return item['stamp']
@@ -506,8 +550,9 @@ class ListeningCoordinator:
         if stamp is None or self.refundable_waiting(call_id,session_id)!=stamp:return False
         state=self.calls[call_id];item=state.waiting_reservation
         state.waiting_count,state.waiting_first=item['count'],item['first']
+        state.waiting_last_dispatch=state.waiting_last_start
         state.waiting_reservation=None
-        self.record(call_id,'waiting_reclaimed','cancelled_without_observed_speech')
+        self.record(call_id,'waiting_reclaimed','cancelled_before_meaningful_speech')
         return True
 
     def fallback_ready(self, call_id, session_id, text):
@@ -522,6 +567,18 @@ class ListeningCoordinator:
                 and 0 <= self.clock()-state.waiting_stopped <= 3
                 and len(normalize(text).split()) >= 1
                 and normalize(state.completed) == normalize(text))
+
+    def closing_ready(self, call_id, session_id, text):
+        state=self.calls.get(call_id)
+        if (state is None or state.closed or state.session_id!=session_id or state.caller or state.assistant
+                or not math.isfinite(state.waiting_stopped) or self.clock()-state.waiting_stopped<.75
+                or state.segment or not 0<=self.clock()-state.final_received<=8):return False
+        normalize=lambda value:' '.join(re.findall(r"\w+",value.casefold()))
+        return normalize(state.completed)==normalize(text)
+
+    def waiting_neutral_only(self, call_id, session_id):
+        state=self.calls.get(call_id)
+        return state is None or state.session_id!=session_id or state.closed or state.waiting_count>0
 
     def mark_waiting_finished(self, call_id, session_id, text, ticket):
         state=self.calls.get(call_id)
