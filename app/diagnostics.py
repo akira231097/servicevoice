@@ -108,7 +108,8 @@ _ENUM_ATTRIBUTES["caller_lookup_outcome"] = frozenset({"found", "fixture", "no_n
     "withheld_or_unsupported"})
 _ENUM_ATTRIBUTES["caller_context_mode"] = frozenset({"off", "shadow", "personalize"})
 _ENUM_ATTRIBUTES["caller_policy_status"] = frozenset({"loaded", "missing", "invalid", "pending"})
-_ENUM_ATTRIBUTES["caller_hint_state"] = frozenset({"name_and_number", "number_only", "name_asked", "details_saved"})
+_ENUM_ATTRIBUTES["caller_hint_state"] = frozenset({"name_and_number", "number_only", "name_asked", "number_offered",
+    "details_saved"})
 _ENUM_ATTRIBUTES["caller_verstat"] = frozenset({"passed_a", "passed_b", "passed_c", "failed", "no_validation", "absent", "other"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"consent_verified","fact_day","fact_time","fact_services","fact_name","fact_callback_number","fact_cancel_named",

@@ -98,8 +98,10 @@ booking_accuracy: compare caller intent/corrections, spoken details and referenc
 with proposals, returned receipts and saved appointment. A clean saved record
 alone does not prove the assistant understood or described it correctly. When the
 evidence item caller_id is present, the assistant had the phone network's caller
-ID: a name or callback number the assistant offered from it and the caller then
-accepted is caller-confirmed intake information, not an invented detail. If no
+ID. A name or callback number that the assistant explicitly offered as caller ID
+(for example "the number you're calling from") and the caller then clearly
+accepted is caller-confirmed intake information; any other unsupported name or
+number is still a mismatch. If no
 booking/change was requested or claimed and no appointment exists, not_applicable.
 confirmation_compliance: before EVERY committed booking/change/cancellation,
 require an assistant readback of the exact current proposal and explicit caller
@@ -126,7 +128,7 @@ Evaluate all languages by meaning. Never infer exact audio, pronunciation, ASR
 accuracy or what the caller actually heard from a stored transcript. This is an
 advisory text review, not a guarantee of zero hallucinations or verified consent.
 """
-JUDGE_PROMPT_REVISION = "2026-10-25-caller-id-1"
+JUDGE_PROMPT_REVISION = "2026-10-25-caller-id-2"
 JUDGE_PROMPT_SHA256 = hashlib.sha256(JUDGE_SYSTEM.encode("utf-8")).hexdigest()
 FIXED_REASONS = {
     "hallucination_free":"Assistant claims reviewed against dealership facts and recorded tool evidence.",

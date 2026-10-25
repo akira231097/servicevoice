@@ -408,7 +408,16 @@ def test_caller_id_guidance_follows_what_was_actually_said(native_app, tmp_path)
         prepared = [*asked, {"role": "tool_calls", "message": "", "toolCalls": [
             {"id": "prep-9", "type": "function", "function": {"name": "prepare_booking", "arguments": "{}"}}]}]
         reminder = run_tool(client, call, "get_dealership_info", {}, "info-1", {"messages": prepared})["caller_id_guidance"]
-        assert reminder.startswith("Use any caller name only exactly as the caller confirmed it")
+        assert reminder.startswith("If you use a confirmed name, say it in full exactly as confirmed")
+
+
+def test_a_number_already_offered_never_reopens_the_name_step(native_app, tmp_path):
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        call, _ = admit(client, caller=TEST_LINE)
+        offered = [bot("May I have your name? I can use the number you're calling from.", 1_000, 4_000)]
+        guidance = run_tool(client, call, "get_session_context", {}, "context-6", {"messages": offered})["caller_id_guidance"]
+        assert "already offered the number they are calling from" in guidance and "Jordan" not in guidance
 
 
 @pytest.mark.parametrize("mode,caller", [("personalize", OWNER), ("off", TEST_LINE), ("shadow", TEST_LINE)])
@@ -463,7 +472,7 @@ def test_reviewer_learns_caller_id_reached_the_assistant_without_values():
     def rows(*states, component="webhook"):
         return {"events": [{"component": component, "event": "caller_hint", "attributes": {"caller_hint_state": s}}
                            for s in states]}
-    assert caller_id_offer(rows("number_only")) == "number_only"
+    assert caller_id_offer(rows("number_only")) == caller_id_offer(rows("number_offered")) == "number_only"
     assert caller_id_offer(rows("details_saved", "name_asked")) == "name_and_number"
     assert caller_id_offer(rows("name_and_number", component="twilio_bridge")) == "name_and_number"
     assert caller_id_offer(rows("number_only", component="gateway")) is None and caller_id_offer(None) is None
@@ -473,7 +482,8 @@ def test_reviewer_learns_caller_id_reached_the_assistant_without_values():
                 "results": [], "operations": [], "events": [], "handoffs": [], "signatures": [],
                 "tool_policy": "provider-native", "caller_id": "name_and_number"}
     item = build_evidence(call, snapshot)["evidence"]["caller_id"]
-    assert item["available_to_assistant"] == "name_and_number" and "values withheld" in item["provenance"]
+    assert item["available_to_assistant"] == "name_and_number"
+    assert "does not contain the caller-ID values" in item["provenance"]
     assert "caller_id" not in build_evidence(call, dict(snapshot, caller_id=None))["evidence"]
 
 
