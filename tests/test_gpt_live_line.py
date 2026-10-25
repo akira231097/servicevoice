@@ -273,6 +273,8 @@ def test_reviewer_uses_provider_ordinals_for_native_calls():
     messages = [
         {"role": "bot", "message": "Hi, this is Cedar.", "secondsFromStart": 0.5},
         {"role": "user", "message": "What are your hours?", "secondsFromStart": 3},
+        {"role": "tool_calls", "message": "", "secondsFromStart": 3.5,
+         "toolCalls": [{"id": "d1", "type": "function", "function": {"name": "delegate", "arguments": "{}"}}]},
         {"role": "tool_calls", "message": "", "secondsFromStart": 4,
          "toolCalls": [{"id": "t1", "type": "function", "function": {"name": "get_dealership_info", "arguments": "{}"}}]},
         {"role": "tool_call_result", "toolCallId": "t1", "name": "get_dealership_info", "result": "{}", "secondsFromStart": 4.2},
@@ -286,10 +288,11 @@ def test_reviewer_uses_provider_ordinals_for_native_calls():
                 "signatures": [], "tool_policy": "provider-native"}
     call = {"artifact": {"messages": messages}, "endedReason": "assistant-ended-call"}
     package = build_evidence(call, snapshot)
-    assert "unverified_native_platform_attempt" not in package["evidence_issues"]
+    assert package["evidence_issues"] == []
     tools = [value for key, value in package["evidence"].items() if key.startswith("tool:")]
-    assert tools[0]["issuance"] == "provider_native" and tools[0]["user_count"] == 1
-    assert tools[1]["platform_evidence"]["provider_ended_by_assistant"] is True
+    assert tools[0]["name"] == "delegate" and tools[0]["evidence_scope"] == "provider_delegation"
+    assert tools[1]["issuance"] == "provider_native" and tools[1]["user_count"] == 1
+    assert tools[2]["platform_evidence"]["provider_ended_by_assistant"] is True
     gateway = dict(snapshot, tool_policy="gemini-issued")
     assert "unverified_native_platform_attempt" in build_evidence(call, gateway)["evidence_issues"]
 

@@ -308,6 +308,12 @@ def build_evidence(call, snapshot, tool_ids=None):
                 else:
                     entry["evidence_scope"]="unverified_platform_attempt"
                     issues.append("unverified_native_platform_attempt")
+            elif native and fn.get("name")=="delegate":
+                # GPT-Live's speaker handing work to its reasoner: a provider
+                # step with no business effect. The reasoner's own tool calls
+                # are the business operations and are checked as usual.
+                entry.pop("server_result",None)
+                entry["evidence_scope"]="provider_delegation"
             else:
                 entry["evidence_scope"]="business_operation"
                 if tid not in local:issues.append("tool_without_terminal_receipt")
