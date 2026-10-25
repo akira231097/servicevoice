@@ -1284,16 +1284,25 @@ class GeminiGateway:
                 and closing_enabled(config) and any(t["function"]["name"]==END_CALL for t in upstream.get("tools",[]))):
             from .phone_closing import candidate as closing_candidate
             closing = closing_candidate(upstream["messages"])
-            if closing and self.closing_ready is not None and self.closing_ready(call_id,sid,closing):
+            if closing and self.closing_ready is not None:
                 state=await run_in_threadpool(self._backchannel_context,sid,call_id)
                 self._checkpoint(timing)
                 if (state and state.get("allow_turn") is True and state.get("has_pending_proposal") is False
                         and state.get("has_pending_operation") is False and state.get("ended") is False
-                        and await run_in_threadpool(self.store.end_call_ready,sid)
-                        and self.closing_ready(call_id,sid,closing)):
-                    timing.row["route"]="deterministic_closing"
-                    return OwnedStream(self._close_phone(request,upstream,sid,call_id,timing,closing),
-                        lambda:self._cleanup_narration(call_id,timing))
+                        and await run_in_threadpool(self.store.end_call_ready,sid)):
+                    # The generation can precede the VAD stop webhook. Wait a
+                    # bounded interval for that evidence; text alone cannot hang
+                    # up a caller who is still speaking. No business work occurs.
+                    closing_deadline=time.monotonic()+.9
+                    while not self.closing_ready(call_id,sid,closing) and time.monotonic()<closing_deadline:
+                        self._checkpoint(timing)
+                        if await request.is_disconnected():break
+                        await asyncio.sleep(.04)
+                    self._checkpoint(timing)
+                    if self.closing_ready(call_id,sid,closing):
+                        timing.row["route"]="deterministic_closing"
+                        return OwnedStream(self._close_phone(request,upstream,sid,call_id,timing,closing),
+                            lambda:self._cleanup_narration(call_id,timing))
         if config.get("SERVICEVOICE_RECEIPT_NARRATION") == "on":
             try:
                 timing.diagnostic_context["receipt_started_at"]=time.time()
@@ -1748,7 +1757,8 @@ class GeminiGateway:
             await run_in_threadpool(self.store.save_group,sid,call_id,[tool],
                 context=user_context(upstream["messages"]),allow_end_call=True)
             self._checkpoint(timing)
-            if not self.closing_ready(call_id,sid,text):return
+            if not self.closing_ready(call_id,sid,text) or not await run_in_threadpool(self.store.end_call_ready,sid):return
+            self._checkpoint(timing)
             timing.row["counts"]["tool_calls"]=1
             timing.mark("tool_emitted")
             self._payload(timing)
