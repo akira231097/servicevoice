@@ -334,8 +334,9 @@ unchanged. Extra questions, unsupported languages and stale results use the
 ordinary model path. Metadata is never supplied or altered after tool issuance.
 
 A narrow explicit English goodbye can issue the existing signed native endCall
-without a model pass when observed final speech matches and no proposal or
-operation is pending. A verified proposal dismissal can reach that path; the
+without a model pass when fresh recognized closing words match, the caller has
+observably stopped and stayed quiet, and no proposal or operation is pending.
+A final-transcript marker is not required. A verified proposal dismissal can reach that path; the
 shortcut itself performs no scheduler action. Bare stop, quoted/conditional
 goodbyes, consent, new requests, uncertainty and other languages keep the model
 path. Native farewell playback and termination still require live verification.

@@ -265,6 +265,7 @@ class ListeningState:
     completed: str = ""
     final_event: float = -math.inf
     final_received: float = -math.inf
+    final_text: str = ""
     previous: str = ""
     epoch: int = 0
     count: int = 0
@@ -379,6 +380,7 @@ class ListeningCoordinator:
                 self._invalidate(state)
             elif role == "user":
                 if started and not state.caller:
+                    state.final_text = ""
                     state.caller_interval_start = now-max(0, age)
                     state.answer_ready = False
                     state.user_revision += 1
@@ -416,6 +418,7 @@ class ListeningCoordinator:
             # A correction is a fresh explanation for listening classification,
             # but it must not refill either waiting-cue allowance.
             state.completed = state.text = state.segment = ""
+            state.final_text = ""
             state.caller_started = now
             state.last_attempt_text = ""
         elif kind == "transcript":
@@ -467,6 +470,7 @@ class ListeningCoordinator:
                 self._invalidate(state)
                 state.final_event = timestamp
                 state.final_received = now
+                state.final_text = value
                 # ASR finalizes clauses during continuing speech. Preserve those
                 # words for the next partial, without treating a final as fresh
                 # speech or throwing away sensitive earlier content on overflow.
@@ -589,12 +593,29 @@ class ListeningCoordinator:
                 and normalize(state.completed) == normalize(text))
 
     def closing_ready(self, call_id, session_id, text):
+        return self.closing_status(call_id,session_id,text)=="ready"
+
+    def closing_status(self, call_id, session_id, text):
+        from .phone_closing import candidate
         state=self.calls.get(call_id)
-        if (state is None or state.closed or state.session_id!=session_id or state.caller or state.assistant
-                or not math.isfinite(state.waiting_stopped) or self.clock()-state.waiting_stopped<.75
-                or state.segment or not 0<=self.clock()-state.final_received<=8):return False
+        if state is None or state.closed or state.session_id!=session_id:return "speaker_state_unavailable"
+        if state.caller:return "caller_speaking"
+        if state.assistant:return "assistant_speaking"
+        if not math.isfinite(state.waiting_stopped):return "caller_end_unobserved"
+        if self.clock()-max(state.waiting_stopped,state.received)<.75:return "caller_pause_too_short"
         normalize=lambda value:' '.join(re.findall(r"\w+",value.casefold()))
-        return normalize(state.completed)==normalize(text)
+        # Live Vapi can retain text as partial even after its observed stop.
+        # Do not wait for a final marker: require current recognized closing
+        # words, an actual speaker stop, and quiet after the latest words.
+        # Only a whole approved closing clause can be used as a suffix. This
+        # also tolerates older accumulated clauses without guessing their text.
+        current=state.segment if state.segment else state.final_text
+        observed=state.received if state.segment else state.final_received
+        if not 0<=self.clock()-observed<=8:return "closing_text_stale"
+        if (not candidate([{"role":"user","content":text}]) or not candidate([{"role":"user","content":current}])
+                or not (normalize(text)==normalize(current) or normalize(text).endswith(' '+normalize(current)))):
+            return "closing_text_unverified"
+        return "ready"
 
     def waiting_neutral_only(self, call_id, session_id):
         state=self.calls.get(call_id)

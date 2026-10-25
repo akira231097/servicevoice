@@ -813,6 +813,7 @@ class GeminiGateway:
         # their existing transport; timing checks never authorize business work.
         self.waiting_cue_state = None
         self.closing_ready = None
+        self.closing_status = None
         self.waiting_neutral_only = None
         self.waiting_cue_commit = None
         self.waiting_cue_assistant = None
@@ -1285,24 +1286,32 @@ class GeminiGateway:
             from .phone_closing import candidate as closing_candidate
             closing = closing_candidate(upstream["messages"])
             if closing and self.closing_ready is not None:
-                state=await run_in_threadpool(self._backchannel_context,sid,call_id)
+                try:
+                    state=await run_in_threadpool(self._backchannel_context,sid,call_id)
+                    operations_ready=await run_in_threadpool(self.store.end_call_ready,sid)
+                except sqlite3.Error:state=None;operations_ready=False
                 self._checkpoint(timing)
+                closing_reason="state_unavailable" if state is None else "proposal_or_operation_pending"
                 if (state and state.get("allow_turn") is True and state.get("has_pending_proposal") is False
                         and state.get("has_pending_operation") is False and state.get("ended") is False
-                        and await run_in_threadpool(self.store.end_call_ready,sid)):
+                        and operations_ready):
                     # The generation can precede the VAD stop webhook. Wait a
                     # bounded interval for that evidence; text alone cannot hang
                     # up a caller who is still speaking. No business work occurs.
-                    closing_deadline=time.monotonic()+.9
+                    closing_deadline=time.monotonic()+1.25
                     while not self.closing_ready(call_id,sid,closing) and time.monotonic()<closing_deadline:
                         self._checkpoint(timing)
                         if await request.is_disconnected():break
                         await asyncio.sleep(.04)
                     self._checkpoint(timing)
+                    closing_reason=(self.closing_status(call_id,sid,closing) if self.closing_status is not None
+                        else "ready" if self.closing_ready(call_id,sid,closing) else "speaker_state_unavailable")
                     if self.closing_ready(call_id,sid,closing):
+                        self._observe_closing(timing,"ready")
                         timing.row["route"]="deterministic_closing"
                         return OwnedStream(self._close_phone(request,upstream,sid,call_id,timing,closing),
                             lambda:self._cleanup_narration(call_id,timing))
+                self._observe_closing(timing,closing_reason)
         if config.get("SERVICEVOICE_RECEIPT_NARRATION") == "on":
             try:
                 timing.diagnostic_context["receipt_started_at"]=time.time()
@@ -1748,21 +1757,37 @@ class GeminiGateway:
         self._release(call_id, timing)
         timing.finish()
 
+    def _observe_closing(self,timing,reason):
+        try:
+            if self.diagnostics is not None:
+                self.diagnostics.record("gateway","closing_checked","observed",
+                    call_id=timing.diagnostic_context["call_id"],request_id=timing.row["request_id"],
+                    attributes={"closing_reason":reason,"generation_id":timing.row["generation_id"],"evidence_source":"server_observed"})
+        except Exception:pass  # Optional observations must not break call control.
+
     async def _close_phone(self,request,upstream,sid,call_id,timing,text):
         try:
             self._phase(timing,True)
             self._checkpoint(timing)
-            if await request.is_disconnected() or not self.closing_ready(call_id,sid,text):return
+            if await request.is_disconnected():return
+            if not self.closing_ready(call_id,sid,text):
+                timing.outcome="interrupted"
+                async for part in self._neutral_stream(request,timing):yield part
+                return
             tool={"id":"call_"+uuid4().hex,"type":"function","function":{"name":END_CALL,"arguments":"{}"}}
             await run_in_threadpool(self.store.save_group,sid,call_id,[tool],
                 context=user_context(upstream["messages"]),allow_end_call=True)
             self._checkpoint(timing)
-            if not self.closing_ready(call_id,sid,text) or not await run_in_threadpool(self.store.end_call_ready,sid):return
+            if not self.closing_ready(call_id,sid,text) or not await run_in_threadpool(self.store.end_call_ready,sid):
+                timing.outcome="interrupted"
+                async for part in self._neutral_stream(request,timing):yield part
+                return
             self._checkpoint(timing)
+            response_id="chatcmpl-"+uuid4().hex
+            timing.row["sse_response_id"]=response_id
             timing.row["counts"]["tool_calls"]=1
             timing.mark("tool_emitted")
             self._payload(timing)
-            response_id="chatcmpl-"+uuid4().hex
             def chunk(delta,reason=None):
                 return {"id":response_id,"object":"chat.completion.chunk","created":int(time.time()),
                     "model":"servicevoice-closing","choices":[{"index":0,"delta":delta,"finish_reason":reason}]}

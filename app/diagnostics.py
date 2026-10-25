@@ -124,6 +124,10 @@ _ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"cancelled_without_observed_s
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_continuation_too_short", "repeated_phrase"})
 _ENUM_ATTRIBUTES["route"] |= frozenset({"deterministic_closing"})
 EVENTS |= frozenset({"waiting_reclaimed"})
+EVENTS |= frozenset({"closing_checked"})
+_ENUM_ATTRIBUTES["closing_reason"] = frozenset({"ready","speaker_state_unavailable","caller_speaking",
+    "assistant_speaking","caller_end_unobserved","caller_pause_too_short","closing_text_stale",
+    "closing_text_unverified","state_unavailable","proposal_or_operation_pending"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _FLAGS |= frozenset({"backchannel_guarded_fallback"})

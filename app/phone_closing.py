@@ -1,7 +1,7 @@
 """Narrow explicit English closing shortcut; all ambiguity goes to the model.
 
 Never interprets consent, changes an appointment, or substitutes for a pending
-proposal withdrawal. The gateway also requires observed final speech and no
+proposal withdrawal. The gateway also requires matched recognized words, observed quiet and no
 unresolved operation before issuing the existing signed native endCall.
 """
 import json

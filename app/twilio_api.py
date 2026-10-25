@@ -537,6 +537,7 @@ def install_twilio(app, settings):
         if config.listening and config.topology == "conference":
             app.state.gemini_gateway.waiting_cue_state = lane.waiting_status
             app.state.gemini_gateway.closing_ready = lane.coordinator.closing_ready
+            app.state.gemini_gateway.closing_status = lane.coordinator.closing_status
             app.state.gemini_gateway.waiting_neutral_only = lane.coordinator.waiting_neutral_only
             app.state.gemini_gateway.waiting_cue_commit = lane.commit_waiting
             app.state.gemini_gateway.waiting_cue_assistant = lane.phone_identity.assistant_id

@@ -83,3 +83,87 @@ def test_closing_requires_exact_recent_final_and_observed_stop():
         assert not c.closing_ready('fixture-call','session','Goodbye.')
         await c.close()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('final',[False,True])
+def test_matching_closing_clause_and_actual_stop_do_not_require_final_flag_or_old_prefix(final):
+    async def run():
+        c,clock,_,_,_,event,_=speaker_setup()
+        state=c.calls['fixture-call'];state.completed='Earlier unrelated vehicle details.'
+        event('transcript','user',transcriptType='partial',transcript='That is all, goodbye.')
+        if final:event('transcript','user',transcriptType='final',transcript='That is all, goodbye.')
+        assert not c.closing_ready('fixture-call','session','Okay. That is all, goodbye.')
+        event('speech-update','user',status='stopped');clock.now+=.8
+        assert c.closing_ready('fixture-call','session','Okay. That is all, goodbye.')
+        assert not c.closing_ready('fixture-call','session','Tell me your hours, then goodbye.')
+        clock.now+=.1;event('speech-update','user',status='started')
+        clock.now+=.2;event('speech-update','user',status='stopped');clock.now+=.8
+        assert not c.closing_ready('fixture-call','session','Okay. That is all, goodbye.')
+        await c.close()
+    asyncio.run(run())
+
+
+def test_new_partial_after_goodbye_revokes_shortcut():
+    async def run():
+        c,clock,_,_,_,event,_=speaker_setup()
+        event('transcript','user',transcriptType='partial',transcript='Goodbye.')
+        event('speech-update','user',status='stopped');clock.now+=.8
+        assert c.closing_ready('fixture-call','session','Goodbye.')
+        clock.now+=.1;event('transcript','user',transcriptType='partial',transcript='Goodbye, wait.')
+        clock.now+=.8
+        assert c.closing_status('fixture-call','session','Goodbye.')=='closing_text_unverified'
+        await c.close()
+    asyncio.run(run())
+
+
+def test_optional_closing_state_failure_uses_model_without_hanging_up(tmp_path,monkeypatch):
+    import sqlite3
+    env=setup(tmp_path,monkeypatch)
+    env.config['SERVICEVOICE_NATIVE_END_CALL']='on'
+    env.gateway.waiting_cue_assistant='test-assistant';env.gateway.closing_ready=lambda *args:True
+    env.history=[{'role':'user','content':'Goodbye.'}]
+    def unavailable(*args):raise sqlite3.OperationalError('synthetic-only')
+    monkeypatch.setattr(env.gateway,'_backchannel_context',unavailable)
+    async def run():
+        try:
+            response=await post(env,lambda b:b.update(tools=[*b['tools'],schema()]))
+            assert response.status_code==200 and 'Gemini fallback' in response.text
+            assert 'synthetic-only' not in response.text
+        finally:await env.gateway.close()
+    asyncio.run(run())
+
+
+def test_real_coordinator_partial_closing_reaches_signed_native_path(tmp_path,monkeypatch):
+    env=setup(tmp_path,monkeypatch)
+    env.config['SERVICEVOICE_NATIVE_END_CALL']='on';env.gateway.waiting_cue_assistant='test-assistant'
+    env.history=[{'role':'user','content':'Okay. That is all, goodbye.'}]
+    async def run():
+        c,clock,_,_,_,event,_=speaker_setup()
+        event('transcript','user',transcriptType='partial',transcript='That is all, goodbye.')
+        event('speech-update','user',status='stopped');clock.now+=.8
+        state=c.calls.pop('fixture-call');state.session_id=env.sid;c.calls[env.cid]=state
+        env.gateway.closing_ready=c.closing_ready;env.gateway.closing_status=c.closing_status
+        try:
+            response=await post(env,lambda b:b.update(tools=[*b['tools'],schema()]))
+            assert response.status_code==200 and '"name":"endCall"' in response.text and not env.sent
+            row=env.gateway.latency_snapshot(env.cid)[-1]
+            assert row['route']=='deterministic_closing' and row['sse_response_id'] in response.text
+        finally:await env.gateway.close();await c.close()
+    asyncio.run(run())
+
+
+def test_caller_resuming_during_native_signature_write_gets_valid_silent_completion(tmp_path,monkeypatch):
+    env=setup(tmp_path,monkeypatch);ready=[True]
+    env.config['SERVICEVOICE_NATIVE_END_CALL']='on';env.gateway.waiting_cue_assistant='test-assistant'
+    env.history=[{'role':'user','content':'Goodbye.'}];env.gateway.closing_ready=lambda *args:ready[0]
+    original=env.gateway.store.save_group
+    def interrupted(*args,**kwargs):
+        original(*args,**kwargs);ready[0]=False
+    monkeypatch.setattr(env.gateway.store,'save_group',interrupted)
+    async def run():
+        try:
+            response=await post(env,lambda b:b.update(tools=[*b['tools'],schema()]))
+            assert response.status_code==200 and '[DONE]' in response.text and 'endCall' not in response.text
+            assert env.gateway.latency_snapshot(env.cid)[-1]['counts']['tool_calls']==0
+        finally:await env.gateway.close()
+    asyncio.run(run())
