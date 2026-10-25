@@ -108,6 +108,8 @@ def test_actual_12ms_blip_with_growing_asr_but_no_new_vad_boundary():
         c.track_waiting('fixture-call','session',123,abandoned=True)
         assert c.refundable_waiting('fixture-call','session') is None
         event('speech-update','user',status='stopped');clock.now+=.76
+        assert c.waiting_status('fixture-call','session')[1]=='caller_pause_too_short'
+        clock.now+=.75  # Long descriptive continuation needs the longer quiet floor.
         assert c.waiting_status('fixture-call','session')[1]=='eligible'
         assert c.refundable_waiting('fixture-call','session')==123
         await c.close()

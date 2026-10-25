@@ -50,6 +50,20 @@ DECISION_RETRY_SECONDS = 1.5
 WAITING_QUIET_SECONDS = .75
 
 
+def waiting_quiet_seconds(state):
+    """A one-second pause inside a long description is not a clear handoff.
+
+    Short replies and a direct question/request keep the ordinary delay. This
+    only raises a timing floor; it never grants speech or classifies consent.
+    """
+    if state.caller_stopped-state.caller_started < 8 or len(state.text.split()) <= 12:
+        return WAITING_QUIET_SECONDS
+    tail=re.split(r"[.!?]\s+", state.text.strip())[-1].strip()
+    direct=re.match(r"^(?:(?:so|and|because)[, ]+)?(?:what|when|where|why|how|can|could|would|will|do|does|is|are|"
+        r"i (?:just )?(?:want|need|would like)|please (?:check|book|schedule|tell|help))\b",tail,re.I)
+    return WAITING_QUIET_SECONDS if direct else 1.5
+
+
 class CueNotSent(Exception):
     """A local dispatch veto before any request crossed the provider boundary."""
 
@@ -557,7 +571,7 @@ class ListeningCoordinator:
         if not math.isfinite(state.waiting_stopped):
             return ticket, "caller_end_unobserved"
         now = self.clock()
-        if now-max(state.waiting_stopped, state.received) < WAITING_QUIET_SECONDS:
+        if now-max(state.waiting_stopped, state.received) < waiting_quiet_seconds(state):
             return ticket, "caller_pause_too_short"
         # Give an already-dispatched listening clip time to finish; this is a
         # conservative bound, not an assertion of measured handset playback.

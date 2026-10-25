@@ -356,8 +356,10 @@ and four simultaneous live callers require separate measurement.
 
 The isolated speech service can enable `SERVICEVOICE_TTS_ATOMIC_FAREWELL=on`.
 Only the exact native farewell, “Thank you for calling. Goodbye.”, is buffered
-and validated completely before any audio bytes are returned. The eight-second
-audio bound and the existing request deadline still apply. Ordinary replies
+and validated completely before any audio bytes are returned. A one-second
+silent tail allows the final voiced frames to cross phone/conference buffers
+before teardown. The eight-second total audio bound and existing request deadline
+still apply. Ordinary replies
 continue streaming; the main speech service is not opted in. This addresses an
 observed Vapi endCall failure where a five-millisecond first segment was mistaken
 for farewell completion and the real audio began after disconnect.
@@ -366,6 +368,11 @@ Fresh growing partial words can restore listening after an omitted VAD start.
 They revoke waiting-cue permission and never establish an end of turn. Repeated
 text, same-length revisions, stale events and elapsed silence cannot do this.
 An observed stop is still required before a waiting cue.
+
+A long descriptive turn needs 1.5 seconds of observed quiet before a hold.
+Short replies and a final direct question/request retain the 0.75-second floor.
+This reduces cut-off “Just…”/“One…” fragments during one-second thinking pauses;
+it does not infer an end of turn from silence or delay a ready main answer.
 
 Jev distinguishes routine worry, uncertainty about a vehicle issue and earliest
 appointment requests from emergency urgency and commands to stop. The isolated

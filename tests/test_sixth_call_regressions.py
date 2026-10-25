@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from app.backchannel_policy import BackchannelDecision, guarded_waiting_fallback, waiting_state, neutral_language_compatible
-from app.gemini_tts import GeminiTTS, ATOMIC_FAREWELL, TTSError
+from app.gemini_tts import GeminiTTS, ATOMIC_FAREWELL, FAREWELL_TAIL_SECONDS, TTSError
 from test_gemini_tts import Stream, event as pcm_event, envelope, body
 from test_listening_cues import setup, drain
 
@@ -28,7 +28,7 @@ def test_farewell_never_releases_a_tiny_segment_before_complete_synthesis():
             assert not task.done()  # No response headers or partial farewell.
             gate.set();response=await task
             chunks=[x async for x in response.body_iterator]
-            assert chunks==[first+rest] and stream.closed
+            assert chunks==[first+rest+b'\x00'*(32000*FAREWELL_TAIL_SECONDS)] and stream.closed
     asyncio.run(run())
 
 
@@ -113,3 +113,22 @@ def test_hows_it_going_is_a_greeting_not_language_uncertainty():
     state,_=waiting_state([{'role':'user','content':"How's it going?"}],CONTEXT)
     assert neutral_language_compatible('cache_compatible',.97,state)
     assert not neutral_language_compatible('not_compatible',.97,state)
+
+
+@pytest.mark.parametrize('tail,quiet',[
+    ('It has been shaking for quite some time and I have been worried about the problem.',1.5),
+    ('So what can you do?',.75),
+    ('Because I just want to book an appointment as soon as possible.',.75),
+])
+def test_long_description_pause_is_not_a_direct_question_handoff(tail,quiet):
+    async def run():
+        c,clock,_,_,_,event,_=setup();clock.now=10
+        text='The engine rattles every morning when I drive around my neighborhood. '+tail
+        event('transcript','user',transcriptType='final',transcript=text)
+        event('speech-update','user',status='stopped')
+        clock.now+=quiet-.01
+        assert c.waiting_status('fixture-call','session')[1]=='caller_pause_too_short'
+        clock.now+=.02
+        assert c.waiting_status('fixture-call','session')[1]=='eligible'
+        await c.close()
+    asyncio.run(run())

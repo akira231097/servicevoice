@@ -27,6 +27,7 @@ MAX_TEXT_CHARACTERS = 4000
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_AUDIO_SECONDS = 90
 ATOMIC_FAREWELL = "Thank you for calling. Goodbye."
+FAREWELL_TAIL_SECONDS = 1
 
 
 class TTSError(RuntimeError):
@@ -330,10 +331,12 @@ class GeminiTTS:
                     chunks=[];size=0
                     async for chunk in audio:
                         size+=len(chunk)
-                        if size>rate*2*8:raise TTSError("tts_audio_limit_exceeded")
+                        if size>rate*2*(8-FAREWELL_TAIL_SECONDS):raise TTSError("tts_audio_limit_exceeded")
                         chunks.append(chunk)
                     if not size:raise TTSError("tts_upstream_empty_audio")
-                    pcm=b"".join(chunks)
+                    # Keep the transport open while the final voiced frames
+                    # cross the conference/phone buffers. No extra words.
+                    pcm=b"".join(chunks)+b"\x00"*(rate*2*FAREWELL_TAIL_SECONDS)
                     await audio.aclose()
                     async def complete_farewell():yield pcm
                     audio=complete_farewell()
