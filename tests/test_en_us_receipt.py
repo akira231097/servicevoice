@@ -44,7 +44,7 @@ def test_en_us_proposal_correction_confirmation_keep_exact_receipts_and_signatur
             assert result["presentation"] == corrected["presentation"] == proposal["presentation"] == context
             assert not env.sent
             rows = env.gateway.latency_snapshot(env.cid)
-            assert len(rows) == 3 and NARRATOR_VERSION == "receipt-en-2026-10-20-7"
+            assert len(rows) == 3 and NARRATOR_VERSION == "receipt-en-2026-10-24-8"
             assert all(row["route"] == "deterministic_receipt" and row["narrator_version"] == NARRATOR_VERSION for row in rows)
             assert all(row["counts"]["upstream_events"] == 0 for row in rows)
             for message in env.history:
