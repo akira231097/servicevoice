@@ -134,6 +134,10 @@ def test_verified_after_full_readback_and_later_yes():
 @pytest.mark.parametrize("readback", [
     "Booking your oil change, Sam Lee, Monday at nine in the morning; we'll call 405 555 0123. Sound good?",
     "That's an oil and filter service on October 26 at 9:00 AM for Sam, callback 4055550123. Go ahead?",
+    # Live call 2026-10-25: natural speech says "your" instead of the caller's name.
+    "I have a proposed oil and filter service for your 2019 Honda Civic on Monday, October 26 at 9 a.m. "
+    "Central Daylight Time. Your callback number is four zero five, five five five, zero one two three. "
+    "Would you like me to go ahead?",
 ])
 def test_paraphrased_readbacks_pass(readback):
     ok, evidence = check(bot(readback, 2_000, 9_000), user("Yeah that works.", 9_200))

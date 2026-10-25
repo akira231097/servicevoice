@@ -21,6 +21,7 @@ from app.domain import TENANT, TZ
 
 PREPARE_TOOLS = frozenset({"prepare_booking", "prepare_first_available_booking",
                            "prepare_reschedule", "prepare_cancellation"})
+ADVISORY_FACTS = frozenset({"name"})
 # Provider timestamps for the end of assistant speech and the start of caller
 # speech are approximate; a yes that starts this close to the end still counts.
 OVERLAP_TOLERANCE_MS = 600
@@ -203,7 +204,9 @@ def assess(artifact, proposal, facts, *, today=None):
     if kind == "cancel":
         checks["cancel_named"] = bool(re.search(r"\bcancel", normalized))
     evidence["facts"] = checks
-    missing = [name for name, ok in checks.items() if not ok]
+    # Spoken readbacks naturally say "your car" to the caller; the name is
+    # recorded as evidence but only what, when and the callback must be heard.
+    missing = [name for name, ok in checks.items() if not ok and name not in ADVISORY_FACTS]
     if missing:
         evidence["missing_facts"] = missing
         evidence["reasons"].append("readback_incomplete")
@@ -247,5 +250,5 @@ def refusal(evidence):
     detail = (" Missing from the readback: " + ", ".join(labels.get(item, item) for item in missing) + ".") if missing else ""
     return {"ok": False, "error": "confirmation_not_verified",
             "message": ("Nothing was saved. Read the pending details back to the caller (service, day and time; for a new "
-                        "booking also their name and callback number), ask whether to go ahead, and call confirm_action "
+                        "booking also their callback number), ask whether to go ahead, and call confirm_action "
                         "only after the caller clearly says yes." + detail)}
