@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import threading
@@ -49,6 +50,7 @@ TOOL_POLICIES = frozenset({"gemini-issued", "provider-native"})
 NATIVE_TOOLS_FLAG = "gpt-live-candidate"
 NATIVE_TOOLS_ENVIRONMENTS = frozenset({"local", "development", "staging"})
 CAP_REFUSAL = {"error": "Thanks for calling. This test line has reached its call limit for now. Please try again later. Goodbye."}
+CALLER_NUMBER = re.compile(r"\+[1-9][0-9]{7,14}")
 
 
 def _cap(values, name):
@@ -334,6 +336,11 @@ class TelephonyIngress:
             # survives; session_id alone never authorizes console/session routes.
             token_hash = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
             state = {"stage": "service", "slots": [], "customer": None, "service": None, "action": "book"}
+            caller = (call.get("customer") or {}).get("number") if isinstance(call.get("customer"), dict) else None
+            if self.config.tool_policy == "provider-native" and isinstance(caller, str) and CALLER_NUMBER.fullmatch(caller):
+                # Offered back as a callback convenience only after the caller
+                # confirms it; never treated as identity verification.
+                state["caller_number"] = caller
             db.execute("INSERT INTO sessions(id,token_hash,tenant,mode,created,ended,state,provider_call_id) VALUES (?,?,?,?,?,0,?,?)",
                        (sid, token_hash, TENANT, "live", now, json.dumps(state), call_id))
             self._insert_binding(db, call_id, sid, now)

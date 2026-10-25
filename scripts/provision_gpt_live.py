@@ -55,6 +55,8 @@ def main(argv=None):
     parser.add_argument("--server-credential-id")
     parser.add_argument("--openai-credential-id")
     parser.add_argument("--voice", default="gleam")
+    parser.add_argument("--reasoner-model", default="gpt-5.6-terra", choices=gpt_live.REASONER_MODELS)
+    parser.add_argument("--reasoning-effort", default="low", choices=gpt_live.REASONING_EFFORTS)
     parser.add_argument("--allow-vapi-billing", action="store_true", help="Proceed without an OpenAI credential (Vapi balance pays GPT-Live).")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--create-server-credential", action="store_true")
@@ -90,9 +92,11 @@ def main(argv=None):
             print("No OpenAI credential is connected in Vapi (Integrations -> OpenAI). Connect it, or pass --allow-vapi-billing.")
             return 2
         payload = gpt_live.assistant_payload(server_url=args.server_url, server_credential_id=server_credential,
-                                             openai_credential_id=openai_id, voice_id=args.voice)
+                                             openai_credential_id=openai_id, voice_id=args.voice,
+                                             reasoner_model=args.reasoner_model, reasoning_effort=args.reasoning_effort)
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         summary = {"name": payload["name"], "model": payload["model"]["model"], "reasoner": payload["model"]["reasoner"]["model"],
+                   "reasoning_effort": payload["model"]["reasoner"]["reasoningEffort"],
                    "voice": payload["voice"]["voiceId"], "tools": len(payload["model"]["tools"]),
                    "server_url": payload["server"]["url"], "openai_credential": bool(openai_id),
                    "prompt_version": gpt_live.PROMPT_VERSION, "payload_sha256": digest}

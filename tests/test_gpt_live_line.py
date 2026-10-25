@@ -91,6 +91,16 @@ def test_assistant_payload_shape_and_guards():
     assert "{{" not in reasoner and "get_dealership_info" in reasoner and "<trusted_dealership_facts>" in reasoner
     assert '"today"' not in reasoner  # the reasoner fetches the date per call
     assert "callback number with its digits grouped" in reasoner  # every readback must let the server verify it
+    assert "caller_number" in reasoner and "join the letters" in reasoner
+    speaker = model["speaker"]["instructions"]
+    for section in ("Facts you can share without checking:", "Backchannel policy:", "Interruption policy:",
+                    "Do not delegate to the backend when:", "While work is running:", "Names and numbers:", "Results:"):
+        assert section in speaker
+    assert "thanks you" in speaker  # pleasantries are answered without a reasoner round trip
+    luna = gpt_live.assistant_payload(server_url="https://edge.example/gpt-live/webhooks/vapi/inbound",
+                                      server_credential_id=SERVER_CREDENTIAL, reasoner_model="gpt-5.6-luna",
+                                      reasoning_effort="none", local_date=date(2026, 10, 25))
+    assert luna["model"]["reasoner"]["model"] == "gpt-5.6-luna" and luna["model"]["reasoner"]["reasoningEffort"] == "none"
     assert "recorded" in model["speaker"]["instructions"] and "recorded" in payload["firstMessage"]
     with pytest.raises(ValueError):
         gpt_live.assistant_payload(server_url="https://edge.example/webhooks/vapi", server_credential_id=SERVER_CREDENTIAL)
@@ -221,9 +231,10 @@ def native_app(tmp_path, monkeypatch):
     return make
 
 
-def admit(client):
+def admit(client, caller=None):
     body = {"message": {"type": "assistant-request", "call": {"id": str(uuid4()), "type": "inboundPhoneCall",
-                                                             "orgId": ORG, "phoneNumberId": PHONE}}}
+                                                             "orgId": ORG, "phoneNumberId": PHONE,
+                                                             **({"customer": {"number": caller}} if caller else {})}}}
     response = client.post(PATH, headers=PHONE_HEADERS, json=body)
     assert response.status_code == 200, response.text
     return {**body["message"]["call"], **response.json()}, response.json()
@@ -295,6 +306,27 @@ def test_reviewer_uses_provider_ordinals_for_native_calls():
     assert tools[2]["platform_evidence"]["provider_ended_by_assistant"] is True
     gateway = dict(snapshot, tool_policy="gemini-issued")
     assert "unverified_native_platform_attempt" in build_evidence(call, gateway)["evidence_issues"]
+
+
+def test_native_line_offers_the_calling_number_only_through_session_context(native_app):
+    app, client = native_app()
+    with client:
+        call, _ = admit(client, caller="+14055550199")
+        context = run_tool(client, call, "get_session_context", {}, "context-1")
+        assert context["caller_number"] == "+14055550199" and "not identity verification" in context["caller_number_note"]
+        unknown, _ = admit(client, caller="anonymous")
+        assert "caller_number" not in run_tool(client, unknown, "get_session_context", {}, "context-2")
+
+
+def test_gateway_issued_phone_line_never_records_the_calling_number(native_app):
+    app, client = native_app(SERVICEVOICE_PHONE_NATIVE_TOOLS="", VAPI_MODEL_PROFILE="gemini-3.8-flash-custom",
+                             SERVICEVOICE_ENVIRONMENT="production")
+    with client:
+        _, admitted = admit(client, caller="+14055550199")
+        sid = admitted["assistantOverrides"]["variableValues"]["session_id"]
+        with app.state.store.connect() as db:
+            state = json.loads(db.execute("SELECT state FROM sessions WHERE id=?", (sid,)).fetchone()[0])
+        assert "caller_number" not in state
 
 
 def test_lifetime_cap_refuses_politely_without_a_session(native_app):

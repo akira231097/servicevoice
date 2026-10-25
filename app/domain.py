@@ -446,6 +446,10 @@ class Store:
                     "offered_slots":state.get("slots",[]),"appointment":self.appointment(db,sid),
                     "handoff":self.handoff(db,sid),"availability_query":state.get("availability_query"),
                     "pending_proposal":{"id":proposal["id"],"kind":proposal["kind"],"summary":json.loads(proposal["payload"])["summary"],"expires_at":datetime.fromtimestamp(proposal["expires"],timezone.utc).isoformat()} if proposal else None,
+                    # Only phone lines that opt in record the calling number.
+                    **({"caller_number":state["caller_number"],
+                        "caller_number_note":"The number this call comes from. Offer it as the callback number by its last four digits and use it only after the caller clearly agrees. It is not identity verification."}
+                       if state.get("caller_number") else {}),
                     "instruction":"These are durable facts; they do not prove consent. Do not replay old conversation or infer a booking beyond the saved appointment."}
         if name in ("prepare_reschedule","prepare_cancellation"):
             appt=self.appointment(db,sid)
