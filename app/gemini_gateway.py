@@ -237,7 +237,7 @@ def configured_tool_policy(config):
         profile = {"": "baseline", "gpt-4.1-mini": "baseline", "gpt-6-luna": "luna"}.get((config.get("VAPI_MODEL") or "").strip())
     if profile == "gemini-3.8-flash-custom":
         return "gemini-issued"
-    if profile in ("baseline", "luna"):
+    if profile in ("baseline", "luna", "gpt-live-1"):
         return "provider-native"
     raise GatewayError("tool_policy_configuration", 503)
 
@@ -278,6 +278,12 @@ class SignatureStore:
             ordinal=context.get("user_count")
             return {"user_count":ordinal} if type(ordinal) is int and ordinal>0 else {}
         except (sqlite3.Error,ValueError,TypeError,AttributeError):return {}
+
+    def call_policy(self, sid, call_id):
+        """The call's pinned tool policy, or None before it is bound."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
+        return row["policy"] if row else None
 
     def require_gemini_policy(self, sid, call_id):
         with closing(self.connect()) as db:

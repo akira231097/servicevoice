@@ -94,8 +94,16 @@ _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "priva
 # refund cause is recorded beside the original emission reason, never over it.
 _ENUM_ATTRIBUTES["backchannel_refund_reason"] = frozenset({"generation_cancelled_before_answer", "generation_superseded_before_answer"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= _ENUM_ATTRIBUTES["backchannel_refund_reason"]
+# Provider-native (GPT-Live) confirmation check: codes only, never caller words.
+_ENUM_ATTRIBUTES["consent_reason"] = frozenset({"verified", "proposal_facts_unavailable", "transcript_unavailable", "readback_anchor_missing",
+    "assent_not_explicit", "later_caller_change", "readback_missing", "answer_during_readback", "readback_incomplete"})
+_ENUM_ATTRIBUTES["consent_assent"] = frozenset({"explicit_yes", "withdrawn_later", "during_readback", "negated_or_changed", "question",
+    "backchannel", "not_assent", "empty", "missing"})
+_ENUM_ATTRIBUTES["consent_anchor"] = frozenset({"tool_result", "proposal_time", "missing"})
+_ENUM_ATTRIBUTES["evidence_source"] |= frozenset({"provider_live_artifact"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
-_FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
+_FLAGS = frozenset({"consent_verified","fact_day","fact_time","fact_services","fact_name","fact_callback_number","fact_cancel_named",
+                    "backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
 _HASHES = frozenset({"cache_asset_id","cache_request_sha256","cache_manifest_sha256","input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
 

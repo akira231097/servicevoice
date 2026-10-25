@@ -84,6 +84,10 @@ def read_snapshot(path, call_id):
                         raise EvidenceError("invalid_appointment_services")
                     if len(valid) > 1:
                         appointment["services"] = valid
+        result["tool_policy"] = None
+        if "provider_tool_policies" in tables:
+            policy = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
+            result["tool_policy"] = policy["policy"] if policy else None
         result["signatures"] = []
         if "gemini_tool_signatures" in tables:
             for r in db.execute("SELECT tool_call_id,fingerprint,extras FROM gemini_tool_signatures WHERE session_id=? AND provider_call_id=? LIMIT 501", (sid,call_id)):
@@ -227,6 +231,9 @@ def build_evidence(call, snapshot, tool_ids=None):
         raise EvidenceError("missing_or_oversized_messages")
     local = {r["call_id"]:r["result"] for r in snapshot["results"]}
     signatures = {r["tool_call_id"]:r for r in snapshot["signatures"]}
+    # A Vapi-hosted model (GPT-Live) issues its own tools: there is no gateway
+    # signature, so the provider transcript ordinal is the only turn anchor.
+    native = snapshot.get("tool_policy") == "provider-native"
     evidence, tools, transcript = {}, [], []
     platform_reports={}
     for message in messages:
@@ -266,6 +273,9 @@ def build_evidence(call, snapshot, tool_ids=None):
             verified = signature.get("fingerprint") == hashlib.sha256(identity.encode()).hexdigest()
             entry = {"name":fn.get("name"),"arguments":args,"sequence":index,"user_count":signature.get("user_count") if verified else None,
                      "gateway_issuance_verified":verified,"server_result":local.get(tid),"provider_user_count":caller_count}
+            if native and not verified:
+                entry["issuance"] = "provider_native"
+                entry["user_count"] = caller_count if caller_count > 0 else None
             if fn.get("name")=="endCall":
                 # This is the one supported Vapi-owned action, never a booking
                 # operation. The DB reader already scopes signatures to both
@@ -285,6 +295,16 @@ def build_evidence(call, snapshot, tool_ids=None):
                         "provider_ended_by_assistant":end_by_assistant,
                         "provider_results":platform_reports.get(tid,[]),
                         "limitations":"A native attempt is not verified execution, caller intent, farewell playback or a scheduler mutation. Provider termination is coverage only."}
+                elif native and len(batch)==1 and args=={}:
+                    reason=call.get("endedReason")
+                    entry.pop("server_result",None)
+                    entry["evidence_scope"]="platform_attempt"
+                    entry["platform_evidence"]={"action":"endCall","issuance_verified":False,"issuance":"provider_native",
+                        "outcome":"unknown","authoritative_scheduler_receipt":False,
+                        "provider_ended_by_assistant":(True if reason in {"assistant-ended-call","assistant-said-end-call-phrase"}
+                            else False if reason=="customer-ended-call" else None) if isinstance(reason,str) else None,
+                        "provider_results":platform_reports.get(tid,[]),
+                        "limitations":"A provider-native attempt is not verified execution, caller intent, farewell playback or a scheduler mutation."}
                 else:
                     entry["evidence_scope"]="unverified_platform_attempt"
                     issues.append("unverified_native_platform_attempt")

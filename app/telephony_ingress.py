@@ -43,18 +43,47 @@ def _uuid(value):
         return False
 
 
+TOOL_POLICIES = frozenset({"gemini-issued", "provider-native"})
+# Only the isolated GPT-Live test line may run tools its Vapi-hosted model
+# issued; production phone calls keep gateway-issued provenance.
+NATIVE_TOOLS_FLAG = "gpt-live-candidate"
+NATIVE_TOOLS_ENVIRONMENTS = frozenset({"local", "development", "staging"})
+CAP_REFUSAL = {"error": "Thanks for calling. This test line has reached its call limit for now. Please try again later. Goodbye."}
+
+
+def _cap(values, name):
+    raw = values.get(name)
+    if raw in (None, ""):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if not 1 <= value <= 100_000:
+        raise ValueError("Telephony admission caps must be whole numbers from 1 to 100000.")
+    return value
+
+
 @dataclass(frozen=True)
 class IngressConfig:
     organization_id: str
     phone_number_id: str
     assistant_id: str
     webhook_secret: str = field(repr=False)
+    tool_policy: str = "gemini-issued"
+    daily_admissions: int | None = None
+    lifetime_admissions: int | None = None
 
     def __post_init__(self):
         if not all(_uuid(value) for value in (self.organization_id, self.phone_number_id, self.assistant_id)):
             raise ValueError("Telephony identity configuration is invalid.")
         if not isinstance(self.webhook_secret, str) or not 32 <= len(self.webhook_secret) <= 512 or any(ord(c) < 33 or ord(c) > 126 for c in self.webhook_secret):
             raise ValueError("Telephony credential configuration is invalid.")
+        if self.tool_policy not in TOOL_POLICIES:
+            raise ValueError("Telephony tool policy is invalid.")
+        for cap in (self.daily_admissions, self.lifetime_admissions):
+            if cap is not None and (type(cap) is not int or not 1 <= cap <= 100_000):
+                raise ValueError("Telephony admission caps are invalid.")
 
     @classmethod
     def from_mapping(cls, values):
@@ -64,8 +93,22 @@ class IngressConfig:
             return None
         if flag != "on":
             raise ValueError("Telephony enable flag must be on or off.")
+        profile = (values.get("VAPI_MODEL_PROFILE") or "").strip()
+        native = values.get("SERVICEVOICE_PHONE_NATIVE_TOOLS") or ""
+        if native:
+            if native != NATIVE_TOOLS_FLAG:
+                raise ValueError("Native phone tools flag is invalid.")
+            if values.get("SERVICEVOICE_ENVIRONMENT") not in NATIVE_TOOLS_ENVIRONMENTS:
+                raise ValueError("Native phone tools are refused outside isolated test environments.")
+            if profile != "gpt-live-1":
+                raise ValueError("Native phone tools require the GPT-Live model profile.")
+        elif profile == "gpt-live-1":
+            raise ValueError("The GPT-Live profile requires the explicit native phone tools flag.")
         config = cls(values.get("VAPI_PHONE_ORG_ID"), values.get("VAPI_PHONE_NUMBER_ID"),
-                     values.get("VAPI_PHONE_ASSISTANT_ID"), values.get("VAPI_PHONE_WEBHOOK_SECRET"))
+                     values.get("VAPI_PHONE_ASSISTANT_ID"), values.get("VAPI_PHONE_WEBHOOK_SECRET"),
+                     tool_policy="provider-native" if native else "gemini-issued",
+                     daily_admissions=_cap(values, "SERVICEVOICE_PHONE_DAILY_ADMISSIONS"),
+                     lifetime_admissions=_cap(values, "SERVICEVOICE_PHONE_LIFETIME_ADMISSIONS"))
         if config.assistant_id == values.get("VAPI_ASSISTANT_ID"):
             raise ValueError("Telephony requires a dedicated assistant.")
         for name in ("VAPI_WEBHOOK_SECRET", "GEMINI_GATEWAY_SECRET"):
@@ -226,7 +269,7 @@ class TelephonyIngress:
         session = db.execute("SELECT * FROM sessions WHERE id=? AND tenant=?", (binding["session_id"], TENANT)).fetchone()
         policy = db.execute("SELECT * FROM provider_tool_policies WHERE provider_call_id=?", (call_id,)).fetchone()
         if not session or session["provider_call_id"] != call_id or session["mode"] != "live" or not policy or (
-                policy["session_id"], policy["assistant_id"], policy["policy"]) != (session["id"], self.config.assistant_id, "gemini-issued"):
+                policy["session_id"], policy["assistant_id"], policy["policy"]) != (session["id"], self.config.assistant_id, self.config.tool_policy):
             raise IngressError("telephony_binding_conflict", 409)
         return binding, session
 
@@ -278,6 +321,14 @@ class TelephonyIngress:
             recent = db.execute("SELECT COUNT(*) FROM telephony_bindings WHERE tenant=? AND created>?", (TENANT, now-self.limits.window_seconds)).fetchone()[0]
             if recent >= self.limits.admissions_per_window:
                 raise IngressError("telephony_admission_rate", 429)
+            # Spending caps for an open test line: the caller hears a polite
+            # refusal and no session or model time is created.
+            if self.config.daily_admissions is not None and db.execute(
+                    "SELECT COUNT(*) FROM telephony_bindings WHERE tenant=? AND created>?", (TENANT, now-86400)).fetchone()[0] >= self.config.daily_admissions:
+                return dict(CAP_REFUSAL)
+            if self.config.lifetime_admissions is not None and db.execute(
+                    "SELECT COUNT(*) FROM telephony_bindings WHERE tenant=?", (TENANT,)).fetchone()[0] >= self.config.lifetime_admissions:
+                return dict(CAP_REFUSAL)
             sid = uid("sess")
             # A deliberately undisclosed random browser capability. Only its hash
             # survives; session_id alone never authorizes console/session routes.
@@ -286,7 +337,7 @@ class TelephonyIngress:
             db.execute("INSERT INTO sessions(id,token_hash,tenant,mode,created,ended,state,provider_call_id) VALUES (?,?,?,?,?,0,?,?)",
                        (sid, token_hash, TENANT, "live", now, json.dumps(state), call_id))
             self._insert_binding(db, call_id, sid, now)
-            db.execute("INSERT INTO provider_tool_policies VALUES (?,?,?,?)", (call_id, sid, self.config.assistant_id, "gemini-issued"))
+            db.execute("INSERT INTO provider_tool_policies VALUES (?,?,?,?)", (call_id, sid, self.config.assistant_id, self.config.tool_policy))
             self._check_deadline(stop, abandoned)
             return self._response(sid)
 

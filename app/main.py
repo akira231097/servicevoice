@@ -33,6 +33,7 @@ from .jev_faq import FAQ_VERSION
 from .jev_classifier import JEV_MODEL
 from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
+from . import native_consent
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
 from .diagnostics import NullDiagnostics, create_diagnostics, operation_identifier, turn_identifier
@@ -474,6 +475,28 @@ def create_app(db_path=None):
     def mark_ended(sid):
         with store.connect() as db:db.execute("UPDATE sessions SET ended=1 WHERE id=?",(sid,))
 
+    def native_confirmation_refusal(sid,call_id,tid,arguments,artifact):
+        """A provider-native confirmation must follow a readback and a later yes.
+
+        Returns None to let the domain decide (committed replays, stale or
+        missing proposals) or after a verified transcript; otherwise the
+        refusal result. Nothing is written by this check.
+        """
+        with store.connect() as db:
+            pending=native_consent.pending_facts(db,sid,arguments.get("proposal_id"))
+        if pending is None:
+            return None
+        proposal,facts=pending
+        verified,evidence=native_consent.assess(artifact,proposal,facts)
+        reason=next(iter(evidence["reasons"]),"verified")
+        diagnose("tool_harness","validation","success" if verified else "rejected",call_id=call_id,
+            operation_id=operation_identifier(sid,tid),
+            attributes={"tool_name":"confirm_action","consent_verified":verified,"consent_reason":reason,
+                "consent_assent":evidence["assent"],"consent_anchor":evidence["anchor"],
+                "evidence_source":"provider_live_artifact",
+                **{"fact_"+name:bool(ok) for name,ok in evidence["facts"].items()}})
+        return None if verified else native_consent.refusal(evidence)
+
     async def process_webhook(message, *, phone=False, deadline=None, abandoned=None, diagnostic_request=None):
         if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
         event_type=message.get("type")
@@ -512,6 +535,9 @@ def create_app(db_path=None):
                 raise HTTPException(exc.status,exc.code) from None
             except sqlite3.Error:
                 raise HTTPException(503,"Tool authorization evidence unavailable.") from None
+            # Gateway provenance does not exist for a Vapi-hosted model's tools;
+            # its confirmations get the server-side readback/assent check.
+            native_phone=phone and await run_in_threadpool(app.state.gemini_gateway.store.call_policy,sid,call_id)=="provider-native"
             results=[]
             for tid,name,arguments,_original in calls:
                 terminal_metadata=phone and (call.get("status")=="ended" or call.get("endedAt") is not None)
@@ -520,8 +546,13 @@ def create_app(db_path=None):
                 # phone HTTP budget. Already accepted effects remain shielded.
                 if phone and ((abandoned is not None and abandoned.is_set()) or (deadline is not None and time.monotonic()>=deadline)):
                     raise HTTPException(504,"Phone webhook deadline exceeded. Retry the same event and call ID to reconcile.")
+                refused=None
+                if may_continue and native_phone and name=="confirm_action":
+                    refused=await run_in_threadpool(native_confirmation_refusal,sid,call_id,tid,arguments,message.get("artifact"))
                 if not may_continue:
                     result={"ok":False,"error":"session_ended","message":"Call ended. No new action was taken."}
+                elif refused is not None:
+                    result=refused
                 else:
                     context=_tool_diagnostic_context(app.state.diagnostics,call_id,tid,diagnostic_contexts)
                     result=await app.state.harness.run(sid,name,arguments,tid,diagnostic_context=context)

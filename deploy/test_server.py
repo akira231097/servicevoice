@@ -127,6 +127,19 @@ class ConfigurationTests(unittest.TestCase):
             self.assertTrue(ready('provider', console, {'GEMINI_API_KEY': 'synthetic', 'GEMINI_GATEWAY_SECRET': 's' * 32,
                                                       'VAPI_MODEL_PROFILE': 'gemini-3.8-flash-custom'}))
 
+    def test_gpt_live_readiness_requires_the_native_phone_policy(self):
+        with tempfile.TemporaryDirectory() as name:
+            file = Path(name) / 'state.sqlite3'
+            with sqlite3.connect(file) as db: db.execute('CREATE TABLE sessions(id TEXT)')
+            config = types.SimpleNamespace(tool_policy='provider-native')
+            console = types.SimpleNamespace(state=types.SimpleNamespace(store=types.SimpleNamespace(path=file),
+                telephony_ingress=types.SimpleNamespace(config=config)))
+            self.assertTrue(ready('provider', console, {'VAPI_MODEL_PROFILE': 'gpt-live-1'}))
+            config.tool_policy = 'gemini-issued'
+            self.assertFalse(ready('provider', console, {'VAPI_MODEL_PROFILE': 'gpt-live-1'}))
+            console.state.telephony_ingress.config = None
+            self.assertFalse(ready('provider', console, {'VAPI_MODEL_PROFILE': 'gpt-live-1'}))
+
     def test_readiness_does_not_create_missing_database(self):
         with tempfile.TemporaryDirectory() as name:
             file = Path(name) / 'missing.sqlite3'
