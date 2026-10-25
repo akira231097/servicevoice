@@ -44,6 +44,14 @@ services:
     volumes:
       - gpt-live-application-data:/evidence:ro
       - gpt-live-evaluation-data:/evaluations
+    # The image's default probe checks the business HTTP port; the reviewer
+    # reports its own worker health from the outbox instead.
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.live_evaluations", "--health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m
