@@ -1603,6 +1603,7 @@ class GeminiGateway:
                         phrase=waiting_phrase(decision,state["user_count"],
                             self.backchannel_budget.previous_phrase(call_id),neutral_only=fallback or state["neutral_confirmation"] or state.get("neutral_only",False) or follow_up
                             or (scoped_waiting and self.waiting_neutral_only is not None and self.waiting_neutral_only(call_id,sid)))
+                        if fallback and self.backchannel_budget.previous_phrase(call_id)!="one_sec":phrase="one_sec"
                         record["phrase_id"]=phrase
                         record["guarded_fallback"]=fallback
                         allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up,

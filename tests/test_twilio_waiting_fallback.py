@@ -38,7 +38,7 @@ def test_fallback_needs_matching_recent_final_and_real_caller_stop():
     asyncio.run(run())
 
 
-def test_interrupted_waiting_cue_does_not_reopen_budget_even_with_split_asr_turn():
+def test_interrupted_waiting_cue_requires_spacing_even_with_split_asr_turn():
     async def run():
         c, clock, _, _, _, event, _ = setup()
         event("speech-update", "user", status="stopped")
@@ -55,7 +55,7 @@ def test_interrupted_waiting_cue_does_not_reopen_budget_even_with_split_asr_turn
         clock.now += 2.3
         event("speech-update", "user", status="stopped")
         clock.now += .8
-        assert c.waiting_status("fixture-call", "session")[1] == "turn_already_acknowledged"
+        assert c.waiting_status("fixture-call", "session")[1] == "cooldown"
         assert not c.commit_waiting("fixture-call", "session")
         event("transcript", "assistant", transcriptType="final", transcript="We can inspect your brakes.")
         clock.now += .1
