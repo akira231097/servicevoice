@@ -131,13 +131,13 @@ _ENUM_ATTRIBUTES["closing_reason"] = frozenset({"ready","speaker_state_unavailab
     "closing_text_unverified","state_unavailable","proposal_or_operation_pending"})
 # Optional caller-ID personalization: fixed codes only, never a number or name.
 EVENTS |= frozenset({"caller_lookup", "caller_hint", "caller_policy"})
-_ENUM_ATTRIBUTES["caller_lookup_outcome"] = frozenset({"found", "fixture", "no_name", "business", "placeholder",
+_ENUM_ATTRIBUTES["caller_lookup_outcome"] = frozenset({"found", "fixture", "returning", "no_name", "business", "placeholder",
     "possibly_truncated", "unusable", "error", "timeout", "capacity", "unauthorized", "rate_limited", "cancelled",
     "withheld_or_unsupported"})
 _ENUM_ATTRIBUTES["caller_context_mode"] = frozenset({"off", "shadow", "personalize"})
 _ENUM_ATTRIBUTES["caller_policy_status"] = frozenset({"loaded", "missing", "invalid", "pending"})
 _ENUM_ATTRIBUTES["caller_hint_state"] = frozenset({"name_and_number", "number_only", "name_asked", "number_offered",
-    "details_saved"})
+    "details_saved", "returning_name", "returning_asked"})
 _ENUM_ATTRIBUTES["caller_verstat"] = frozenset({"passed_a", "passed_b", "passed_c", "failed", "no_validation", "absent", "other"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})

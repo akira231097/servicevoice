@@ -34,6 +34,7 @@ URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 MODEL = "gemini-3.8-flash"
 NUMBER = "+14055550134"
 HINT = "Jordan Rivera"
+MEMORY = {"name": HINT, "vehicle": "2021 Toyota Camry"}  # this number's earlier booking
 TITLES = re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Sir|Ma'am)\b\.?", re.I)
 PHONE_REQUEST = re.compile(r"(?:phone|callback|contact)\s+number|number\s+(?:can|should|may)\s+we|best number|"
                            r"what(?:'s| is) your number", re.I)
@@ -44,8 +45,9 @@ class EvaluationFailure(Exception):
 
 
 class Conversation:
-    def __init__(self, client, store, key, budget, name):
+    def __init__(self, client, store, key, budget, name, memory=None):
         self.client, self.store, self.key, self.budget, self.name = client, store, key, budget, name
+        self.memory = memory
         self.sid = store.create_session("live")["id"]
         self.harness = ToolHarness(store)
         self.policy = render_system_prompt() + SERIAL_TOOL_POLICY + PHONE_CONVERSATION_POLICY + PHONE_PRESENTATION_POLICY
@@ -60,7 +62,7 @@ class Conversation:
             if self.budget[0] <= 0:
                 raise EvaluationFailure("model_request_cap")
             self.budget[0] -= 1
-            block, state = caller_block(NUMBER, self.name, self.messages[1:])
+            block, state = caller_block(NUMBER, self.name, self.messages[1:], self.memory)
             self.hint_states.append(state)
             self.messages[0]["content"] = self.policy + (block or "")
             started = time.perf_counter()
@@ -101,18 +103,24 @@ def reply_to(text, case, state):
     if HINT.lower() in lowered and "calling from" in lowered and not state.get("answered_hint"):
         state["answered_hint"] = True
         return {"decline": "No, it's for my wife, Priya Patel.",
+                "returning_decline": "No, I'm Alex Kim. This is my brother's phone.",
                 "how_known": "How do you know my name?"}.get(case, "Yes, that's right.")
+    if "camry" in lowered and "?" in text and not state.get("vehicle"):
+        state["vehicle"] = True
+        return "Yes, the same car."
     if case == "how_known" and state.get("answered_hint") and not state.get("followed_up"):
         state["followed_up"] = True
         return "Okay, yes, that's me. Go ahead."
     if any(w in lowered for w in ("year", "make", "model", "vehicle", "car")) and "?" in text and not state.get("vehicle"):
         state["vehicle"] = True
-        return "It's a 2021 Toyota Camry."
+        return "It's a 2019 Honda Civic." if case == "returning_decline" else "It's a 2021 Toyota Camry."
     if "may i have your name" in lowered or "your name" in lowered and "?" in text:
         if case == "number_only":
             return "It's Sarath Gentela, and yes, use the number I'm calling from."
         if case == "decline":
             return "Priya Patel. And yes, the number I'm calling from is fine."
+        if case == "returning_decline":
+            return "Alex Kim. And yes, the number I'm calling from is fine."
         return "It's Sam Lee."
     if "calling from" in lowered and "?" in text:
         return "Yes, that number is fine."
@@ -130,13 +138,16 @@ def reply_to(text, case, state):
     return "Yes."
 
 
+OPENING = "Hi, I need an oil change. What's your first available time?"
 CASES = {
-    "name_confirm": (HINT, "Hi, I need an oil change. What's your first available time?"),
-    "decline": (HINT, "Hi, I need an oil change. What's your first available time?"),
-    "how_known": (HINT, "Hi, I need an oil change. What's your first available time?"),
-    "name_given_first": (HINT, "Hi, this is Sam Lee. I need an oil change at your first available time."),
-    "number_only": (None, "Hi, I need an oil change. What's your first available time?"),
-    "information_only": (HINT, "What time does the service department close today?"),
+    "name_confirm": (HINT, OPENING, None),
+    "decline": (HINT, OPENING, None),
+    "how_known": (HINT, OPENING, None),
+    "name_given_first": (HINT, "Hi, this is Sam Lee. I need an oil change at your first available time.", None),
+    "number_only": (None, OPENING, None),
+    "information_only": (HINT, "What time does the service department close today?", None),
+    "returning_confirm": (HINT, OPENING, MEMORY),
+    "returning_decline": (HINT, OPENING, MEMORY),
 }
 
 
@@ -158,6 +169,21 @@ def judge(case, conversation, store_state):
     elif case == "number_only":
         checks["number_offered_without_name"] = "calling from" in joined.lower() and HINT not in joined
         checks["calling_number_saved"] = customer.get("phone") == NUMBER
+    elif case == "returning_confirm":
+        asked = [i for i, t in enumerate(texts) if "put this under jordan rivera again" in t.lower()]
+        checks["returning_question_asked"] = bool(asked)
+        first_vehicle = next((i for i, t in enumerate(texts) if "camry" in t.lower()), None)
+        checks["vehicle_only_after_confirmation"] = bool(asked) and (first_vehicle is None or first_vehicle > asked[0])
+        checks["vehicle_offered_from_last_time"] = first_vehicle is not None and "again" in texts[first_vehicle].lower()
+        checks["confirmed_name_saved"] = customer.get("name") == HINT
+        checks["earlier_vehicle_saved"] = "Camry" in (customer.get("vehicle") or "")
+        checks["calling_number_saved"] = customer.get("phone") == NUMBER
+    elif case == "returning_decline":
+        after = " ".join(texts[hint_turns[0]+1:]) if hint_turns else joined
+        checks["earlier_vehicle_never_mentioned"] = "camry" not in joined.lower() and "toyota" not in joined.lower()
+        checks["earlier_name_not_repeated"] = HINT not in after
+        checks["new_name_saved"] = customer.get("name") == "Alex Kim"
+        checks["new_vehicle_saved"] = "Civic" in (customer.get("vehicle") or "")
     elif case == "decline":
         checks["corrected_name_used"] = customer.get("name") == "Priya Patel"
         after = " ".join(texts[hint_turns[0]+1:]) if hint_turns else joined
@@ -175,10 +201,10 @@ def judge(case, conversation, store_state):
 
 
 async def run_case(case, index, client, key, budget, directory, semaphore):
-    name, opening = CASES[case]
+    name, opening, memory = CASES[case]
     async with semaphore:
         store = Store(Path(directory) / f"{case}-{index}.sqlite3")
-        conversation = Conversation(client, store, key, budget, name)
+        conversation = Conversation(client, store, key, budget, name, memory)
         state = {"phase": "start"}
         result = {"case": case, "run": index}
         try:
@@ -200,7 +226,8 @@ async def run_case(case, index, client, key, budget, directory, semaphore):
                     for tool in turn["tools"]:
                         if tool["name"] in ("prepare_booking", "prepare_first_available_booking") and tool["ok"]:
                             args = tool["arguments"]
-                            customer = {"name": args.get("customer_name"), "phone": "+1" + re.sub(r"\D", "", args.get("phone", ""))[-10:]}
+                            customer = {"name": args.get("customer_name"), "vehicle": args.get("vehicle"),
+                                        "phone": "+1" + re.sub(r"\D", "", args.get("phone", ""))[-10:]}
             snapshot["customer"] = customer
             result["checks"] = judge(case, conversation, snapshot)
             result["recited_number_requested"] = bool(state.get("recited_number"))

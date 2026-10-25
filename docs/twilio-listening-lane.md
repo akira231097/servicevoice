@@ -392,12 +392,23 @@ allowlisted numbers, never the numbers. It is reread every two seconds off the
 call path; a missing, unreadable or malformed file fails closed to `off`,
 including for calls already in progress.
 
-For an allowlisted caller, the signed incoming-call webhook starts one Twilio
-Lookup caller-name request (`Fields=caller_name`) on its own four-connection
-pool with a single total deadline, no retries and no queue. Nothing in call
-admission, the greeting or an answer waits for it. Results live in memory for
-that call and are discarded at hang-up. Callers not on the allowlist are never
-looked up. A labelled synthetic name is accepted only for owned test calls.
+For an allowlisted caller, or every eligible US caller when the policy sets
+`"callers": "everyone"`, the signed incoming-call webhook starts one background
+task. It first reads this number's latest earlier booking (name, vehicle and
+visit count; read-only, no schema change); only without one does it make a
+Twilio Lookup caller-name request (`Fields=caller_name`, about one cent) on its
+own four-connection pool with a single total deadline, no retries and no queue.
+Nothing in call admission, the greeting or an answer waits for it. Results live
+in memory for that call and are discarded at hang-up. In allowlist mode other
+callers are never looked up; withheld and toll-free numbers never are. A
+labelled synthetic name is accepted only for owned test calls.
+
+A returning caller hears "Should I put this under [name] again, at the number
+you're calling from?". The earlier booking's vehicle is withheld from the
+assistant until that question has been asked, and is offered ("Is this for the
+[vehicle] again?") only if the caller confirms the name. If they decline, the
+earlier name, booking and vehicle are never mentioned. No earlier appointment
+becomes accessible: the existing session-only appointment rules are unchanged.
 
 CNAM listings are at most 15 characters and often placeholders. The cleaner
 rejects business, placeholder, place-name, joint, single-word, initial-only,

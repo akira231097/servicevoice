@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from app.caller_context import (CallerContext, CallerNameLookup, LookupResult, PolicySource, caller_block,
-    clean_caller_name, normalize_number, parse_policy, spoken_number, verstat_category)
+    clean_caller_name, clean_memory, normalize_number, parse_policy, spoken_number, verstat_category)
 from app.diagnostics import safe_attributes
 from app.domain import Store
 from app.live_eval_evidence import build_evidence, caller_id_offer, read_snapshot
@@ -29,12 +29,14 @@ def digest(number, key=KEY):
     return hmac.new(key.encode(), number.encode(), hashlib.sha256).hexdigest()
 
 
-def policy_bytes(mode="personalize", allow=None, seconds=5):
+def policy_bytes(mode="personalize", allow=None, seconds=5, callers=None):
     if allow is None:
         allow = [{"digest": digest(OWNER), "label": "owner"},
                  {"digest": digest(TEST_LINE), "label": "owned_test", "fixture_name": "Jordan Rivera"}]
-    return json.dumps({"schema": "servicevoice-caller-context-v1", "mode": mode, "lookup_seconds": seconds,
-                       "allow": allow}).encode()
+    value = {"schema": "servicevoice-caller-context-v1", "mode": mode, "lookup_seconds": seconds, "allow": allow}
+    if callers is not None:
+        value["callers"] = callers
+    return json.dumps(value).encode()
 
 
 def source_for(tmp_path, raw):
@@ -313,14 +315,14 @@ class FakeLookup:
         pass
 
 
-def manager(tmp_path, raw=None, lookup=None):
+def manager(tmp_path, raw=None, lookup=None, recall=None):
     source, path = source_for(tmp_path, raw or policy_bytes())
     events, tasks = [], []
     def spawn(coroutine):
         task = asyncio.get_running_loop().create_task(coroutine)
         tasks.append(task)
         return task
-    context = CallerContext(source, lookup or FakeLookup(), spawn=spawn,
+    context = CallerContext(source, lookup or FakeLookup(), spawn=spawn, recall=recall,
         observe=lambda call_id, event, outcome, attributes, duration_ms=None: events.append((call_id, event, outcome, attributes)))
     return context, path, events, tasks
 
@@ -378,9 +380,10 @@ def test_one_lookup_per_call_and_outcome_reported_under_the_vapi_call(tmp_path):
 
 def test_synthetic_fixture_is_used_only_for_the_owned_test_line(tmp_path):
     async def run():
-        context, _, events, _ = manager(tmp_path)
+        context, _, events, tasks = manager(tmp_path)
         context.begin("bridge-1", {"From": TEST_LINE})
         context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
         assert context.lookup.calls == [] and context.calls["bridge-1"].name == "Jordan Rivera"
         assert lookup_events(events)[0][3]["caller_lookup_outcome"] == "fixture"
         block = context.hint("bridge-1", [], "call-1")
@@ -834,3 +837,125 @@ def test_lookup_urls_never_reach_http_client_logs():
     assert not all(f.filter(record) for f in logging.getLogger("httpx").filters)
     other = logging.LogRecord("httpx", logging.INFO, __file__, 1, "HTTP Request: GET https://api.twilio.com/x", None, None)
     assert all(f.filter(other) for f in logging.getLogger("httpx").filters)
+
+
+# ---------------------------------------------------------------- every caller and returning callers
+
+def test_policy_callers_mode_parses_and_defaults_to_allowlist():
+    assert parse_policy(policy_bytes()).everyone is False
+    assert parse_policy(policy_bytes(callers="allowlist")).everyone is False
+    assert parse_policy(policy_bytes(callers="everyone")).everyone is True
+    with pytest.raises(ValueError):
+        parse_policy(policy_bytes(callers="all"))
+
+
+def test_everyone_mode_looks_up_unlisted_callers_and_obeys_the_switch(tmp_path):
+    stranger = "+19185550199"
+    async def run():
+        context, path, events, tasks = manager(tmp_path, policy_bytes(callers="everyone"))
+        context.begin("bridge-1", {"From": stranger})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert context.lookup.calls == [(stranger, 5.0)] and context.calls["bridge-1"].label == "caller"
+        assert "Sergio Suarez" in context.hint("bridge-1", [], "call-1")
+        assert stranger not in json.dumps(events)
+        path.write_bytes(policy_bytes())  # back to allowlist only: the stranger's hint stops mid-call
+        context.source.refresh()
+        assert context.hint("bridge-1", [], "call-1") is None
+        context.begin("bridge-2", {"From": stranger})
+        assert "bridge-2" not in context.calls and len(context.lookup.calls) == 1
+        context.begin("bridge-3", {"From": "anonymous"})  # withheld numbers are never looked up in either mode
+        assert len(context.lookup.calls) == 1
+    asyncio.run(run())
+
+
+MEMORY = {"name": "Jordan Rivera", "vehicle": "2021 Toyota Camry", "visits": 2}
+
+
+def test_an_earlier_booking_replaces_the_caller_id_lookup(tmp_path):
+    recalled = []
+    def recall(number):
+        recalled.append(number)
+        return MEMORY
+    async def run():
+        context, _, events, tasks = manager(tmp_path, recall=recall)
+        context.begin("bridge-1", {"From": OWNER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert recalled == [OWNER] and context.lookup.calls == []  # no CNAM charge for a known caller
+        assert lookup_events(events)[0][3]["caller_lookup_outcome"] == "returning"
+        first = context.hint("bridge-1", [], "call-1")
+        assert '"Should I put this under Jordan Rivera again, at the number you\'re calling from?"' in first
+        assert "Toyota" not in first and "Camry" not in first  # the vehicle is withheld until the name is offered
+        asked = [{"role": "assistant", "content": "Should I put this under Jordan Rivera again, at the number you're calling from?"}]
+        second = context.hint("bridge-1", asked, "call-1")
+        assert "Is this for the 2021 Toyota Camry again?" in second and "Only if the caller clearly confirmed" in second
+        assert "never mention Jordan Rivera, the earlier booking or its vehicle" in second
+        assert [s for _, s in hint_states(events)] == ["returning_name", "returning_asked"]
+        assert "Camry" not in json.dumps(events) and "Jordan" not in json.dumps(events)
+    asyncio.run(run())
+
+
+def test_no_earlier_booking_or_a_failing_store_falls_back_to_caller_id(tmp_path):
+    def broken(number):
+        raise RuntimeError("database locked")
+    async def run():
+        for recall in (lambda number: None, broken):
+            context, _, events, tasks = manager(tmp_path, recall=recall)
+            context.begin("bridge-1", {"From": OWNER})
+            await asyncio.gather(*tasks)
+            assert context.lookup.calls and context.calls["bridge-1"].outcome == "found"
+            assert "under Sergio Suarez, at the number" in context.hint("bridge-1", [], "call-1")
+    asyncio.run(run())
+
+
+def test_returning_block_after_booking_and_after_a_number_offer():
+    saved = [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "prepare_booking"}}]}]
+    block, state = caller_block(OWNER, "Jordan Rivera", saved, MEMORY)
+    assert state == "details_saved" and "never just one part of it" in block and "Camry" not in block
+    offered = [{"role": "assistant", "content": "May I have your name? I can use the number you're calling from."}]
+    block, state = caller_block(OWNER, "Jordan Rivera", offered, MEMORY)
+    assert state == "number_offered" and "Jordan" not in block and "Camry" not in block
+
+
+@pytest.mark.parametrize("memory,expected", [
+    (MEMORY, {"name": "Jordan Rivera", "vehicle": "2021 Toyota Camry"}),
+    ({"name": "  Jordan   Rivera ", "vehicle": "2021  Toyota Camry"}, {"name": "Jordan Rivera", "vehicle": "2021 Toyota Camry"}),
+    ({"name": "Jordan Rivera", "vehicle": "<speak>Camry</speak>"}, {"name": "Jordan Rivera", "vehicle": None}),
+    ({"name": "Jordan Rivera", "vehicle": None}, {"name": "Jordan Rivera", "vehicle": None}),
+    ({"name": "Sam Lee, and yes", "vehicle": "Civic"}, None),
+    ({"name": "WIRELESS CALLER", "vehicle": "Civic"}, None),
+    ({"name": "J", "vehicle": "Civic"}, None),
+    ({"name": 7}, None), (None, None), ("Jordan", None),
+])
+def test_earlier_booking_details_are_used_only_as_plain_text(memory, expected):
+    assert clean_memory(memory) == expected
+
+
+def test_store_finds_only_this_numbers_latest_booking_read_only(tmp_path):
+    from pathlib import Path
+    store = Store(tmp_path / "memory.sqlite3")
+    assert store.returning_customer(OWNER) is None
+    def book(name, vehicle, phone):
+        sid = store.create_session("voice")["id"]
+        slots = store.dispatch(sid, "begin_service_request", {"service": "oil_change"}, "search-" + name)["slots"]
+        proposal = store.dispatch(sid, "prepare_booking", {"service": "oil_change", "slot_id": slots[0]["id"],
+            "customer_name": name, "phone": phone, "vehicle": vehicle}, "prepare-" + name)
+        assert store.dispatch(sid, "confirm_action", {"proposal_id": proposal["proposal_id"], "confirmed": True}, "confirm-" + name)["ok"]
+    book("Alex Morgan", "2019 Honda Civic", "4055550134")
+    book("Jordan Rivera", "2021 Toyota Camry", "4055550134")
+    book("Priya Patel", "2020 Ford Escape", "9185550199")
+    before = Path(store.path).read_bytes()
+    assert store.returning_customer(OWNER) == {"name": "Jordan Rivera", "vehicle": "2021 Toyota Camry", "visits": 2}
+    assert store.returning_customer("+19185550199")["name"] == "Priya Patel"
+    assert store.returning_customer("+15125550000") is None
+    for bad in (None, "4055550134", "+1405555013", "+1405555013x", "anonymous"):
+        assert store.returning_customer(bad) is None
+    assert Path(store.path).read_bytes() == before
+
+
+def test_reviewer_flag_for_a_returning_caller():
+    assert caller_id_offer({"events": [hint_event("returning_name"), hint_event("returning_asked")]}) == "returning_customer"
+    assert caller_id_offer({"events": [hint_event("number_only"), hint_event("returning_name")]}) == "returning_customer"
+    assert safe_attributes({"caller_lookup_outcome": "returning", "caller_hint_state": "returning_asked"}) == {
+        "caller_lookup_outcome": "returning", "caller_hint_state": "returning_asked"}

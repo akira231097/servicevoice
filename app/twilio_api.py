@@ -153,7 +153,7 @@ class TwilioLane:
         if self.caller_source is not None and self.caller is None:
             self.caller = CallerContext(self.caller_source,
                 CallerNameLookup(self.config.api_key_sid, self.config.api_key_secret),
-                spawn=self.spawn, observe=self.observe_caller)
+                spawn=self.spawn, observe=self.observe_caller, recall=self.app.state.store.returning_customer)
             await self.caller.start()
         self.coordinator.key = settings.get("TYPESAFE_API_KEY", "")
         if flag(settings, "SERVICEVOICE_TWILIO_TESTER"):
