@@ -8,11 +8,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from contextlib import closing
 from dataclasses import replace
 import hashlib
 import importlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -68,8 +70,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
     """Keep CLI admission strict; optionally decouple a pytest correctness fixture.
 
     A supplied fixture deadline applies only to this disposable app's ingress,
-    within IngressLimits' five-second maximum. It is not a production setting,
-    latency result or evidence that the one-second default admits every burst.
+    signature-lock wait and tool response wait, within five seconds. It is not
+    a production setting, latency result or evidence that defaults admit every burst.
     Admission events are never retried here, in either mode.
     """
     if type(callers) is not int or callers not in (4,10):raise ValueError('Callers must be4 or10.')
@@ -97,6 +99,23 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
             exercise_scope='offline_correctness_fixture_not_default_deadline_performance' if offline_fixture_deadline is not None
                 else 'strict_default_deadline_offline_stress')
         gateway=app.state.gemini_gateway
+        with closing(gateway.store.connect()) as connection:
+            default_signature_busy_ms=connection.execute('PRAGMA busy_timeout').fetchone()[0]
+        default_tool_deadline=app.state.harness.timeout_seconds
+        if offline_fixture_deadline is not None:
+            # Local instance only, after synthetic env + disposable app setup.
+            # No production constructor or timeout changes. Genuine storage
+            # errors still fail; commands/effects are never retried here.
+            def fixture_signature_connection():
+                connection=sqlite3.connect(gateway.store.path,timeout=offline_fixture_deadline)
+                connection.row_factory=sqlite3.Row
+                return connection
+            gateway.store.connect=fixture_signature_connection
+            app.state.harness.timeout_seconds=offline_fixture_deadline
+        progress['fixture_budgets']={'default_signature_busy_ms':default_signature_busy_ms,
+            'default_tool_response_seconds':default_tool_deadline,
+            'signature_busy_ms':int(offline_fixture_deadline*1000) if offline_fixture_deadline is not None else default_signature_busy_ms,
+            'tool_response_seconds':app.state.harness.timeout_seconds}
         await gateway.client.aclose()
         active=0;peak=0;entered=0;barrier=asyncio.Event();hold_entered=0;hold_ready=asyncio.Event();closed=0
         requests=Counter();stages={};checks={}
@@ -196,7 +215,8 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                     result=await inbound({'type':'tool-calls','call':calls[index],'toolCallList':[command]})
                     check(result.status_code==200,'Signed command webhook was rejected')
                     raw=json.loads(result.json()['results'][0]['result'])
-                    check(raw.get('error') not in ('operation_pending','status_unavailable','operation_unknown'),'Unexpected unsettled tool within this bounded exercise')
+                    check(raw.get('error') not in ('operation_pending','status_unavailable','operation_unknown'),
+                        'Unexpected unsettled tool within this bounded exercise: '+json.dumps({'caller':index,'phase':phase,'error':raw.get('error')}))
                     histories[index].extend([{'role':'assistant','content':'','tool_calls':[command]},
                         {'role':'tool','tool_call_id':command['id'],'content':json.dumps(raw)}])
                     return raw
@@ -267,6 +287,7 @@ async def exercise(directory,progress=None,*,callers=4,offline_fixture_deadline=
                         'offline_fixture_deadline_seconds':offline_fixture_deadline,
                         'production_default_ingress_deadline_seconds':default_ingress_deadline,
                         'exercise_scope':progress['exercise_scope'],
+                        'fixture_budgets':progress['fixture_budgets'],
                         'admission_event_retries':0,
                         'gateway_wal_anchor_status':progress['gateway_wal_anchor_status'],
                         'terminal_event_attempt_statuses':terminal_attempts}
