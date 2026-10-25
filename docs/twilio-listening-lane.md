@@ -352,7 +352,7 @@ remain rejected; the in-memory receipts do not survive a process restart.
 These changes do not switch models, shorten booking checks, or enable the
 prototype on the main number. Endpointing, prompt reduction, speakerphone echo,
 and four simultaneous live callers require separate measurement.
-# Handset regression safeguards (October 24)
+## Handset regression safeguards (October 24)
 
 The isolated speech service can enable `SERVICEVOICE_TTS_ATOMIC_FAREWELL=on`.
 Only the exact native farewell, “Thank you for calling. Goodbye.”, is buffered
@@ -373,4 +373,3 @@ neutral-hold fallback also accepts a weak exclusion (below 0.90) only with an
 independently recognized routine subject, compatible language, fresh matching
 final caller text and observed quiet. Strong exclusions, missing/invalid model
 responses, explicit stop/end requests and unfinished thoughts remain silent.
-
