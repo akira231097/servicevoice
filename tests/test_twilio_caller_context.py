@@ -995,7 +995,7 @@ def directory_client(handler, clock=time.time):
 def run_directory(handler, seconds=5, limit=50):
     async def run():
         client = directory_client(handler)
-        result = await client.lookup(OWNER, TRESTLE_KEY, seconds, limit)
+        result = await client.lookup(OWNER, ("trestle", TRESTLE_KEY), seconds, limit)
         await client.client.aclose()
         return result
     return asyncio.run(run())
@@ -1104,9 +1104,9 @@ def test_directory_daily_cap_counts_requests_and_resets_each_utc_day():
         return httpx.Response(500)
     async def run():
         client = directory_client(handler, clock=lambda: now[0])
-        today = [(await client.lookup(OWNER, TRESTLE_KEY, 5, 2)).outcome for _ in range(3)]
+        today = [(await client.lookup(OWNER, ("trestle", TRESTLE_KEY), 5, 2)).outcome for _ in range(3)]
         now[0] += 86400
-        tomorrow = (await client.lookup(OWNER, TRESTLE_KEY, 5, 2)).outcome
+        tomorrow = (await client.lookup(OWNER, ("trestle", TRESTLE_KEY), 5, 2)).outcome
         await client.client.aclose()
         return today, tomorrow
     today, tomorrow = asyncio.run(run())
@@ -1120,10 +1120,10 @@ def test_directory_capacity_skips_instead_of_queueing():
         return httpx.Response(200, json=directory_reply())
     async def run():
         client = directory_client(handler)
-        held = [asyncio.create_task(client.lookup(OWNER, TRESTLE_KEY, 5, 50)) for _ in range(2)]
+        held = [asyncio.create_task(client.lookup(OWNER, ("trestle", TRESTLE_KEY), 5, 50)) for _ in range(2)]
         while client.active < 2:
             await asyncio.sleep(0)
-        extra = await client.lookup(OWNER, TRESTLE_KEY, 5, 50)
+        extra = await client.lookup(OWNER, ("trestle", TRESTLE_KEY), 5, 50)
         release.set()
         results = await asyncio.gather(*held)
         await client.client.aclose()
@@ -1168,8 +1168,8 @@ def test_directory_key_file_with_a_byte_order_mark_is_accepted(tmp_path):
 class FakeDirectory:
     def __init__(self, result=None, gate=None):
         self.calls, self.result, self.gate, self.closed = [], result or LookupResult("found", "Waidong Syrws", 30.0), gate, False
-    async def lookup(self, number, key, seconds, daily_limit):
-        self.calls.append((number, key, seconds, daily_limit))
+    async def lookup(self, number, access, seconds, daily_limit):
+        self.calls.append((number, access, seconds, daily_limit))
         if self.gate:
             await self.gate.wait()
         if isinstance(self.result, Exception):
@@ -1193,7 +1193,7 @@ def test_directory_names_a_first_time_caller_only_after_caller_id_has_none(tmp_p
         context.bind("bridge-1", "call-1")
         await asyncio.gather(*tasks)
         assert context.lookup.calls == [(STRANGER, 5.0)]
-        assert context.directory.calls == [(STRANGER, TRESTLE_KEY, 5.0, 50)]
+        assert context.directory.calls == [(STRANGER, ("trestle", TRESTLE_KEY), 5.0, 50)]
         block = context.hint("bridge-1", [], "call-1")
         assert '"Should I put this under Waidong Syrws, at the number you\'re calling from?"' in block
         assert "listed for this phone number in a phone directory" in block and "caller ID name" not in block
@@ -1288,7 +1288,7 @@ def test_directory_rechecks_the_live_policy_before_each_paid_request(tmp_path):
         context.source.refresh()
         gate.set()
         await asyncio.gather(*tasks)
-        assert context.directory.calls == [(OWNER, TRESTLE_KEY, 5.0, 50)]  # the listed owner only
+        assert context.directory.calls == [(OWNER, ("trestle", TRESTLE_KEY), 5.0, 50)]  # the listed owner only
     asyncio.run(run())
 
 
@@ -1421,3 +1421,161 @@ def test_reviewer_provenance_names_every_possible_source(tmp_path):
     snapshot["caller_id"] = caller_id_offer({"events": [hint_event("name_and_number")]})
     provenance = build_evidence(call, snapshot)["evidence"]["caller_id"]["provenance"]
     assert "phone directory listing" in provenance and "earlier booking" in provenance and "caller ID" in provenance
+
+
+# ---------------------------------------------------------------- the same directory through a Twilio Add-on
+
+ADDON = "trestle_reverse_phone"
+TWILIO_AUTH = ("SK" + "2" * 32, "b" * 32)
+
+
+def twilio_directory_policy(addon=ADDON, **kwargs):
+    value = json.loads(policy_bytes(**kwargs))
+    value["directory"], value["directory_addon"] = "twilio_trestle", addon
+    return json.dumps(value).encode()
+
+
+def addon_reply(result=None, number=OWNER, key=ADDON, status="successful", entry_status="successful"):
+    """Twilio Lookup v1 with an Add-on: Trestle's reply sits under add_ons.results.<name>.result."""
+    if result is None:
+        result = {"phone_number": number[2:], "is_valid": True, "line_type": "Mobile", "carrier": "Carrier",
+                  "is_prepaid": False, "is_commercial": False,
+                  "belongs_to": [{"name": "Waidong Syrws", "age_range": "25-29", "gender": "Male"}],
+                  "current_addresses": [{"street_line_1": "100 Main St", "city": "Oklahoma City"}],
+                  "associated_people": [], "alternate_phones": ["4055550100"], "warnings": []}
+    return {"caller_name": None, "country_code": "US", "phone_number": number, "national_format": "(405) 555-0134",
+            "carrier": None, "url": "https://lookups.twilio.com/v1/PhoneNumbers/" + number,
+            "add_ons": {"status": status, "message": None, "code": None, "results": {
+                key: {"request_sid": "XR" + "0" * 32, "status": entry_status, "message": None, "code": None,
+                      "result": result}}}}
+
+
+def twilio_directory_client(handler):
+    return DirectoryLookup(twilio_auth=TWILIO_AUTH, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def run_twilio_directory(handler, addon=ADDON):
+    async def run():
+        client = twilio_directory_client(handler)
+        result = await client.lookup(OWNER, ("twilio_trestle", addon), 5, 50)
+        await client.client.aclose()
+        return result
+    return asyncio.run(run())
+
+
+def test_policy_twilio_route_needs_exactly_an_addon_name():
+    policy = parse_policy(twilio_directory_policy())
+    assert (policy.directory, policy.directory_addon) == ("twilio_trestle", ADDON)
+    direct_with_addon = json.loads(directory_policy())
+    direct_with_addon["directory_addon"] = ADDON
+    for raw in (twilio_directory_policy(addon=None), twilio_directory_policy(addon="has space"),
+                twilio_directory_policy(addon="x" * 65), twilio_directory_policy(addon=7),
+                json.dumps(direct_with_addon).encode()):
+        with pytest.raises(ValueError):
+            parse_policy(raw)
+
+
+def test_twilio_route_needs_no_key_file_and_never_sends_a_direct_key(tmp_path):
+    source, path = source_for(tmp_path, twilio_directory_policy())
+    assert source.directory_access() == ("twilio_trestle", ADDON) and source.directory_status() == "ready"
+    (tmp_path / "directory.key").write_text(TRESTLE_KEY)  # a leftover direct key stays out of Twilio requests
+    source.refresh()
+    assert source.directory_access() == ("twilio_trestle", ADDON) and source.directory_key() is None
+    path.write_bytes(directory_policy())
+    source.refresh()
+    assert source.directory_access() == ("trestle", TRESTLE_KEY)
+    path.write_bytes(policy_bytes())
+    source.refresh()
+    assert source.directory_access() is None and source.directory_status() == "off"
+
+
+def test_twilio_route_request_shape_and_listed_person():
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=addon_reply())
+    result = run_twilio_directory(handler)
+    assert (result.outcome, result.name) == ("found", "Waidong Syrws")
+    request = seen[0]
+    assert request.url.host == "lookups.twilio.com" and request.url.raw_path.startswith(b"/v1/PhoneNumbers/%2B14055550134")
+    assert dict(request.url.params) == {"AddOns": ADDON}  # no Type parameter: no other paid Lookup data
+    assert request.headers["authorization"] == "Basic " + base64.b64encode(":".join(TWILIO_AUTH).encode()).decode()
+    assert "x-api-key" not in request.headers
+
+
+def two_results():
+    reply = addon_reply()
+    entry = reply["add_ons"]["results"][ADDON]
+    reply["add_ons"]["results"] = {"first": entry, "second": entry}
+    return reply
+
+
+@pytest.mark.parametrize("response,outcome,name", [
+    (httpx.Response(200, json=addon_reply(key="trestle_caller_id")), "found", "Waidong Syrws"),
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "is_commercial": False, "belongs_to": [
+        {"type": "Person", "firstname": "LaToya", "lastname": "McKenzie", "name": "LaToya M McKenzie"}]})),
+     "found", "LaToya McKenzie"),
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "is_commercial": True,
+                                           "belongs_to": [{"name": "Rivera Holdings"}]})), "business", None),
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "is_commercial": False,
+                                           "belongs_to": [{"name": "Ann Lee"}, {"name": "Bo Lee"}]})), "unusable", None),
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "belongs_to": []})), "no_name", None),
+    (httpx.Response(200, json=addon_reply(status="failed")), "error", None),
+    (httpx.Response(200, json=addon_reply(entry_status="failed")), "error", None),
+    (httpx.Response(200, json={**addon_reply(), "add_ons": None}), "error", None),
+    (httpx.Response(200, json=two_results()), "unusable", None),
+    # Twilio answered for another number, even though the inner reply names ours.
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "belongs_to": [{"name": "Ann Lee"}]},
+                                          number="+19185550199")), "unusable", None),
+    (httpx.Response(200, json=addon_reply({"phone_number": "9185550199", "belongs_to": [{"name": "Ann Lee"}]})),
+     "unusable", None),
+    (httpx.Response(200, json=addon_reply({"phone_number": "4055550134", "belongs_to": [{"name": "Ann Lee"}],
+                                           "error": {"name": "InternalError", "message": "x"}})), "error", None),
+    (httpx.Response(404, json={"code": 20404}), "no_name", None),
+    (httpx.Response(401, json={}), "unauthorized", None),
+    (httpx.Response(429, json={}), "rate_limited", None),
+    (httpx.Response(400, json={"code": 21606}), "error", None),
+])
+def test_twilio_route_outcomes(response, outcome, name):
+    result = run_twilio_directory(lambda request: response)
+    assert (result.outcome, result.name) == (outcome, name)
+
+
+def test_twilio_route_without_twilio_credentials_sends_nothing():
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=addon_reply())
+    async def run():
+        client = DirectoryLookup(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        result = await client.lookup(OWNER, ("twilio_trestle", ADDON), 5, 50)
+        await client.client.aclose()
+        return result, client.used
+    result, used = asyncio.run(run())
+    assert result.outcome == "unauthorized" and seen == [] and used == 0
+
+
+def test_twilio_route_names_a_first_time_caller_through_the_call_flow(tmp_path):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=addon_reply(number=STRANGER))
+    async def run():
+        directory = twilio_directory_client(handler)
+        context, _, events, tasks = manager(tmp_path, twilio_directory_policy(callers="everyone"),
+                                            FakeLookup(LookupResult("no_name")), directory=directory)
+        context._policy_observed()
+        context.begin("bridge-1", {"From": STRANGER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        block = context.hint("bridge-1", [], "call-1")
+        await directory.client.aclose()
+        return block, events
+    block, events = asyncio.run(run())
+    assert len(seen) == 1 and seen[0].url.params["AddOns"] == ADDON and "x-api-key" not in seen[0].headers
+    assert '"Should I put this under Waidong Syrws, at the number you\'re calling from?"' in block
+    assert "listed for this phone number in a phone directory" in block
+    assert events[0][3]["caller_directory_status"] == "ready"
+    assert lookup_events(events)[0][3]["caller_directory_outcome"] == "found"
+    recorded = json.dumps(events)
+    assert STRANGER not in recorded and "Waidong" not in recorded
