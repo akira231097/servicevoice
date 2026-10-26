@@ -1,0 +1,11 @@
+# App-only overlay for the isolated GPT-Live line. The base image's pinned
+# packages must equal requirements-lock.txt; the deploy step verifies that
+# with `pip freeze` before building. No network access is needed.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG COMMIT
+COPY app/ /app/app/
+COPY deploy/server.py deploy/runtime_health.py /app/deploy/
+COPY runtime_sqlite.py requirements-lock.txt /app/
+COPY scripts/database_backup.py /app/scripts/database_backup.py
+LABEL servicevoice.gpt_live.commit="${COMMIT}"

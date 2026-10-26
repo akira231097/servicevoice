@@ -33,6 +33,8 @@ from .jev_faq import FAQ_VERSION
 from .jev_classifier import JEV_MODEL
 from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
+from .caller_context import CallerContext, CallerNameLookup, DirectoryLookup, PolicySource
+from . import native_consent
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
 from .diagnostics import NullDiagnostics, create_diagnostics, operation_identifier, turn_identifier
@@ -42,6 +44,9 @@ from .diagnostic_http import DiagnosticHTTPMiddleware
 ROOT=Path(__file__).resolve().parent.parent
 load_dotenv(ROOT/".env")
 TELEPHONY_HTTP_TIMEOUT_SECONDS=6.0
+# Longest admission waits for the caller's name (an earlier booking, then caller ID)
+# so the very first sentence can use it. A caller-name lookup usually takes 0.2 s.
+GREETING_NAME_WAIT_SECONDS=1.5
 
 class Message(BaseModel):
     model_config=ConfigDict(extra="forbid")
@@ -64,6 +69,35 @@ def _tool_diagnostic_context(diagnostics,call_id,tool_id,contexts):
         return {"call_id":call_id,"turn_id":turn_identifier(call_id,ordinal),"diagnostics":diagnostics}
     except Exception:
         return None  # Missing diagnostic linkage cannot change an accepted effect.
+
+def provider_history(messages):
+    """Vapi's live-call messages in the shape caller_context reads: assistant speech and tool names only."""
+    history=[]
+    for message in messages if isinstance(messages,list) else ():
+        if not isinstance(message,dict):continue
+        if message.get("role")=="bot" and isinstance(message.get("message"),str):
+            history.append({"role":"assistant","content":message["message"]})
+        elif message.get("role")=="tool_calls" and isinstance(message.get("toolCalls"),list):
+            history.append({"role":"assistant","tool_calls":[{"function":{"name":(call.get("function") or {}).get("name")}}
+                for call in message["toolCalls"] if isinstance(call,dict)]})
+    return history
+
+def caller_greeting(state, policy):
+    """The first sentence for a caller-ID state, and the fixed code recorded for review.
+
+    A name from an earlier booking from this number is used at once; a caller-ID or
+    directory name is unverified, so it is asked about first; without one the
+    caller is asked for their name. Names were already cleaned by caller_context.
+    """
+    usable=(state.outcome in ("found","fixture","returning")
+            or getattr(state,"directory_outcome",None)=="found" and getattr(policy,"directory","off")!="off")
+    name=state.name if usable and state.number is not None else None
+    disclosure="I'm Cedar, an AI assistant for Cedar Service, a fictional dealership demo, and this call is recorded."
+    if name and state.outcome=="returning":
+        return f"Hi {name}, welcome back! {disclosure} How can I help today?","returning_asked"
+    if name:
+        return f"Hi! {disclosure} Am I speaking with {name}?","name_asked"
+    return f"Hi! {disclosure} Who am I speaking with today?","number_only"
 
 def create_app(db_path=None):
     from dotenv import dotenv_values
@@ -106,12 +140,24 @@ def create_app(db_path=None):
                 app.state.telemetry_initialized=True
         await app.state.gemini_gateway.start()
         await app.state.gemini_tts.start()
+        if app.state.caller_source is not None and app.state.caller_context is None:
+            values=settings()
+            caller=CallerContext(app.state.caller_source,
+                CallerNameLookup(values.get("TWILIO_API_KEY_SID") or "",values.get("TWILIO_API_KEY_SECRET") or ""),
+                spawn=asyncio.create_task,observe=observe_caller,recall=app.state.store.returning_customer,
+                directory=DirectoryLookup())  # idle unless the policy enables it and its key file exists
+            await caller.start()
+            app.state.caller_context=caller
     async def shutdown_resources():
         app.state.telephony_http_closing=True
         pending=list(app.state.telephony_http_tasks)
         if pending:
             try:await asyncio.wait_for(asyncio.shield(asyncio.gather(*pending,return_exceptions=True)),timeout=6)
             except asyncio.TimeoutError:pass  # Do not cancel accepted synchronous effects.
+        caller,app.state.caller_context=app.state.caller_context,None
+        if caller is not None:
+            try:await asyncio.wait_for(caller.close(),timeout=3)
+            except Exception:pass  # In-memory caller ID is discarded either way.
         try:
             await app.state.gemini_gateway.close()
         finally:
@@ -155,6 +201,10 @@ def create_app(db_path=None):
         try:return app.state.diagnostics.record(component,event,outcome,call_id=call_id,**kwargs)
         except Exception:return False
     app.state.diagnose=diagnose
+    def observe_caller(call_id,event,outcome,attributes,duration_ms=None):
+        # caller_context passes fixed codes only, never a number or name.
+        diagnose("webhook",event,outcome,call_id="gpt-live-caller-policy" if call_id=="twilio-caller-policy" else call_id,
+            duration_ms=duration_ms,attributes=attributes)
 
     app.add_middleware(DiagnosticHTTPMiddleware,observer=diagnose)
 
@@ -442,6 +492,12 @@ def create_app(db_path=None):
         limits=IngressLimits(active_calls=capacity.max_live_calls,workers=capacity.phone_workers,
                              admissions_per_window=capacity.phone_admissions_per_minute),
         live_admission=app.state.live_admission)
+    # Optional caller-ID personalization on the GPT-Live line only. Invalid
+    # settings fail startup, as on the Twilio lane; a missing or broken policy
+    # file fails closed to no lookups while running.
+    native=app.state.telephony_ingress.config is not None and app.state.telephony_ingress.config.tool_policy=="provider-native"
+    app.state.caller_source=PolicySource.from_settings(settings()) if native else None
+    app.state.caller_context=None
     app.state.telephony_http_capacity=capacity.phone_http_capacity
     app.state.telephony_http_pending=set()
     app.state.telephony_http_lock=threading.Lock()
@@ -473,6 +529,58 @@ def create_app(db_path=None):
 
     def mark_ended(sid):
         with store.connect() as db:db.execute("UPDATE sessions SET ended=1 WHERE id=?",(sid,))
+
+    def native_confirmation_refusal(sid,call_id,tid,arguments,artifact):
+        """A provider-native confirmation must follow a readback and a later yes.
+
+        Returns None to let the domain decide (committed replays, stale or
+        missing proposals) or after a verified transcript; otherwise the
+        refusal result. Nothing is written by this check.
+        """
+        with store.connect() as db:
+            pending=native_consent.pending_facts(db,sid,arguments.get("proposal_id"))
+        if pending is None:
+            return None
+        proposal,facts=pending
+        verified,evidence=native_consent.assess(artifact,proposal,facts)
+        reason=next(iter(evidence["reasons"]),"verified")
+        diagnose("tool_harness","validation","success" if verified else "rejected",call_id=call_id,
+            operation_id=operation_identifier(sid,tid),
+            attributes={"tool_name":"confirm_action","consent_verified":verified,"consent_reason":reason,
+                "consent_assent":evidence["assent"],"consent_anchor":evidence["anchor"],
+                "evidence_source":"provider_live_artifact",
+                **{"fact_"+name:bool(ok) for name,ok in evidence["facts"].items()}})
+        return None if verified else native_consent.refusal(evidence)
+
+    def caller_context_effect(event,message,result):
+        """Start or finish caller-ID context after verified phone ingress. Never awaits or changes the call."""
+        caller=app.state.caller_context
+        if caller is None:return
+        try:
+            call=message["call"];call_id=call["id"]
+            if event=="call_bound" and isinstance(result,dict) and result.get("assistantId"):
+                customer=call.get("customer") if isinstance(call.get("customer"),dict) else {}
+                caller.begin(call_id,{"From":customer.get("number")})
+                caller.bind(call_id,call_id)
+            elif event=="call_ended":
+                caller.finish(call_id,call_id)
+        except Exception:
+            pass  # Personalization never affects admission or teardown.
+
+    def with_caller_guidance(result,call_id,message):
+        """Add caller-ID guidance to the provider response only; it is never stored or reviewed."""
+        caller=app.state.caller_context
+        # Any result of a live call can carry it: a slow tool answering "pending" must not drop the name.
+        if caller is None or not isinstance(result,dict) or result.get("error")=="session_ended":return result
+        try:
+            state=caller.calls.get(call_id)
+            # Not allowlisted, or a lookup (including the optional paid directory) is still running.
+            if state is None or state.outcome=="pending" or getattr(state,"directory_outcome",None)=="pending":return result
+            artifact=message.get("artifact")
+            block=caller.hint(call_id,provider_history(artifact.get("messages") if isinstance(artifact,dict) else None),call_id)
+        except Exception:
+            return result
+        return {**result,"caller_id_guidance":block.strip()} if isinstance(block,str) and block.strip() else result
 
     async def process_webhook(message, *, phone=False, deadline=None, abandoned=None, diagnostic_request=None):
         if not isinstance(message,dict):raise HTTPException(422,"Missing message.")
@@ -512,6 +620,9 @@ def create_app(db_path=None):
                 raise HTTPException(exc.status,exc.code) from None
             except sqlite3.Error:
                 raise HTTPException(503,"Tool authorization evidence unavailable.") from None
+            # Gateway provenance does not exist for a Vapi-hosted model's tools;
+            # its confirmations get the server-side readback/assent check.
+            native_phone=phone and await run_in_threadpool(app.state.gemini_gateway.store.call_policy,sid,call_id)=="provider-native"
             results=[]
             for tid,name,arguments,_original in calls:
                 terminal_metadata=phone and (call.get("status")=="ended" or call.get("endedAt") is not None)
@@ -520,8 +631,13 @@ def create_app(db_path=None):
                 # phone HTTP budget. Already accepted effects remain shielded.
                 if phone and ((abandoned is not None and abandoned.is_set()) or (deadline is not None and time.monotonic()>=deadline)):
                     raise HTTPException(504,"Phone webhook deadline exceeded. Retry the same event and call ID to reconcile.")
+                refused=None
+                if may_continue and native_phone and name=="confirm_action":
+                    refused=await run_in_threadpool(native_confirmation_refusal,sid,call_id,tid,arguments,message.get("artifact"))
                 if not may_continue:
                     result={"ok":False,"error":"session_ended","message":"Call ended. No new action was taken."}
+                elif refused is not None:
+                    result=refused
                 else:
                     context=_tool_diagnostic_context(app.state.diagnostics,call_id,tid,diagnostic_contexts)
                     result=await app.state.harness.run(sid,name,arguments,tid,diagnostic_context=context)
@@ -531,6 +647,8 @@ def create_app(db_path=None):
                     # Accepted effects remain committed; an exact retry can
                     # recover their receipt. Never return unverifiable success.
                     raise HTTPException(503,"Tool response evidence could not be saved. Retry the original tool ID.")
+                if native_phone:
+                    result=with_caller_guidance(result,call_id,message)
                 results.append({"toolCallId":tid,"result":json.dumps(result)})
             return {"results":results}
         if event_type=="transcript" and message.get("transcriptType")=="final":
@@ -588,7 +706,27 @@ def create_app(db_path=None):
                 request.state.diagnostic_call_id=verified_call_id
                 diagnose("voice_runtime",event,"success",call_id=verified_call_id,
                     attributes={"evidence_source":"verified_phone_ingress"})
+                caller_context_effect(event,message,result)
+                if event=="call_bound":
+                    result=await greet_by_name(message,result)
                 return result
+            async def greet_by_name(message,result):
+                """Answer with the caller's name when it is known within a short wait; never fail admission."""
+                caller=app.state.caller_context
+                if caller is None or not isinstance(result,dict) or not result.get("assistantId"):return result
+                try:
+                    call_id=message["call"]["id"];state=caller.calls.get(call_id)
+                    if state is None or caller.source.current.mode!="personalize":return result
+                    task=state.task
+                    budget=min(GREETING_NAME_WAIT_SECONDS,deadline-time.monotonic()-1.0)
+                    if task is not None and not task.done() and budget>0:
+                        try:await asyncio.wait_for(asyncio.shield(task),timeout=budget)
+                        except Exception:pass  # a slow lookup keeps running; its name reaches later tool results
+                    greeting,code=caller_greeting(state,caller.source.current)
+                except Exception:
+                    return result
+                observe_caller(call_id,"caller_hint","observed",{"caller_hint_state":code})
+                return {**result,"assistantOverrides":{**(result.get("assistantOverrides") or {}),"firstMessage":greeting}}
             if event_type=="assistant-request":
                 coroutine=observe_phone_effect(ingress.admit,"call_bound")
             elif event_type=="end-of-call-report" or (event_type=="status-update" and message.get("status")=="ended"):

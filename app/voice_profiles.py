@@ -24,6 +24,13 @@ MODEL_PROFILES = {
         "sources": ["https://docs.vapi.ai/providers/model/openai", "https://developers.openai.com/api/docs/models/gpt-6-luna", "https://developers.openai.com/api/docs/guides/deployment-checklist"],
         "notes": ["Chat Completions function calling requires none reasoning; temperature is valid with none. Standard tier selected explicitly."],
     },
+    "gpt-live-1": {
+        "settings": {"provider": "openai", "model": "gpt-live-1"},
+        "support": "documented_native_beta",
+        "sources": ["https://docs.vapi.ai/gpt-live/overview", "https://docs.vapi.ai/gpt-live/configuration"],
+        "notes": ["Vapi beta: full-duplex speaker plus a GPT-5.6 reasoner. The classic assistant path cannot express it; use scripts/provision_gpt_live.py.",
+                  "Isolated phone line only: requires SERVICEVOICE_PHONE_NATIVE_TOOLS=gpt-live-candidate outside production."],
+    },
     "gemini-3.8-flash": {
         "settings": {"provider": "google", "model": "gemini-3.8-flash"},
         "support": "native_unverified_blocked",
@@ -156,6 +163,8 @@ def select_profiles(env, *, model_profile=None, voice_profile=None, apply=False,
     if selected_model not in MODEL_PROFILES or selected_voice not in VOICE_PROFILES:
         raise ValueError("Unknown model or voice profile. Use --list-profiles for exact choices.")
     model_entry, voice_entry = MODEL_PROFILES[selected_model], VOICE_PROFILES[selected_voice]
+    if model_entry["support"] == "documented_native_beta":
+        raise ValueError("GPT-Live needs a speaker/reasoner assistant. Use scripts/provision_gpt_live.py, not the classic assistant path.")
     if model_entry["support"] == "native_unverified_blocked":
         raise ValueError("Exact Gemini 3.8 Flash native Vapi support is unverified. Use gemini-3.8-flash-custom with an implemented adapter and explicit experimental opt-in; no other Gemini is substituted.")
     model, voice = deepcopy(model_entry["settings"]), deepcopy(voice_entry["settings"])

@@ -1,0 +1,87 @@
+# Isolated GPT-Live (Vapi beta) test line. Never recreates or edits a main or
+# other candidate service, network or volume; publishes no ports.
+name: servicevoice-gpt-live-candidate
+services:
+  gpt-live-business:
+    image: ${SERVICEVOICE_GPT_LIVE_IMAGE:?Set the reviewed local overlay image}
+    pull_policy: never
+    command: ["--mode", "provider"]
+    env_file:
+      - path: ${SERVICEVOICE_GPT_LIVE_ENV_FILE:?Set the root-only candidate env file outside the checkout}
+        format: raw
+    environment:
+      SERVICEVOICE_DB: /data/servicevoice.sqlite3
+    volumes:
+      - gpt-live-application-data:/data
+      # Private caller-ID policy (mode and keyed digests, never numbers). A
+      # missing file means no lookups; its HMAC key lives in the env file.
+      - ${SERVICEVOICE_GPT_LIVE_CALLER_POLICY_DIR:-/opt/servicevoice-gpt-live/caller-context}:/run/caller-context:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "2"}
+    networks: [accepted-application]
+  gpt-live-reviewer:
+    image: ${SERVICEVOICE_GPT_LIVE_IMAGE:?Set the reviewed local overlay image}
+    pull_policy: never
+    entrypoint: ["python", "-m", "app.live_evaluations"]
+    command: []
+    env_file:
+      - path: ${SERVICEVOICE_GPT_LIVE_REVIEWER_ENV_FILE:?Set the root-only reviewer env file outside the checkout}
+        format: raw
+    environment:
+      SERVICEVOICE_EVAL_SOURCE_DB: /evidence/servicevoice.sqlite3
+      SERVICEVOICE_EVAL_DIAGNOSTICS_PATH: /evidence/servicevoice-diagnostics.sqlite3
+      SERVICEVOICE_EVAL_OUTBOX: /evaluations/outbox.sqlite3
+    volumes:
+      # Not :ro on purpose. The scheduler uses SQLite WAL; on this mostly idle
+      # line its -shm file disappears between calls, and a reader on a
+      # read-only mount cannot recreate it ("unable to open database file").
+      # The reviewer still opens the database with mode=ro and query_only.
+      - gpt-live-application-data:/evidence
+      - gpt-live-evaluation-data:/evaluations
+    # The image's default probe checks the business HTTP port; the reviewer
+    # reports its own worker health from the outbox instead. At 0.15 CPU the
+    # check's Python start-up alone took about 6 s (2026-10-25), so a 5 s
+    # limit marked a working reviewer unhealthy.
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.live_evaluations", "--health"]
+      interval: 60s
+      timeout: 30s
+      start_period: 60s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 192m
+    cpus: 0.15
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    logging:
+      driver: local
+      options: {max-size: "5m", max-file: "2"}
+    networks: [review-egress]
+networks:
+  accepted-application:
+    external: true
+    name: servicevoice-lightsail_application
+  review-egress: {}
+volumes:
+  gpt-live-application-data:
+  gpt-live-evaluation-data:

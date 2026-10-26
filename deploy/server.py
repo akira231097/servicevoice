@@ -133,7 +133,11 @@ def ready(mode, console, values=os.environ):
                     or values.get('GEMINI_TTS_BEARER_SECRET') in {
                         values.get('GEMINI_API_KEY'), values.get('GEMINI_GATEWAY_SECRET'), values.get('VAPI_PHONE_WEBHOOK_SECRET')}):
                 return False
-        return bool(console.state.telephony_ingress.config is not None
+        ingress = console.state.telephony_ingress.config
+        if values.get('VAPI_MODEL_PROFILE') == 'gpt-live-1':
+            # Isolated GPT-Live line: Vapi hosts the model; only phone tools run here.
+            return bool(ingress is not None and ingress.tool_policy == 'provider-native')
+        return bool(ingress is not None
                     and values.get('VAPI_MODEL_PROFILE') == 'gemini-3.8-flash-custom'
                     and values.get('GEMINI_API_KEY') and len(values.get('GEMINI_GATEWAY_SECRET', '')) >= 32)
     except (sqlite3.Error, OSError):

@@ -285,6 +285,22 @@ class Store:
             "The local advisor request was withdrawn. Its audit record remains; no appointment was changed and no external contact was made."
             if row["status"]=="withdrawn" else "Local queue only; no actual transfer or callback sent."}
 
+    def returning_customer(self, phone):
+        """Read-only: the name and vehicle from this callback number's latest booking.
+
+        A caller-ID hint for an isolated phone line, never identity: no times,
+        references or appointment access. None when the number never booked.
+        """
+        if not isinstance(phone, str) or len(phone) != 12 or not phone.startswith("+1") or not phone[1:].isdigit():
+            return None
+        with self.read_connection(0.2) as db:
+            rows = db.execute("""SELECT customer FROM appointments WHERE tenant=?
+                AND json_extract(customer,'$.phone')=? ORDER BY rowid DESC LIMIT 50""", (TENANT, phone)).fetchall()
+        if not rows:
+            return None
+        latest = json.loads(rows[0]["customer"])
+        return {"name": latest.get("name"), "vehicle": latest.get("vehicle"), "visits": len(rows)}
+
     def appointment(self, db, sid):
         r=db.execute('''SELECT a.*,s.start FROM appointments a JOIN slots s ON a.slot_id=s.id
             WHERE a.session_id=? AND a.tenant=? ORDER BY a.rowid DESC LIMIT 1''',(sid,TENANT)).fetchone()
@@ -446,6 +462,10 @@ class Store:
                     "offered_slots":state.get("slots",[]),"appointment":self.appointment(db,sid),
                     "handoff":self.handoff(db,sid),"availability_query":state.get("availability_query"),
                     "pending_proposal":{"id":proposal["id"],"kind":proposal["kind"],"summary":json.loads(proposal["payload"])["summary"],"expires_at":datetime.fromtimestamp(proposal["expires"],timezone.utc).isoformat()} if proposal else None,
+                    # Only phone lines that opt in record the calling number.
+                    **({"caller_number":state["caller_number"],
+                        "caller_number_note":"The number this call comes from. Offer it as the callback number by its last four digits and use it only after the caller clearly agrees. It is not identity verification."}
+                       if state.get("caller_number") else {}),
                     "instruction":"These are durable facts; they do not prove consent. Do not replay old conversation or infer a booking beyond the saved appointment."}
         if name in ("prepare_reschedule","prepare_cancellation"):
             appt=self.appointment(db,sid)

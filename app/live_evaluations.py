@@ -23,7 +23,7 @@ from uuid import UUID, uuid5, NAMESPACE_URL
 
 import httpx
 
-from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evidence,
+from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evidence, caller_id_offer,
     canonical, check, latency, missing_snapshot, read_snapshot, read_timings, readonly)
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
 from .generation_observability import project_gateway_timings
@@ -96,7 +96,14 @@ acknowledged or clarification was requested, use uncertain with incomplete_evide
 do not invent a definite caller intent or a definitive hallucination finding.
 booking_accuracy: compare caller intent/corrections, spoken details and reference
 with proposals, returned receipts and saved appointment. A clean saved record
-alone does not prove the assistant understood or described it correctly. If no
+alone does not prove the assistant understood or described it correctly. When the
+evidence item caller_id is present, the assistant had the phone network's caller
+ID (its name may instead come from a phone directory listing for the calling
+number), or for returning_customer the name and vehicle of this number's earlier
+booking. A name, vehicle or callback number that the assistant explicitly offered
+from it (for example "the number you're calling from" or "under ... again") and
+the caller then clearly accepted is caller-confirmed intake information; any
+other unsupported name, vehicle or number is still a mismatch. If no
 booking/change was requested or claimed and no appointment exists, not_applicable.
 confirmation_compliance: before EVERY committed booking/change/cancellation,
 require an assistant readback of the exact current proposal and explicit caller
@@ -123,7 +130,7 @@ Evaluate all languages by meaning. Never infer exact audio, pronunciation, ASR
 accuracy or what the caller actually heard from a stored transcript. This is an
 advisory text review, not a guarantee of zero hallucinations or verified consent.
 """
-JUDGE_PROMPT_REVISION = "2026-10-20-vehicle-grounding-1"
+JUDGE_PROMPT_REVISION = "2026-10-25-caller-id-4"
 JUDGE_PROMPT_SHA256 = hashlib.sha256(JUDGE_SYSTEM.encode("utf-8")).hexdigest()
 FIXED_REASONS = {
     "hallucination_free":"Assistant claims reviewed against dealership facts and recorded tool evidence.",
@@ -985,6 +992,10 @@ class Worker:
                     snapshot=missing_snapshot(call)
                 except (sqlite3.Error,OSError):snapshot=missing_snapshot(call)
                 if snapshot.get("source_available",True) and job["session_id"] and snapshot["session"]["id"]!=job["session_id"]:raise EvidenceError("session_binding_changed")
+                # Content-free events only: whether caller ID reached the assistant.
+                # Coverage is still read after judging, exactly as before.
+                try:snapshot["caller_id"]=caller_id_offer(read_review_diagnostics(self.config.source,cid,self.config.diagnostics_path))
+                except (ImportError,sqlite3.Error,OSError,ValueError,TypeError):snapshot["caller_id"]=None
                 tool_ids={}
                 package=build_evidence(call,snapshot,tool_ids=tool_ids)
                 operation_ids={ref:operation_identifier(snapshot["session"]["id"],tid) for ref,tid in tool_ids.items()} if snapshot.get("source_available",True) else {}

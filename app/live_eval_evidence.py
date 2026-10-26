@@ -84,6 +84,10 @@ def read_snapshot(path, call_id):
                         raise EvidenceError("invalid_appointment_services")
                     if len(valid) > 1:
                         appointment["services"] = valid
+        result["tool_policy"] = None
+        if "provider_tool_policies" in tables:
+            policy = db.execute("SELECT policy FROM provider_tool_policies WHERE provider_call_id=? AND session_id=?", (call_id, sid)).fetchone()
+            result["tool_policy"] = policy["policy"] if policy else None
         result["signatures"] = []
         if "gemini_tool_signatures" in tables:
             for r in db.execute("SELECT tool_call_id,fingerprint,extras FROM gemini_tool_signatures WHERE session_id=? AND provider_call_id=? LIMIT 501", (sid,call_id)):
@@ -217,6 +221,20 @@ class Redactor:
         return value
 
 
+def caller_id_offer(diagnostics):
+    """Strongest caller-ID text the phone assistant received, from content-free events only."""
+    rows = diagnostics.get("events") if isinstance(diagnostics, dict) else None
+    # The Twilio lane records these on its bridge; the GPT-Live line on its webhook.
+    states = {(row.get("attributes") or {}).get("caller_hint_state") for row in rows if isinstance(row, dict)
+              and row.get("component") in ("twilio_bridge", "webhook") and row.get("event") == "caller_hint"} if isinstance(rows, list) else set()
+    if states & {"returning_name", "returning_asked"}:
+        return "returning_customer"
+    # The name is withdrawn only after it was offered, so name_asked implies an earlier offer.
+    if states & {"name_and_number", "name_asked"}:
+        return "name_and_number"
+    return "number_only" if states & {"number_only", "number_offered"} else None
+
+
 def build_evidence(call, snapshot, tool_ids=None):
     """Build the judge package. ``tool_ids`` (optional dict) receives ``tool:N`` -> provider tool call id."""
     snapshot = deepcopy(snapshot)
@@ -227,6 +245,9 @@ def build_evidence(call, snapshot, tool_ids=None):
         raise EvidenceError("missing_or_oversized_messages")
     local = {r["call_id"]:r["result"] for r in snapshot["results"]}
     signatures = {r["tool_call_id"]:r for r in snapshot["signatures"]}
+    # A Vapi-hosted model (GPT-Live) issues its own tools: there is no gateway
+    # signature, so the provider transcript ordinal is the only turn anchor.
+    native = snapshot.get("tool_policy") == "provider-native"
     evidence, tools, transcript = {}, [], []
     platform_reports={}
     for message in messages:
@@ -266,6 +287,9 @@ def build_evidence(call, snapshot, tool_ids=None):
             verified = signature.get("fingerprint") == hashlib.sha256(identity.encode()).hexdigest()
             entry = {"name":fn.get("name"),"arguments":args,"sequence":index,"user_count":signature.get("user_count") if verified else None,
                      "gateway_issuance_verified":verified,"server_result":local.get(tid),"provider_user_count":caller_count}
+            if native and not verified:
+                entry["issuance"] = "provider_native"
+                entry["user_count"] = caller_count if caller_count > 0 else None
             if fn.get("name")=="endCall":
                 # This is the one supported Vapi-owned action, never a booking
                 # operation. The DB reader already scopes signatures to both
@@ -285,9 +309,25 @@ def build_evidence(call, snapshot, tool_ids=None):
                         "provider_ended_by_assistant":end_by_assistant,
                         "provider_results":platform_reports.get(tid,[]),
                         "limitations":"A native attempt is not verified execution, caller intent, farewell playback or a scheduler mutation. Provider termination is coverage only."}
+                elif native and len(batch)==1 and args=={}:
+                    reason=call.get("endedReason")
+                    entry.pop("server_result",None)
+                    entry["evidence_scope"]="platform_attempt"
+                    entry["platform_evidence"]={"action":"endCall","issuance_verified":False,"issuance":"provider_native",
+                        "outcome":"unknown","authoritative_scheduler_receipt":False,
+                        "provider_ended_by_assistant":(True if reason in {"assistant-ended-call","assistant-said-end-call-phrase"}
+                            else False if reason=="customer-ended-call" else None) if isinstance(reason,str) else None,
+                        "provider_results":platform_reports.get(tid,[]),
+                        "limitations":"A provider-native attempt is not verified execution, caller intent, farewell playback or a scheduler mutation."}
                 else:
                     entry["evidence_scope"]="unverified_platform_attempt"
                     issues.append("unverified_native_platform_attempt")
+            elif native and fn.get("name")=="delegate":
+                # GPT-Live's speaker handing work to its reasoner: a provider
+                # step with no business effect. The reasoner's own tool calls
+                # are the business operations and are checked as usual.
+                entry.pop("server_result",None)
+                entry["evidence_scope"]="provider_delegation"
             else:
                 entry["evidence_scope"]="business_operation"
                 if tid not in local:issues.append("tool_without_terminal_receipt")
@@ -309,6 +349,10 @@ def build_evidence(call, snapshot, tool_ids=None):
         issues.append("no_caller_transcript")
     created = datetime.fromtimestamp(snapshot["session"]["created"],timezone.utc)
     evidence["facts"] = dealership_facts(created.astimezone(TZ).date())
+    if snapshot.get("caller_id") in ("number_only", "name_and_number", "returning_customer"):
+        evidence["caller_id"] = {"available_to_assistant": snapshot["caller_id"],
+            "provenance": ("caller ID, a phone directory listing or an earlier booking for this calling number; "
+                           "unverified; this item does not contain the caller-ID values")}
     evidence["state"] = {"scheduler_evidence_available":snapshot.get("source_available",True),"appointments":snapshot["appointments"],"proposals":snapshot["proposals"],
         "handoffs":snapshot["handoffs"],"pending_operations":[r for r in snapshot["operations"] if r["status"] in {"queued","running","unknown"}]}
     # Do not send DB session ids, fingerprints, tokens or provider signatures.

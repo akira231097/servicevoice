@@ -1,0 +1,22 @@
+# BEGIN ServiceVoice isolated GPT-Live candidate
+# Reviewed snippet: insert INSIDE the existing HTTPS site's braces, before its
+# final catch-all. Only the authenticated phone webhook is reachable; the
+# upstream still verifies its bearer credential on every request.
+@gpt_live_candidate_business {
+    method POST
+    path /gpt-live/webhooks/vapi/inbound
+}
+handle @gpt_live_candidate_business {
+    uri strip_prefix /gpt-live
+    request_body {
+        max_size 1MB
+    }
+    reverse_proxy gpt-live-business:8000 {
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 35s
+            keepalive 4s
+        }
+    }
+}
+# END ServiceVoice isolated GPT-Live candidate
