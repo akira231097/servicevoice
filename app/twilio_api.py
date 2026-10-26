@@ -154,7 +154,8 @@ class TwilioLane:
             self.caller = CallerContext(self.caller_source,
                 CallerNameLookup(self.config.api_key_sid, self.config.api_key_secret),
                 spawn=self.spawn, observe=self.observe_caller, recall=self.app.state.store.returning_customer,
-                directory=DirectoryLookup())  # idle unless the policy enables it and its key file exists
+                # Idle unless the policy enables a directory route (and, for the direct route, its key file exists).
+                directory=DirectoryLookup(twilio_auth=(self.config.api_key_sid, self.config.api_key_secret)))
             await self.caller.start()
         self.coordinator.key = settings.get("TYPESAFE_API_KEY", "")
         if flag(settings, "SERVICEVOICE_TWILIO_TESTER"):

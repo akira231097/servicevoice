@@ -434,6 +434,14 @@ assistant asks the same name question; asked how it knows the name, it says the
 name is listed for this phone number in a phone directory. A directory's own
 capitalization (LaToya, DeShawn) is kept.
 
+The same data is sold as Trestle's Reverse Phone Marketplace Add-on in Twilio.
+With `"directory": "twilio_trestle"` and `"directory_addon"` set to the Add-on's
+unique name, the request goes to Twilio Lookup v1 (`AddOns=<name>`, no `Type`) on
+the lane's own Twilio key, and Twilio bills it; no key file is needed. Its owners
+carry no type, so untyped owners count as people unless the line is commercial.
+Install the Add-on for Lookups only: enabling it for incoming calls would make
+Twilio run a paid lookup on every call, outside this policy and its cap.
+
 In `personalize`, the phone assistant receives unverified caller-ID text after
 the policy hash. It replaces the existing name-and-number question with "Should
 I put this under [name], at the number you're calling from?", or, without a

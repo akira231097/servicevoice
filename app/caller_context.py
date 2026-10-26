@@ -4,9 +4,10 @@ The calling number comes only from Twilio's signed incoming-call webhook. For a
 number on the private allowlist, or every eligible caller when the policy says
 "everyone", a background task first checks this number's earlier bookings and
 otherwise makes one Twilio Lookup caller-name request. When that gives no usable
-name and the policy enables it, one paid phone-directory request (Trestle Caller
-Identification) follows. Call admission, the greeting and every answer proceed
-without waiting for any of it. Results stay in memory for that call only.
+name and the policy enables it, one paid phone-directory request (Trestle's data,
+directly or through a Twilio Marketplace Add-on) follows. Call admission, the
+greeting and every answer proceed without waiting for any of it. Results stay in
+memory for that call only.
 
 A caller-ID or directory name is an unverified hint: it is the line owner's
 listing, never identity, consent or authentication. An earlier booking
@@ -43,8 +44,11 @@ POLICY_POLL_SECONDS = 2.0
 MAX_POLICY_BYTES = 65536
 MAX_LOOKUP_BYTES = 16384
 MAX_LOOKUP_SECONDS = 10.0
-# Optional paid phone-to-name directory (Trestle Caller Identification API).
+# Optional paid phone-to-name directory: Trestle Caller Identification directly ("trestle"),
+# or Trestle Reverse Phone as a Twilio Marketplace Add-on on the lane's own Twilio key ("twilio_trestle").
+DIRECTORIES = ("off", "trestle", "twilio_trestle")
 DIRECTORY_URL = "https://api.trestleiq.com/3.1/caller_id"
+LOOKUP_V1_URL = "https://lookups.twilio.com/v1/PhoneNumbers/"  # Marketplace Add-ons run only through Lookup v1
 DIRECTORY_KEY_FILE = "directory.key"  # beside the policy file; absent means the directory is never called
 DIRECTORY_CAPACITY = 2
 DEFAULT_DIRECTORY_DAILY_LIMIT = 50
@@ -62,6 +66,7 @@ DETAIL_TOOLS = frozenset({"prepare_booking", "prepare_first_available_booking", 
 _NUMBER = re.compile(r"\+1[2-9]\d{2}[2-9]\d{6}")
 _TOLL_FREE = frozenset({"800", "833", "844", "855", "866", "877", "888"})
 _DIGEST = re.compile(r"[a-f0-9]{64}")
+_ADDON_NAME = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 _NAME_TEXT = re.compile(r"[A-Za-z][A-Za-z .,'\-]*")
 _TOKEN = re.compile(r"[A-Za-z]+(?:['\-][A-Za-z]+)*")
 _STATES = frozenset("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ "
@@ -192,22 +197,28 @@ class CallerPolicy:
     lookup_seconds: float = DEFAULT_LOOKUP_SECONDS
     status: str = "loaded"
     everyone: bool = False  # True: every eligible caller, not only the allowlist
-    directory: str = "off"  # "trestle": a paid name directory after bookings and CNAM
+    directory: str = "off"  # a paid name directory after bookings and CNAM: "trestle" or "twilio_trestle"
     directory_daily_limit: int = DEFAULT_DIRECTORY_DAILY_LIMIT
+    directory_addon: str | None = None  # the Twilio Add-on's unique name, for "twilio_trestle" only
 
 
 def parse_policy(raw):
     """Strict private policy: mode, who is looked up, lookup deadline and HMAC digests of listed numbers."""
     value = json.loads(raw.decode("utf-8"))
     if (not isinstance(value, dict)
-            or set(value) - {"schema", "mode", "callers", "lookup_seconds", "allow", "directory", "directory_daily_limit"}
+            or set(value) - {"schema", "mode", "callers", "lookup_seconds", "allow", "directory", "directory_daily_limit",
+                             "directory_addon"}
             or value.get("schema") != POLICY_SCHEMA or value.get("mode") not in MODES
             or value.get("callers", "allowlist") not in ("allowlist", "everyone")
-            or value.get("directory", "off") not in ("off", "trestle")):
+            or value.get("directory", "off") not in DIRECTORIES):
         raise ValueError("caller_policy_schema")
     limit = value.get("directory_daily_limit", DEFAULT_DIRECTORY_DAILY_LIMIT)
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("caller_policy_bounds")
+    addon = value.get("directory_addon")
+    if (value.get("directory") == "twilio_trestle") != (addon is not None) or (
+            addon is not None and (not isinstance(addon, str) or not _ADDON_NAME.fullmatch(addon))):
+        raise ValueError("caller_policy_directory")  # the add-on name exists exactly when the Twilio route is chosen
     seconds = value.get("lookup_seconds", DEFAULT_LOOKUP_SECONDS)
     allow = value.get("allow", [])
     if type(seconds) not in (int, float) or not 0.5 <= seconds <= MAX_LOOKUP_SECONDS or not isinstance(allow, list) or len(allow) > 16:
@@ -227,7 +238,7 @@ def parse_policy(raw):
                 raise ValueError("caller_policy_fixture")
         entries[digest] = AllowEntry(label, fixture)
     return CallerPolicy(value["mode"], entries, float(seconds), everyone=value.get("callers") == "everyone",
-                        directory=value.get("directory", "off"), directory_daily_limit=limit)
+                        directory=value.get("directory", "off"), directory_daily_limit=limit, directory_addon=addon)
 
 
 class PolicySource:
@@ -259,12 +270,22 @@ class PolicySource:
         return hmac.new(self._key, number.encode("ascii"), hashlib.sha256).hexdigest()
 
     def directory_key(self, policy=None):
-        """The directory's API key while the policy (default: the live one) enables the directory, else None."""
+        """The directory's API key while the policy (default: the live one) enables the direct route, else None."""
         return self._directory_key if (policy or self.current).directory == "trestle" else None
+
+    def directory_access(self, policy=None):
+        """(route, credential) for asking the directory under ``policy`` (default: the live one), or None."""
+        policy = policy or self.current
+        if policy.directory == "twilio_trestle":
+            return "twilio_trestle", policy.directory_addon  # the lane's own Twilio key; Twilio bills the Add-on
+        key = self.directory_key(policy)
+        return ("trestle", key) if key else None
 
     def directory_status(self):
         if self.current.directory == "off":
             return "off"
+        if self.current.directory == "twilio_trestle":
+            return "ready"  # whether the Add-on is installed shows in the first request's outcome
         return {"present": "ready", "missing": "missing_key"}.get(self.key_status, "invalid_key")
 
     def _refresh_key(self):
@@ -417,13 +438,17 @@ class CallerNameLookup:
 
 
 class DirectoryLookup:
-    """Paid Trestle Caller Identification requests: own small pool, a daily cap, no retries, no queue.
+    """Paid phone-directory requests: own small pool, a daily cap, no retries, no queue.
 
-    Only ``belongs_to`` is read, and from it only the listing type and the
-    person's name. Addresses, age, gender and every other field are discarded.
+    Two routes to Trestle's data: its Caller Identification API with its own key
+    ("trestle"), or its Reverse Phone Marketplace Add-on through Twilio Lookup v1
+    on the lane's Twilio key ("twilio_trestle"; Twilio bills it). Only
+    ``belongs_to`` is read, and from it only the listing type and the person's
+    name. Addresses, age, gender and every other field are discarded.
     """
 
-    def __init__(self, *, client=None, capacity=DIRECTORY_CAPACITY, clock=time.time):
+    def __init__(self, *, twilio_auth=None, client=None, capacity=DIRECTORY_CAPACITY, clock=time.time):
+        self._twilio_auth = twilio_auth
         self.client = _lookup_client(client, capacity)
         self.owns_client = client is None
         self.capacity, self.active = capacity, 0
@@ -443,7 +468,11 @@ class DirectoryLookup:
         self.used += 1
         return True
 
-    async def lookup(self, number, key, seconds, daily_limit):
+    async def lookup(self, number, access, seconds, daily_limit):
+        """``access`` is (route, credential): ("trestle", API key) or ("twilio_trestle", Add-on unique name)."""
+        route, credential = access
+        if route == "twilio_trestle" and not self._twilio_auth:
+            return LookupResult("unauthorized")
         if self.active >= self.capacity:
             return LookupResult("capacity")
         if not self._within_daily_limit(daily_limit):
@@ -451,18 +480,25 @@ class DirectoryLookup:
         self.active += 1
         started = time.monotonic()
         try:
-            result = await self._request(number, key, seconds)
+            result = await self._request(number, route, credential, seconds)
         finally:
             self.active -= 1
         result.elapsed_ms = round((time.monotonic()-started)*1000, 3)
         return result
 
-    async def _request(self, number, key, seconds):
+    def request(self, number, route, credential):
+        """(url, query, headers, auth) for one request; no paid extras beyond the directory itself."""
+        if route == "twilio_trestle":
+            return LOOKUP_V1_URL + quote(number, safe=""), {"AddOns": credential}, {"accept": "application/json"}, self._twilio_auth
+        # Trestle's documented local form with a US hint.
+        return (DIRECTORY_URL, {"phone": number[2:], "phone.country_hint": "US"},
+                {"x-api-key": credential, "accept": "application/json"}, None)
+
+    async def _request(self, number, route, credential, seconds):
+        url, query, headers, auth = self.request(number, route, credential)
         try:
             async with asyncio.timeout(seconds):
-                # The provider's documented local form with a US hint. No paid add-ons.
-                async with self.client.stream("GET", DIRECTORY_URL, params={"phone": number[2:], "phone.country_hint": "US"},
-                                              headers={"x-api-key": key, "accept": "application/json"},
+                async with self.client.stream("GET", url, params=query, headers=headers, auth=auth,
                                               follow_redirects=False) as response:
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -474,16 +510,27 @@ class DirectoryLookup:
             return LookupResult("timeout")
         except httpx.HTTPError:
             return LookupResult("error")
+        return self.parse(number, route, credential, status, body)
+
+    @classmethod
+    def parse(cls, number, route, credential, status, body):
+        """A fixed outcome and, at most, a cleaned person's name from one response."""
         if status in (401, 403):
             return LookupResult("unauthorized")  # also a disabled key or an empty prepaid balance
         if status == 429:
             return LookupResult("rate_limited")  # the per-second limit or the billing-cycle quota
+        if status == 404 and route == "twilio_trestle":
+            return LookupResult("no_name")  # Lookup's answer for a number it considers invalid
         if status != 200:
             return LookupResult("error")
         try:
             data = json.loads(body)
         except (ValueError, UnicodeError):
             return LookupResult("unusable")
+        if route == "twilio_trestle":
+            data = cls._addon_result(data, number, credential)
+            if isinstance(data, LookupResult):
+                return data
         if not isinstance(data, dict):
             return LookupResult("unusable")
         if data.get("error"):
@@ -491,17 +538,38 @@ class DirectoryLookup:
         listed = data.get("phone_number")
         if isinstance(listed, str) and re.sub(r"\D", "", listed)[-10:] != number[2:]:
             return LookupResult("unusable")
-        return self._listed_name(data.get("belongs_to"))
+        return cls._listed_name(data.get("belongs_to"), data.get("is_commercial") is True)
 
     @staticmethod
-    def _listed_name(owners):
+    def _addon_result(data, number, name):
+        """The Trestle reply inside Twilio's Lookup v1 Add-on wrapper, or a failure outcome."""
+        if not isinstance(data, dict) or data.get("phone_number") != number:
+            return LookupResult("unusable")
+        addons = data.get("add_ons")
+        if not isinstance(addons, dict) or addons.get("status") != "successful":
+            return LookupResult("error")  # not installed for Lookups, or the Add-on failed
+        results = addons.get("results")
+        entry = results.get(name) if isinstance(results, dict) else None
+        if entry is None and isinstance(results, dict) and len(results) == 1:
+            entry = next(iter(results.values()))  # Twilio's example keys the result by the Add-on's own name
+        if not isinstance(entry, dict):
+            return LookupResult("unusable")
+        if entry.get("status") != "successful":
+            return LookupResult("error")
+        return entry.get("result")
+
+    @staticmethod
+    def _listed_name(owners, commercial=False):
         # The reference documents one highest-ranked owner but labels the field a list.
         owners = [owners] if isinstance(owners, dict) else owners
         if not owners:
             return LookupResult("no_name")
         if not isinstance(owners, list):
             return LookupResult("unusable")
-        kinds = [str(o.get("type")).lower() if isinstance(o, dict) else None for o in owners]
+        # The Reverse Phone Add-on's example lists owners without a type: those count as
+        # people unless the line itself is commercial.
+        untyped = "business" if commercial else "person"
+        kinds = [str(o.get("type") or untyped).lower() if isinstance(o, dict) else None for o in owners]
         people = [o for o, kind in zip(owners, kinds) if kind == "person"]
         if not people:
             return LookupResult("business" if "business" in kinds else "no_name")
@@ -733,11 +801,11 @@ class CallerContext:
         else:
             result = await self._guarded(self.lookup.lookup, state.number, seconds)
             policy = self.source.current  # one snapshot: a reload cannot mix two policies' settings
-            key = self._directory_key(state, policy) if result.outcome != "found" else None
-            if key:
+            access = self._directory_access(state, policy) if result.outcome != "found" else None
+            if access:
                 # Only now is the paid directory asked; the caller-name outcome is kept for review.
                 state.outcome, state.directory_outcome = result.outcome, "pending"
-                listing = await self._guarded(self.directory.lookup, state.number, key, seconds,
+                listing = await self._guarded(self.directory.lookup, state.number, access, seconds,
                                               policy.directory_daily_limit)
                 state.directory_outcome = listing.outcome
                 if listing.outcome == "found":
@@ -759,11 +827,11 @@ class CallerContext:
     def _eligible(state, policy):
         return state.number is not None and (state.digest in policy.allow or policy.everyone and state.label == "caller")
 
-    def _directory_key(self, state, policy):
-        """The directory key, only while ``policy`` (the live one) enables the directory for this caller."""
+    def _directory_access(self, state, policy):
+        """How to ask the directory, only while ``policy`` (the live one) enables it for this caller."""
         if self.directory is None or policy.mode == "off" or not self._eligible(state, policy):
             return None
-        return self.source.directory_key(policy)
+        return self.source.directory_access(policy)
 
     def bind(self, bridge_id, call_id):
         """Vapi admission named the call: lookup evidence belongs to that call's review."""
