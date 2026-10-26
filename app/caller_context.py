@@ -152,6 +152,9 @@ def clean_caller_name(raw, caller_type=None, *, cnam=True):
     tokens = [w for w in words if len(w) > 1 and w.upper() not in _SUFFIXES | _TITLES]
     if not 2 <= len(tokens) <= 4 or any(len(t) > 20 or not _TOKEN.fullmatch(t) for t in tokens):
         return None, "unusable"
+    if not cnam:
+        # A directory's own mixed capitalization (LaToya, DeShawn) is kept; all-caps or lowercase words are fixed.
+        return " ".join(_title(t) if t.isupper() or t.islower() else t for t in tokens), "found"
     return " ".join(_title(t) for t in tokens), "found"
 
 
@@ -255,9 +258,9 @@ class PolicySource:
     def digest(self, number):
         return hmac.new(self._key, number.encode("ascii"), hashlib.sha256).hexdigest()
 
-    def directory_key(self):
-        """The directory's API key while the live policy enables the directory, else None."""
-        return self._directory_key if self.current.directory == "trestle" else None
+    def directory_key(self, policy=None):
+        """The directory's API key while the policy (default: the live one) enables the directory, else None."""
+        return self._directory_key if (policy or self.current).directory == "trestle" else None
 
     def directory_status(self):
         if self.current.directory == "off":
@@ -278,7 +281,7 @@ class PolicySource:
                 raw = self.key_path.read_bytes() if info.st_size <= MAX_KEY_BYTES else b""
             except OSError:
                 raw, stamp = b"", None  # unreadable: no directory requests; retried on the next poll
-            text = raw.decode("ascii", "replace").strip()
+            text = raw.decode("utf-8-sig", "replace").strip()  # tolerates a byte-order mark; non-ASCII fails below
             usable = 16 <= len(text) <= 256 and all(33 <= ord(c) <= 126 for c in text)
             key, status = (text, "present") if usable else (None, "invalid")
         changed = status != self.key_status or key != self._directory_key
@@ -729,12 +732,13 @@ class CallerContext:
             result = LookupResult("fixture", fixture)
         else:
             result = await self._guarded(self.lookup.lookup, state.number, seconds)
-            key = self._directory_key(state) if result.outcome != "found" else None
+            policy = self.source.current  # one snapshot: a reload cannot mix two policies' settings
+            key = self._directory_key(state, policy) if result.outcome != "found" else None
             if key:
                 # Only now is the paid directory asked; the caller-name outcome is kept for review.
                 state.outcome, state.directory_outcome = result.outcome, "pending"
                 listing = await self._guarded(self.directory.lookup, state.number, key, seconds,
-                                              self.source.current.directory_daily_limit)
+                                              policy.directory_daily_limit)
                 state.directory_outcome = listing.outcome
                 if listing.outcome == "found":
                     result, state.source = LookupResult(result.outcome, listing.name), "directory"
@@ -755,12 +759,11 @@ class CallerContext:
     def _eligible(state, policy):
         return state.number is not None and (state.digest in policy.allow or policy.everyone and state.label == "caller")
 
-    def _directory_key(self, state):
-        """The directory key, only while the live policy enables the directory for this caller."""
-        policy = self.source.current
+    def _directory_key(self, state, policy):
+        """The directory key, only while ``policy`` (the live one) enables the directory for this caller."""
         if self.directory is None or policy.mode == "off" or not self._eligible(state, policy):
             return None
-        return self.source.directory_key()
+        return self.source.directory_key(policy)
 
     def bind(self, bridge_id, call_id):
         """Vapi admission named the call: lookup evidence belongs to that call's review."""
@@ -781,7 +784,7 @@ class CallerContext:
         final = outcome
         if directory != "not_called":
             attributes["caller_directory_outcome"] = directory
-            if directory != "capped":
+            if directory not in ("capped", "capacity"):
                 final = directory  # a directory request, when one was made, decides the status
         status = ("completed" if final in _LOOKUP_COMPLETED else "not_applicable" if final == "withheld_or_unsupported"
                   else "cancelled" if final == "cancelled" else "failed")
@@ -809,12 +812,15 @@ class CallerContext:
         policy = self.source.current
         if state is None or policy.mode != "personalize" or not self._eligible(state, policy):
             return None
-        # Turning the directory off also stops directory names already found, mid-call.
-        usable = (state.outcome in ("found", "fixture", "returning")
-                  or state.directory_outcome == "found" and policy.directory != "off")
+        usable = state.outcome in ("found", "fixture", "returning") or state.directory_outcome == "found"
         name = state.name if usable else None
+        directory = state.source == "directory"
         block, hint_state = caller_block(state.number, name, messages, state.memory if state.outcome == "returning" else None,
-                                         directory=state.source == "directory")
+                                         directory=directory)
+        if directory and policy.directory == "off" and hint_state == "name_and_number":
+            # Turning the directory off mid-call withdraws a listed name not yet offered. Once
+            # offered, the withdrawal text above (which never contains the name) still applies.
+            block, hint_state = caller_block(state.number, None, messages)
         if hint_state != state.hint_state:
             # Each change is recorded once; the reviewer reads these fixed codes
             # to learn that caller ID reached the assistant, never the values.
