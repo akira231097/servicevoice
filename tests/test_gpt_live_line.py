@@ -223,6 +223,14 @@ def test_time_and_digit_parsing():
 
 # --- phone path ----------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def steady_caller_policy(monkeypatch):
+    """No background policy rereads mid-test. On a scanned Windows runner a transient read
+    error fails the policy closed for one 2 s poll, which no test here is about."""
+    from app import caller_context
+    monkeypatch.setattr(caller_context, "POLICY_POLL_SECONDS", 3600)
+
+
 @pytest.fixture
 def native_app(tmp_path, monkeypatch):
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
@@ -745,3 +753,13 @@ def test_the_default_greeting_stays_when_personalization_is_off_or_the_caller_is
         with client:
             _, admitted = admit(client, caller=caller)
             assert "firstMessage" not in admitted["assistantOverrides"]
+
+
+def test_a_slow_tool_answer_still_carries_the_caller_id_guidance(native_app, tmp_path):
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        call, _ = admit(client, caller=TEST_LINE)
+        settled(app, call["id"])
+        app.state.harness.timeout_seconds = 1e-6  # every tool answers "still pending" at once
+        result = run_tool(client, call, "get_session_context", {}, "context-slow", {"messages": []})
+        assert result["error"] == "operation_pending" and "Jordan Rivera" in result["caller_id_guidance"]

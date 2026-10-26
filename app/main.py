@@ -570,7 +570,8 @@ def create_app(db_path=None):
     def with_caller_guidance(result,call_id,message):
         """Add caller-ID guidance to the provider response only; it is never stored or reviewed."""
         caller=app.state.caller_context
-        if caller is None or not isinstance(result,dict) or result.get("ok") is not True:return result
+        # Any result of a live call can carry it: a slow tool answering "pending" must not drop the name.
+        if caller is None or not isinstance(result,dict) or result.get("error")=="session_ended":return result
         try:
             state=caller.calls.get(call_id)
             # Not allowlisted, or a lookup (including the optional paid directory) is still running.
