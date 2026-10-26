@@ -669,3 +669,79 @@ def test_the_paid_directory_names_a_first_time_caller_only_with_its_switch_and_k
         book_directly(app, "Dana Lee", "2019 Honda Civic", stranger[2:])
         call, _ = admit(client, caller=stranger)
         assert settled(app, call["id"]).outcome == "returning" and asked == []
+
+
+# --- the caller's name in the very first sentence -------------------------------
+
+def greeting(admitted):
+    return admitted["assistantOverrides"].get("firstMessage")
+
+
+def test_a_returning_caller_is_greeted_by_name_at_once(native_app, tmp_path):
+    from app.diagnostics import read_review_diagnostics
+    from app.live_eval_evidence import caller_id_offer
+    app, client = native_app(**caller_policy(tmp_path))
+    with client:
+        book_directly(app, "Dana Lee", "2019 Honda Civic", TEST_LINE[2:])
+        call, admitted = admit(client, caller=TEST_LINE)
+        sid = admitted["assistantOverrides"]["variableValues"]["session_id"]
+        assert admitted["assistantOverrides"]["variableValues"] == {"session_id": sid}  # the call binding is unchanged
+        assert greeting(admitted).startswith("Hi Dana Lee, welcome back!") and "this call is recorded" in greeting(admitted)
+        assert "Civic" not in greeting(admitted)
+        assert run_tool(client, call, "get_dealership_info", {}, "info-g1", {"messages": []})["ok"] is True
+    assert caller_id_offer(read_review_diagnostics(Path(app.state.store.path), call["id"])) == "returning_customer"
+
+
+def test_a_caller_id_name_is_asked_about_and_an_unknown_caller_is_asked_their_name(native_app, tmp_path, monkeypatch):
+    from app import main as main_module
+    from app.caller_context import LookupResult
+
+    class NoName:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def lookup(self, number, seconds):
+            return LookupResult("no_name")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "CallerNameLookup", NoName)
+    app, client = native_app(**caller_policy(tmp_path, callers="everyone"))
+    with client:
+        _, admitted = admit(client, caller=TEST_LINE)  # the owned test line's labelled synthetic name
+        assert greeting(admitted).endswith("Am I speaking with Jordan Rivera?")
+        _, admitted = admit(client, caller="+19185550123")
+        assert greeting(admitted).endswith("Who am I speaking with today?") and "this call is recorded" in greeting(admitted)
+
+
+def test_a_slow_lookup_never_holds_up_the_answer(native_app, tmp_path, monkeypatch):
+    import asyncio
+    from app import main as main_module
+
+    class Held:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def lookup(self, number, seconds):
+            await asyncio.Event().wait()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "CallerNameLookup", Held)
+    monkeypatch.setattr(main_module, "GREETING_NAME_WAIT_SECONDS", 0.3)
+    app, client = native_app(**caller_policy(tmp_path, callers="everyone"))
+    with client:
+        call, admitted = admit(client, caller="+19185550123")
+        # Answered with the ask-for-a-name greeting while the lookup is still running.
+        assert greeting(admitted).endswith("Who am I speaking with today?")
+        assert app.state.caller_context.calls[call["id"]].outcome == "pending"
+
+
+def test_the_default_greeting_stays_when_personalization_is_off_or_the_caller_is_not_listed(native_app, tmp_path):
+    for mode, caller in (("off", TEST_LINE), ("personalize", "+19185550123")):
+        app, client = native_app(**caller_policy(tmp_path, mode=mode))  # written just before this app reads it
+        with client:
+            _, admitted = admit(client, caller=caller)
+            assert "firstMessage" not in admitted["assistantOverrides"]

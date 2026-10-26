@@ -44,6 +44,9 @@ from .diagnostic_http import DiagnosticHTTPMiddleware
 ROOT=Path(__file__).resolve().parent.parent
 load_dotenv(ROOT/".env")
 TELEPHONY_HTTP_TIMEOUT_SECONDS=6.0
+# Longest admission waits for the caller's name (an earlier booking, then caller ID)
+# so the very first sentence can use it. A caller-name lookup usually takes 0.2 s.
+GREETING_NAME_WAIT_SECONDS=1.5
 
 class Message(BaseModel):
     model_config=ConfigDict(extra="forbid")
@@ -78,6 +81,23 @@ def provider_history(messages):
             history.append({"role":"assistant","tool_calls":[{"function":{"name":(call.get("function") or {}).get("name")}}
                 for call in message["toolCalls"] if isinstance(call,dict)]})
     return history
+
+def caller_greeting(state, policy):
+    """The first sentence for a caller-ID state, and the fixed code recorded for review.
+
+    A name from an earlier booking from this number is used at once; a caller-ID or
+    directory name is unverified, so it is asked about first; without one the
+    caller is asked for their name. Names were already cleaned by caller_context.
+    """
+    usable=(state.outcome in ("found","fixture","returning")
+            or getattr(state,"directory_outcome",None)=="found" and getattr(policy,"directory","off")!="off")
+    name=state.name if usable and state.number is not None else None
+    disclosure="I'm Cedar, an AI assistant for Cedar Service, a fictional dealership demo, and this call is recorded."
+    if name and state.outcome=="returning":
+        return f"Hi {name}, welcome back! {disclosure} How can I help today?","returning_asked"
+    if name:
+        return f"Hi! {disclosure} Am I speaking with {name}?","name_asked"
+    return f"Hi! {disclosure} Who am I speaking with today?","number_only"
 
 def create_app(db_path=None):
     from dotenv import dotenv_values
@@ -686,7 +706,26 @@ def create_app(db_path=None):
                 diagnose("voice_runtime",event,"success",call_id=verified_call_id,
                     attributes={"evidence_source":"verified_phone_ingress"})
                 caller_context_effect(event,message,result)
+                if event=="call_bound":
+                    result=await greet_by_name(message,result)
                 return result
+            async def greet_by_name(message,result):
+                """Answer with the caller's name when it is known within a short wait; never fail admission."""
+                caller=app.state.caller_context
+                if caller is None or not isinstance(result,dict) or not result.get("assistantId"):return result
+                try:
+                    call_id=message["call"]["id"];state=caller.calls.get(call_id)
+                    if state is None or caller.source.current.mode!="personalize":return result
+                    task=state.task
+                    budget=min(GREETING_NAME_WAIT_SECONDS,deadline-time.monotonic()-1.0)
+                    if task is not None and not task.done() and budget>0:
+                        try:await asyncio.wait_for(asyncio.shield(task),timeout=budget)
+                        except Exception:pass  # a slow lookup keeps running; its name reaches later tool results
+                    greeting,code=caller_greeting(state,caller.source.current)
+                except Exception:
+                    return result
+                observe_caller(call_id,"caller_hint","observed",{"caller_hint_state":code})
+                return {**result,"assistantOverrides":{**(result.get("assistantOverrides") or {}),"firstMessage":greeting}}
             if event_type=="assistant-request":
                 coroutine=observe_phone_effect(ingress.admit,"call_bound")
             elif event_type=="end-of-call-report" or (event_type=="status-update" and message.get("status")=="ended"):
