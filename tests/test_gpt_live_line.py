@@ -356,7 +356,8 @@ OWNER = "+12175550142"
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test", "Jordan Rivera"),), callers=None):
+def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test", "Jordan Rivera"),), callers=None,
+                  directory=None):
     allow = []
     for number, label, fixture in entries:
         entry = {"digest": hmac.new(CALLER_KEY.encode(), number.encode(), hashlib.sha256).hexdigest(), "label": label}
@@ -367,6 +368,8 @@ def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test
     policy = {"schema": "servicevoice-caller-context-v1", "mode": mode, "allow": allow}
     if callers:
         policy["callers"] = callers
+    if directory:
+        policy["directory"] = directory
     path.write_text(json.dumps(policy))
     return {"SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY": str(path), "SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY": CALLER_KEY}
 
@@ -374,7 +377,8 @@ def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test
 def settled(app, call_id, seconds=5):
     """The earlier-booking check and any lookup run in the background; wait for them in tests."""
     deadline = time.monotonic() + seconds
-    while app.state.caller_context.calls[call_id].outcome == "pending" and time.monotonic() < deadline:
+    while (app.state.caller_context.calls[call_id].outcome == "pending"
+           or app.state.caller_context.calls[call_id].directory_outcome == "pending") and time.monotonic() < deadline:
         time.sleep(0.01)
     return app.state.caller_context.calls[call_id]
 
@@ -604,3 +608,58 @@ def test_store_finds_only_this_numbers_latest_booking_read_only(tmp_path):
     for bad in (None, "4055550134", "+1405555013", "+1405555013x", "anonymous"):
         assert store.returning_customer(bad) is None
     assert Path(store.path).read_bytes() == before
+
+
+# --- optional paid phone directory (the lane's d12cf5b) -------------------------
+
+def test_the_paid_directory_names_a_first_time_caller_only_with_its_switch_and_key(native_app, tmp_path, monkeypatch):
+    from app import main as main_module
+    from app.caller_context import LookupResult
+    stranger, asked = "+19185550144", []
+
+    class NoCallerIdName:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def lookup(self, number, seconds):
+            return LookupResult("no_name")
+
+        async def close(self):
+            pass
+
+    class Directory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def lookup(self, number, key, seconds, daily_limit):
+            asked.append((number, key, daily_limit))
+            return LookupResult("found", "Riley Chen")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "CallerNameLookup", NoCallerIdName)
+    monkeypatch.setattr(main_module, "DirectoryLookup", Directory)
+    settings = caller_policy(tmp_path, callers="everyone", directory="trestle")
+    app, client = native_app(**settings)  # no key file yet: the directory is never asked
+    with client:
+        call, _ = admit(client, caller=stranger)
+        settled(app, call["id"])
+        guidance = run_tool(client, call, "get_session_context", {}, "context-d1", {"messages": []})["caller_id_guidance"]
+        assert asked == [] and "May I have your name? I can use the number you're calling from." in guidance
+    key = "trestle-test-key-" + "x" * 24
+    (tmp_path / "directory.key").write_text(key)
+    app, client = native_app(**settings)
+    with client:
+        call, _ = admit(client, caller=stranger)
+        state = settled(app, call["id"])
+        assert state.directory_outcome == "found" and asked == [(stranger, key, 50)]
+        guidance = run_tool(client, call, "get_session_context", {}, "context-d2", {"messages": []})["caller_id_guidance"]
+        assert "Should I put this under Riley Chen, at the number you're calling from?" in guidance
+        assert "listed for this phone number in a phone directory" in guidance
+    asked.clear()
+    app, client = native_app(**settings)  # an earlier booking names the caller, so nothing paid is asked
+    with client:
+        book_directly(app, "Dana Lee", "2019 Honda Civic", stranger[2:])
+        call, _ = admit(client, caller=stranger)
+        assert settled(app, call["id"]).outcome == "returning" and asked == []

@@ -33,7 +33,7 @@ from .jev_faq import FAQ_VERSION
 from .jev_classifier import JEV_MODEL
 from .advisor_api import install_advisor_api
 from .telephony_ingress import IngressConfig, IngressError, IngressLimits, TelephonyIngress
-from .caller_context import CallerContext, CallerNameLookup, PolicySource
+from .caller_context import CallerContext, CallerNameLookup, DirectoryLookup, PolicySource
 from . import native_consent
 from .capacity import CapacityConfig, CapacityError, LiveAdmission
 from .observability import NullTelemetry, TelemetryConfig, create_telemetry, NullLocalTimingSink, create_local_timing_sink
@@ -124,7 +124,8 @@ def create_app(db_path=None):
             values=settings()
             caller=CallerContext(app.state.caller_source,
                 CallerNameLookup(values.get("TWILIO_API_KEY_SID") or "",values.get("TWILIO_API_KEY_SECRET") or ""),
-                spawn=asyncio.create_task,observe=observe_caller,recall=app.state.store.returning_customer)
+                spawn=asyncio.create_task,observe=observe_caller,recall=app.state.store.returning_customer,
+                directory=DirectoryLookup())  # idle unless the policy enables it and its key file exists
             await caller.start()
             app.state.caller_context=caller
     async def shutdown_resources():
@@ -552,7 +553,8 @@ def create_app(db_path=None):
         if caller is None or not isinstance(result,dict) or result.get("ok") is not True:return result
         try:
             state=caller.calls.get(call_id)
-            if state is None or state.outcome=="pending":return result  # not allowlisted, or the lookup is still running
+            # Not allowlisted, or a lookup (including the optional paid directory) is still running.
+            if state is None or state.outcome=="pending" or getattr(state,"directory_outcome",None)=="pending":return result
             artifact=message.get("artifact")
             block=caller.hint(call_id,provider_history(artifact.get("messages") if isinstance(artifact,dict) else None),call_id)
         except Exception:
