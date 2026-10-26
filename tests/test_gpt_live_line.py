@@ -374,13 +374,19 @@ def caller_policy(tmp_path, mode="personalize", entries=((TEST_LINE, "owned_test
     return {"SERVICEVOICE_TWILIO_CALLER_CONTEXT_POLICY": str(path), "SERVICEVOICE_TWILIO_CALLER_CONTEXT_KEY": CALLER_KEY}
 
 
-def settled(app, call_id, seconds=5):
-    """The earlier-booking check and any lookup run in the background; wait for them in tests."""
+def settled(app, call_id, seconds=30):
+    """The earlier-booking check and any lookup run in the background; wait for them in tests.
+
+    Hosted CI runners can be many times slower than a laptop, so the wait is
+    generous, and a step that never finishes fails here instead of later.
+    """
     deadline = time.monotonic() + seconds
-    while (app.state.caller_context.calls[call_id].outcome == "pending"
-           or app.state.caller_context.calls[call_id].directory_outcome == "pending") and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        state = app.state.caller_context.calls[call_id]
+        if state.outcome != "pending" and state.directory_outcome != "pending":
+            return state
         time.sleep(0.01)
-    return app.state.caller_context.calls[call_id]
+    raise AssertionError("caller-ID background step did not finish within %s s" % seconds)
 
 
 def test_caller_id_name_rides_on_tool_results_and_is_never_stored(native_app, tmp_path):
@@ -468,15 +474,15 @@ def test_caller_name_lookup_never_delays_the_call_and_ends_with_it(native_app, t
     monkeypatch.setattr(main_module, "CallerNameLookup", HeldLookup)
     app, client = native_app(**caller_policy(tmp_path, entries=((OWNER, "owner", None),)))
     with client:
-        started = time.monotonic()
         call, _ = admit(client, caller=OWNER)
-        assert time.monotonic() - started < 2  # admission never waits for the lookup
+        # Admission returned while the lookup is still held open, so it never waits for it.
+        assert app.state.caller_context.calls[call["id"]].outcome == "pending"
         assert "caller_id_guidance" not in run_tool(client, call, "get_session_context", {}, "context-4", {"messages": []})
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while "event" not in gate and time.monotonic() < deadline:
             time.sleep(0.01)
         gate["loop"].call_soon_threadsafe(gate["event"].set)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while app.state.caller_context.calls[call["id"]].outcome == "pending" and time.monotonic() < deadline:
             time.sleep(0.02)
         guidance = run_tool(client, call, "get_session_context", {}, "context-5", {"messages": []})["caller_id_guidance"]
