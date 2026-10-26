@@ -45,9 +45,9 @@ class EvaluationFailure(Exception):
 
 
 class Conversation:
-    def __init__(self, client, store, key, budget, name, memory=None):
+    def __init__(self, client, store, key, budget, name, memory=None, directory=False):
         self.client, self.store, self.key, self.budget, self.name = client, store, key, budget, name
-        self.memory = memory
+        self.memory, self.directory = memory, directory
         self.sid = store.create_session("live")["id"]
         self.harness = ToolHarness(store)
         self.policy = render_system_prompt() + SERIAL_TOOL_POLICY + PHONE_CONVERSATION_POLICY + PHONE_PRESENTATION_POLICY
@@ -62,7 +62,7 @@ class Conversation:
             if self.budget[0] <= 0:
                 raise EvaluationFailure("model_request_cap")
             self.budget[0] -= 1
-            block, state = caller_block(NUMBER, self.name, self.messages[1:], self.memory)
+            block, state = caller_block(NUMBER, self.name, self.messages[1:], self.memory, directory=self.directory)
             self.hint_states.append(state)
             self.messages[0]["content"] = self.policy + (block or "")
             started = time.perf_counter()
@@ -104,11 +104,12 @@ def reply_to(text, case, state):
         state["answered_hint"] = True
         return {"decline": "No, it's for my wife, Priya Patel.",
                 "returning_decline": "No, I'm Alex Kim. This is my brother's phone.",
-                "how_known": "How do you know my name?"}.get(case, "Yes, that's right.")
+                "how_known": "How do you know my name?",
+                "directory_how_known": "How do you know my name?"}.get(case, "Yes, that's right.")
     if "camry" in lowered and "?" in text and not state.get("vehicle"):
         state["vehicle"] = True
         return "Yes, the same car."
-    if case == "how_known" and state.get("answered_hint") and not state.get("followed_up"):
+    if case in ("how_known", "directory_how_known") and state.get("answered_hint") and not state.get("followed_up"):
         state["followed_up"] = True
         return "Okay, yes, that's me. Go ahead."
     if any(w in lowered for w in ("year", "make", "model", "vehicle", "car")) and "?" in text and not state.get("vehicle"):
@@ -148,7 +149,10 @@ CASES = {
     "information_only": (HINT, "What time does the service department close today?", None),
     "returning_confirm": (HINT, OPENING, MEMORY),
     "returning_decline": (HINT, OPENING, MEMORY),
+    "directory_confirm": (HINT, OPENING, None),
+    "directory_how_known": (HINT, OPENING, None),
 }
+DIRECTORY_CASES = frozenset({"directory_confirm", "directory_how_known"})  # the name is a phone-directory listing
 
 
 def judge(case, conversation, store_state):
@@ -195,6 +199,8 @@ def judge(case, conversation, store_state):
         checks["calling_number_saved"] = customer.get("phone") == NUMBER
     if case == "how_known":
         checks["explains_caller_id"] = "caller id" in joined.lower()
+    if case == "directory_how_known":
+        checks["explains_directory_listing"] = "directory" in joined.lower()
     if case != "information_only":
         checks["booking_reached_proposal_or_appointment"] = bool(proposal_or_booking)
     return checks
@@ -204,7 +210,7 @@ async def run_case(case, index, client, key, budget, directory, semaphore):
     name, opening, memory = CASES[case]
     async with semaphore:
         store = Store(Path(directory) / f"{case}-{index}.sqlite3")
-        conversation = Conversation(client, store, key, budget, name, memory)
+        conversation = Conversation(client, store, key, budget, name, memory, case in DIRECTORY_CASES)
         state = {"phase": "start"}
         result = {"case": case, "run": index}
         try:

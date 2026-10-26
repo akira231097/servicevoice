@@ -134,6 +134,9 @@ EVENTS |= frozenset({"caller_lookup", "caller_hint", "caller_policy"})
 _ENUM_ATTRIBUTES["caller_lookup_outcome"] = frozenset({"found", "fixture", "returning", "no_name", "business", "placeholder",
     "possibly_truncated", "unusable", "error", "timeout", "capacity", "unauthorized", "rate_limited", "cancelled",
     "withheld_or_unsupported"})
+_ENUM_ATTRIBUTES["caller_directory_outcome"] = frozenset({"found", "no_name", "business", "placeholder", "unusable",
+    "error", "timeout", "capacity", "capped", "unauthorized", "rate_limited", "cancelled"})
+_ENUM_ATTRIBUTES["caller_directory_status"] = frozenset({"off", "ready", "missing_key", "invalid_key"})
 _ENUM_ATTRIBUTES["caller_context_mode"] = frozenset({"off", "shadow", "personalize"})
 _ENUM_ATTRIBUTES["caller_policy_status"] = frozenset({"loaded", "missing", "invalid", "pending"})
 _ENUM_ATTRIBUTES["caller_hint_state"] = frozenset({"name_and_number", "number_only", "name_asked", "number_offered",

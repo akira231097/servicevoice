@@ -417,6 +417,21 @@ and suffixes. Only an explicit comma establishes surname-first order; otherwise
 the listed order is kept and never guessed, so the assistant uses a confirmed
 name in full or not at all.
 
+Optional phone directory: when the policy also sets `"directory": "trestle"` and
+the key file `directory.key` exists beside the policy, a caller with no earlier
+booking and no usable CNAM name gets one Trestle Caller Identification request
+(`GET /3.1/caller_id`, about seven cents, no paid add-ons) on its own
+two-connection pool, with the same total deadline, no retries and a daily cap
+(`"directory_daily_limit"`, default 50 requests per UTC day; a restart resets
+the count). Only a single listed person's first and last name are read; a
+business listing, several people or an unusable name are skipped, and addresses,
+ages and every other field are discarded. The key file is reread like the
+policy, so it can be installed or removed without a restart. Without it, or with
+`"directory": "off"` (the default), the directory is never called, and turning it
+off also stops directory names already found. The assistant asks the same name
+question; asked how it knows the name, it says the name is listed for this phone
+number in a phone directory.
+
 In `personalize`, the phone assistant receives unverified caller-ID text after
 the policy hash. It replaces the existing name-and-number question with "Should
 I put this under [name], at the number you're calling from?", or, without a
@@ -430,7 +445,9 @@ every booking. `shadow` performs the lookup without changing speech.
 
 Diagnostics record fixed codes only (`caller_lookup`, `caller_hint`,
 `caller_policy` on `twilio_bridge`): outcome, mode, STIR/SHAKEN category and
-duration, never the number, name or provider response. The reviewer reads the
+duration, plus the directory outcome when it was asked and the directory status
+(`ready`, `missing_key` or `invalid_key`) when it is enabled, never the number,
+name, key or provider response. The reviewer reads the
 same codes to add a content-free `caller_id` evidence item, so an accepted
 caller-ID name or calling number is not graded as an invented detail. The
 booking database schema is unchanged.

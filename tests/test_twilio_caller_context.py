@@ -11,8 +11,8 @@ import xml.etree.ElementTree as ET
 import httpx
 import pytest
 
-from app.caller_context import (CallerContext, CallerNameLookup, LookupResult, PolicySource, caller_block,
-    clean_caller_name, clean_memory, normalize_number, parse_policy, spoken_number, verstat_category)
+from app.caller_context import (CallerContext, CallerNameLookup, DirectoryLookup, LookupResult, PolicySource,
+    caller_block, clean_caller_name, clean_memory, normalize_number, parse_policy, spoken_number, verstat_category)
 from app.diagnostics import safe_attributes
 from app.domain import Store
 from app.live_eval_evidence import build_evidence, caller_id_offer, read_snapshot
@@ -315,14 +315,14 @@ class FakeLookup:
         pass
 
 
-def manager(tmp_path, raw=None, lookup=None, recall=None):
+def manager(tmp_path, raw=None, lookup=None, recall=None, directory=None):
     source, path = source_for(tmp_path, raw or policy_bytes())
     events, tasks = [], []
     def spawn(coroutine):
         task = asyncio.get_running_loop().create_task(coroutine)
         tasks.append(task)
         return task
-    context = CallerContext(source, lookup or FakeLookup(), spawn=spawn, recall=recall,
+    context = CallerContext(source, lookup or FakeLookup(), spawn=spawn, recall=recall, directory=directory,
         observe=lambda call_id, event, outcome, attributes, duration_ms=None: events.append((call_id, event, outcome, attributes)))
     return context, path, events, tasks
 
@@ -959,3 +959,372 @@ def test_reviewer_flag_for_a_returning_caller():
     assert caller_id_offer({"events": [hint_event("number_only"), hint_event("returning_name")]}) == "returning_customer"
     assert safe_attributes({"caller_lookup_outcome": "returning", "caller_hint_state": "returning_asked"}) == {
         "caller_lookup_outcome": "returning", "caller_hint_state": "returning_asked"}
+
+
+# ---------------------------------------------------------------- optional phone directory
+
+TRESTLE_KEY = "t" * 40
+STRANGER = "+19185550199"
+
+
+def directory_policy(directory="trestle", limit=None, **kwargs):
+    value = json.loads(policy_bytes(**kwargs))
+    value["directory"] = directory
+    if limit is not None:
+        value["directory_daily_limit"] = limit
+    return json.dumps(value).encode()
+
+
+def directory_reply(first="Waidong", last="Syrws", kind="Person", number="4055550134", **extra):
+    """The documented response shape, including the fields that must be discarded."""
+    owner = {"id": "Person.1", "name": f"{first} L {last}", "firstname": first, "middlename": "L", "lastname": last,
+             "alternate_names": [], "age_range": "25-29", "gender": "Male", "type": kind, "industry": None,
+             "link_to_phone_start_date": "2018-01-01"}
+    reply = {"id": "Phone.1", "phone_number": number, "is_valid": True, "line_type": "Mobile", "carrier": "Carrier",
+             "is_prepaid": False, "is_commercial": False, "belongs_to": owner,
+             "current_addresses": [{"street_line_1": "100 Main St", "city": "Oklahoma City", "postal_code": "73102",
+                                    "state_code": "OK"}], "warnings": [], "error": None}
+    reply.update(extra)
+    return reply
+
+
+def directory_client(handler, clock=time.time):
+    return DirectoryLookup(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), clock=clock)
+
+
+def run_directory(handler, seconds=5, limit=50):
+    async def run():
+        client = directory_client(handler)
+        result = await client.lookup(OWNER, TRESTLE_KEY, seconds, limit)
+        await client.client.aclose()
+        return result
+    return asyncio.run(run())
+
+
+def test_policy_directory_keys_parse_with_safe_defaults():
+    plain = parse_policy(policy_bytes())
+    assert (plain.directory, plain.directory_daily_limit) == ("off", 50)
+    enabled = parse_policy(directory_policy(limit=5))
+    assert (enabled.directory, enabled.directory_daily_limit) == ("trestle", 5)
+    for raw in (directory_policy("whitepages"), directory_policy(limit=0), directory_policy(limit=1001),
+                directory_policy(limit="50"), directory_policy(limit=True), directory_policy(limit=2.5)):
+        with pytest.raises(ValueError):
+            parse_policy(raw)
+
+
+def test_directory_key_file_is_reloaded_and_fails_closed(tmp_path):
+    source, path = source_for(tmp_path, directory_policy())
+    key_file = tmp_path / "directory.key"
+    assert source.directory_key() is None and source.directory_status() == "missing_key"
+    key_file.write_text(TRESTLE_KEY + "\n")
+    assert source.refresh() and source.directory_key() == TRESTLE_KEY and source.directory_status() == "ready"
+    assert source.refresh() is False  # unchanged files: nothing reread
+    assert TRESTLE_KEY not in repr(source.current)
+    for bad in ("short", "a key with spaces in the middle", "k" * 600):
+        key_file.write_text(bad)
+        source.refresh()
+        assert source.directory_key() is None and source.directory_status() == "invalid_key"
+    key_file.write_text(TRESTLE_KEY)
+    assert source.refresh() and source.directory_key() == TRESTLE_KEY
+    path.write_bytes(policy_bytes())  # the policy's default leaves the directory off: the key is never handed out
+    assert source.refresh() and source.directory_key() is None and source.directory_status() == "off"
+    path.write_bytes(directory_policy())
+    assert source.refresh() and source.directory_key() == TRESTLE_KEY
+    key_file.unlink()
+    assert source.refresh() and source.directory_key() is None and source.directory_status() == "missing_key"
+    key_file.write_text(TRESTLE_KEY)
+    assert source.refresh() and source.directory_key() == TRESTLE_KEY
+    assert source.fail_closed() and source.directory_key() is None
+
+
+def test_directory_request_shape_and_listed_person():
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=directory_reply())
+    result = run_directory(handler)
+    assert (result.outcome, result.name) == ("found", "Waidong Syrws") and result.elapsed_ms >= 0
+    request = seen[0]
+    assert request.url.host == "api.trestleiq.com" and request.url.path == "/3.1/caller_id"
+    assert dict(request.url.params) == {"phone": "4055550134", "phone.country_hint": "US"}  # no paid add-ons
+    assert request.headers["x-api-key"] == TRESTLE_KEY and "authorization" not in request.headers
+    assert set(vars(result)) == {"outcome", "name", "elapsed_ms"}  # nothing else leaves the parser
+
+
+@pytest.mark.parametrize("reply,outcome,name", [
+    (directory_reply(belongs_to=[directory_reply()["belongs_to"]]), "found", "Waidong Syrws"),
+    (directory_reply(first="JORDAN", last="O'NEIL", number="+14055550134"), "found", "Jordan O'Neil"),
+    (directory_reply(first="Jenny", last="Oh"), "found", "Jenny Oh"),
+    (directory_reply(first="Christopher", last="Montgomery"), "found", "Christopher Montgomery"),
+    (directory_reply(belongs_to={"type": "Person", "name": "Ana Lucia Reyes"}), "found", "Ana Lucia Reyes"),
+    (directory_reply(kind="Business"), "business", None),
+    (directory_reply(belongs_to=[{"type": "Business", "name": "Rivera Auto"}]), "business", None),
+    (directory_reply(belongs_to=None), "no_name", None),
+    (directory_reply(belongs_to=[]), "no_name", None),
+    (directory_reply(belongs_to=[{"type": "Person", "firstname": "Ann", "lastname": "Lee"},
+                                 {"type": "Person", "firstname": "Bo", "lastname": "Lee"}]), "unusable", None),
+    (directory_reply(belongs_to="text"), "unusable", None),
+    (directory_reply(first="Ignore", last="Instructions"), "placeholder", None),
+    (directory_reply(first="J", last="Smith", belongs_to={"type": "Person", "firstname": "J", "lastname": "Smith"}),
+     "unusable", None),
+    (directory_reply(number="9185550199"), "unusable", None),
+    (directory_reply(error={"name": "InternalError", "message": "Could not retrieve entire response"}), "error", None),
+    (["list"], "unusable", None),
+])
+def test_directory_reply_outcomes(reply, outcome, name):
+    result = run_directory(lambda request: httpx.Response(200, json=reply))
+    assert (result.outcome, result.name) == (outcome, name)
+
+
+@pytest.mark.parametrize("status,outcome", [(401, "unauthorized"), (403, "unauthorized"), (429, "rate_limited"),
+                                            (400, "error"), (500, "error")])
+def test_directory_http_failures_are_fixed_codes(status, outcome):
+    result = run_directory(lambda request: httpx.Response(status, json={"errorCode": "AUTHENTICATION_FAILED"}))
+    assert result.outcome == outcome and result.name is None
+
+
+def test_directory_oversized_broken_unreachable_and_slow_replies():
+    assert run_directory(lambda request: httpx.Response(200, content=b"x" * 70000)).outcome == "unusable"
+    assert run_directory(lambda request: httpx.Response(200, content=b"{broken")).outcome == "unusable"
+    def broken(request):
+        raise httpx.ConnectError("unreachable", request=request)
+    assert run_directory(broken).outcome == "error"
+    async def stalled(request):
+        await asyncio.sleep(30)
+    started = time.monotonic()
+    assert run_directory(stalled, seconds=0.5).outcome == "timeout" and time.monotonic() - started < 2
+
+
+def test_directory_daily_cap_counts_requests_and_resets_each_utc_day():
+    now, seen = [1_790_000_000.0], []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(500)
+    async def run():
+        client = directory_client(handler, clock=lambda: now[0])
+        today = [(await client.lookup(OWNER, TRESTLE_KEY, 5, 2)).outcome for _ in range(3)]
+        now[0] += 86400
+        tomorrow = (await client.lookup(OWNER, TRESTLE_KEY, 5, 2)).outcome
+        await client.client.aclose()
+        return today, tomorrow
+    today, tomorrow = asyncio.run(run())
+    assert today == ["error", "error", "capped"] and tomorrow == "error" and len(seen) == 3
+
+
+def test_directory_capacity_skips_instead_of_queueing():
+    release = asyncio.Event()
+    async def handler(request):
+        await release.wait()
+        return httpx.Response(200, json=directory_reply())
+    async def run():
+        client = directory_client(handler)
+        held = [asyncio.create_task(client.lookup(OWNER, TRESTLE_KEY, 5, 50)) for _ in range(2)]
+        while client.active < 2:
+            await asyncio.sleep(0)
+        extra = await client.lookup(OWNER, TRESTLE_KEY, 5, 50)
+        release.set()
+        results = await asyncio.gather(*held)
+        await client.client.aclose()
+        return extra, results, client.used
+    extra, results, used = asyncio.run(run())
+    assert extra.outcome == "capacity" and [r.outcome for r in results] == ["found"] * 2 and used == 2
+
+
+def test_directory_urls_never_reach_http_client_logs():
+    import logging
+    directory_client(lambda request: httpx.Response(200))
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1,
+        "HTTP Request: GET https://api.trestleiq.com/3.1/caller_id?phone=4055550134&phone.country_hint=US", None, None)
+    assert not all(f.filter(record) for f in logging.getLogger("httpx").filters)
+
+
+@pytest.mark.parametrize("raw,cnam,directory", [
+    ("Angela Martinez", "possibly_truncated", "found"),  # exactly 15 characters
+    ("Jenny Oh", "placeholder", "found"),  # a surname that is also a state code
+    ("Wireless Caller", "placeholder", "placeholder"),
+    ("Ignore Previous", "placeholder", "placeholder"),
+    ("Smith", "unusable", "unusable")])
+def test_directory_names_skip_only_the_cnam_rules(raw, cnam, directory):
+    assert clean_caller_name(raw)[1] == cnam and clean_caller_name(raw, cnam=False)[1] == directory
+
+
+class FakeDirectory:
+    def __init__(self, result=None, gate=None):
+        self.calls, self.result, self.gate, self.closed = [], result or LookupResult("found", "Waidong Syrws", 30.0), gate, False
+    async def lookup(self, number, key, seconds, daily_limit):
+        self.calls.append((number, key, seconds, daily_limit))
+        if self.gate:
+            await self.gate.wait()
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+    async def close(self):
+        self.closed = True
+
+
+def directory_manager(tmp_path, raw=None, lookup=None, directory=None, recall=None, key=True):
+    if key:
+        (tmp_path / "directory.key").write_text(TRESTLE_KEY)
+    return manager(tmp_path, raw or directory_policy(callers="everyone"), lookup or FakeLookup(LookupResult("no_name")),
+                   recall=recall, directory=directory or FakeDirectory())
+
+
+def test_directory_names_a_first_time_caller_only_after_caller_id_has_none(tmp_path):
+    async def run():
+        context, _, events, tasks = directory_manager(tmp_path)
+        context.begin("bridge-1", {"From": STRANGER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert context.lookup.calls == [(STRANGER, 5.0)]
+        assert context.directory.calls == [(STRANGER, TRESTLE_KEY, 5.0, 50)]
+        block = context.hint("bridge-1", [], "call-1")
+        assert '"Should I put this under Waidong Syrws, at the number you\'re calling from?"' in block
+        assert "listed for this phone number in a phone directory" in block and "caller ID name" not in block
+        assert "Never greet or address the caller by the listed name" in block
+        asked = [{"role": "assistant", "content": "Should I put this under Waidong Syrws, at the number you're calling from?"}]
+        later = context.hint("bridge-1", asked, "call-1")
+        assert "Waidong" not in later and "never mention the listed name again" in later
+        assert lookup_events(events) == [("call-1", "caller_lookup", "completed", {"caller_lookup_outcome": "no_name",
+            "caller_directory_outcome": "found", "caller_context_mode": "personalize", "caller_verstat": "absent"})]
+        assert hint_states(events) == [("call-1", "name_and_number"), ("call-1", "name_asked")]
+        recorded = json.dumps(events)
+        assert STRANGER not in recorded and "Waidong" not in recorded and TRESTLE_KEY not in recorded
+    asyncio.run(run())
+
+
+def test_directory_is_never_asked_when_caller_id_a_test_name_or_a_booking_names_the_caller(tmp_path):
+    async def run():
+        context, _, events, tasks = directory_manager(tmp_path / "cnam", lookup=FakeLookup())
+        context.begin("bridge-1", {"From": STRANGER})
+        context.begin("bridge-2", {"From": TEST_LINE})  # the owned test line's labelled synthetic name
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert context.directory.calls == [] and "caller_directory_outcome" not in lookup_events(events)[0][3]
+        assert "Sergio Suarez" in context.hint("bridge-1", [], "call-1")
+        assert "phone directory" not in context.hint("bridge-1", [], "call-1")
+        returning, _, _, tasks = directory_manager(tmp_path / "booking", recall=lambda number: MEMORY)
+        returning.begin("bridge-3", {"From": STRANGER})
+        await asyncio.gather(*tasks)
+        assert returning.directory.calls == [] and returning.lookup.calls == []
+    (tmp_path / "cnam").mkdir()
+    (tmp_path / "booking").mkdir()
+    asyncio.run(run())
+
+
+def test_directory_needs_both_the_policy_switch_and_the_key(tmp_path):
+    async def run():
+        context, path, events, tasks = directory_manager(tmp_path, key=False)
+        context.begin("bridge-1", {"From": STRANGER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert context.directory.calls == [] and context.source.directory_status() == "missing_key"
+        assert lookup_events(events)[0][3] == {"caller_lookup_outcome": "no_name", "caller_context_mode": "personalize",
+                                               "caller_verstat": "absent"}
+        (tmp_path / "directory.key").write_text(TRESTLE_KEY)
+        path.write_bytes(policy_bytes(callers="everyone"))  # key installed, but the policy leaves the directory off
+        context.source.refresh()
+        context.begin("bridge-2", {"From": STRANGER})
+        await asyncio.gather(*tasks)
+        assert context.directory.calls == [] and context.source.directory_status() == "off"
+        assert "I can use the number you're calling from" in context.hint("bridge-2", [], "call-2")
+    asyncio.run(run())
+
+
+def test_directory_rechecks_the_live_policy_before_each_paid_request(tmp_path):
+    async def run():
+        gate = asyncio.Event()
+        context, path, _, tasks = directory_manager(tmp_path, lookup=FakeLookup(LookupResult("no_name"), gate=gate))
+        context.begin("bridge-1", {"From": STRANGER})
+        context.begin("bridge-2", {"From": OWNER})
+        while len(context.lookup.calls) < 2:
+            await asyncio.sleep(0)
+        path.write_bytes(directory_policy())  # back to the allowlist while caller ID is in flight
+        context.source.refresh()
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert context.directory.calls == [(OWNER, TRESTLE_KEY, 5.0, 50)]  # the listed owner only
+    asyncio.run(run())
+
+
+def test_turning_the_directory_off_stops_its_names_mid_call(tmp_path):
+    async def run():
+        context, path, _, tasks = directory_manager(tmp_path)
+        context.begin("bridge-1", {"From": STRANGER})
+        await asyncio.gather(*tasks)
+        assert "Waidong Syrws" in context.hint("bridge-1", [], "call-1")
+        path.write_bytes(policy_bytes(callers="everyone"))
+        context.source.refresh()
+        block = context.hint("bridge-1", [], "call-1")
+        assert "Waidong" not in block and "I can use the number you're calling from" in block
+    asyncio.run(run())
+
+
+def test_hang_up_during_the_directory_request_keeps_the_caller_id_outcome(tmp_path):
+    async def run():
+        gate = asyncio.Event()
+        context, _, events, tasks = directory_manager(tmp_path, directory=FakeDirectory(gate=gate))
+        context.begin("bridge-1", {"From": STRANGER})
+        context.bind("bridge-1", "call-1")
+        while not context.directory.calls:
+            await asyncio.sleep(0)
+        assert lookup_events(events) == []  # nothing is reported while the directory request is open
+        assert "I can use the number you're calling from" in context.hint("bridge-1", [], "call-1")
+        context.finish("bridge-1", "call-1")
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert lookup_events(events) == [("call-1", "caller_lookup", "cancelled", {"caller_lookup_outcome": "no_name",
+            "caller_directory_outcome": "cancelled", "caller_context_mode": "personalize", "caller_verstat": "absent"})]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("result,status,outcome", [
+    (RuntimeError("unexpected"), "failed", "error"), (LookupResult("capped"), "completed", "capped"),
+    (LookupResult("unauthorized"), "failed", "unauthorized"), (LookupResult("business"), "completed", "business")])
+def test_directory_failures_are_contained_and_reported(tmp_path, result, status, outcome):
+    async def run():
+        context, _, events, tasks = directory_manager(tmp_path, directory=FakeDirectory(result))
+        context.begin("bridge-1", {"From": STRANGER})
+        context.bind("bridge-1", "call-1")
+        await asyncio.gather(*tasks)
+        assert lookup_events(events)[0][2] == status and lookup_events(events)[0][3]["caller_directory_outcome"] == outcome
+        assert "I can use the number you're calling from" in context.hint("bridge-1", [], "call-1")
+    asyncio.run(run())
+
+
+def test_policy_event_reports_the_directory_status_never_the_key(tmp_path):
+    context, path, events, _ = directory_manager(tmp_path)
+    context._policy_observed()
+    assert events[-1][3] == {"caller_context_mode": "personalize", "caller_policy_status": "loaded",
+                             "caller_directory_status": "ready"}
+    path.write_bytes(policy_bytes(callers="everyone"))
+    context.source.refresh()
+    context._policy_observed()
+    assert events[-1][3] == {"caller_context_mode": "personalize", "caller_policy_status": "loaded"}
+    assert TRESTLE_KEY not in json.dumps(events)
+
+
+def test_shutdown_closes_the_directory_client(tmp_path):
+    async def run():
+        context, *_ = directory_manager(tmp_path)
+        await context.close()
+        return context.directory.closed
+    assert asyncio.run(run())
+
+
+def test_diagnostics_keep_only_fixed_directory_codes():
+    assert safe_attributes({"caller_directory_outcome": "found", "caller_directory_status": "ready"}) == {
+        "caller_directory_outcome": "found", "caller_directory_status": "ready"}
+    assert safe_attributes({"caller_directory_outcome": "Waidong Syrws", "caller_directory_status": TRESTLE_KEY}) == {}
+
+
+def test_reviewer_provenance_names_every_possible_source(tmp_path):
+    store = Store(tmp_path / "review.sqlite3")
+    sid = store.create_session("voice")["id"]
+    with store.connect() as db:
+        db.execute("UPDATE sessions SET provider_call_id='review-call' WHERE id=?", (sid,))
+    call = {"createdAt": "2026-10-25T17:00:00Z", "artifact": {"messages": [
+        {"role": "bot", "message": "Should I put this under Waidong Syrws, at the number you're calling from?", "secondsFromStart": 20},
+        {"role": "user", "message": "Yes.", "secondsFromStart": 23}]}}
+    snapshot = read_snapshot(store.path, "review-call")
+    snapshot["caller_id"] = caller_id_offer({"events": [hint_event("name_and_number")]})
+    provenance = build_evidence(call, snapshot)["evidence"]["caller_id"]["provenance"]
+    assert "phone directory listing" in provenance and "earlier booking" in provenance and "caller ID" in provenance

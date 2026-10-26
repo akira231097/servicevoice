@@ -3,18 +3,20 @@
 The calling number comes only from Twilio's signed incoming-call webhook. For a
 number on the private allowlist, or every eligible caller when the policy says
 "everyone", a background task first checks this number's earlier bookings and
-otherwise makes one Twilio Lookup caller-name request; call admission, the
-greeting and every answer proceed without waiting for it. Results stay in
-memory for that call only.
+otherwise makes one Twilio Lookup caller-name request. When that gives no usable
+name and the policy enables it, one paid phone-directory request (Trestle Caller
+Identification) follows. Call admission, the greeting and every answer proceed
+without waiting for any of it. Results stay in memory for that call only.
 
-A caller-ID name is an unverified hint from the phone network: it is the line
-owner's listing, never identity, consent or authentication. An earlier booking
+A caller-ID or directory name is an unverified hint: it is the line owner's
+listing, never identity, consent or authentication. An earlier booking
 is the stronger hint, but the number may have changed hands, so its vehicle and
 other details are withheld from the assistant until the name has been offered
 and are used only if the caller confirms it. The assistant offers a name once,
 at the point where it would otherwise ask for the caller's name and callback
 number. Diagnostics record fixed codes only, never the number, the name, the
-vehicle or the provider response.
+vehicle or the provider response. From a directory response only the listed
+person's name is read; addresses, ages and every other field are discarded.
 """
 from __future__ import annotations
 
@@ -41,6 +43,13 @@ POLICY_POLL_SECONDS = 2.0
 MAX_POLICY_BYTES = 65536
 MAX_LOOKUP_BYTES = 16384
 MAX_LOOKUP_SECONDS = 10.0
+# Optional paid phone-to-name directory (Trestle Caller Identification API).
+DIRECTORY_URL = "https://api.trestleiq.com/3.1/caller_id"
+DIRECTORY_KEY_FILE = "directory.key"  # beside the policy file; absent means the directory is never called
+DIRECTORY_CAPACITY = 2
+DEFAULT_DIRECTORY_DAILY_LIMIT = 50
+MAX_DIRECTORY_BYTES = 65536
+MAX_KEY_BYTES = 512
 # The longest Vapi call here is ten minutes; anything older was never finished.
 STALE_CALL_SECONDS = 900
 ENDED_MEMORY = 256
@@ -109,12 +118,14 @@ def _title(token):
     return word
 
 
-def clean_caller_name(raw, caller_type=None):
+def clean_caller_name(raw, caller_type=None, *, cnam=True):
     """Return (display name, outcome). The name is None unless it is clearly a person's name.
 
     CNAM listings hold at most 15 characters, are often uppercase and are often
     placeholders such as WIRELESS CALLER or a city and state. Only an explicit
     comma establishes surname-first order; otherwise the listed order is kept.
+    ``cnam=False`` (a directory's structured person name) skips the two
+    CNAM-only rules: the 15-character cut and the "City ST" listing.
     """
     if caller_type == "BUSINESS":
         return None, "business"
@@ -133,9 +144,9 @@ def clean_caller_name(raw, caller_type=None):
     words = [w.strip(".") for w in words]
     if any(w.upper().replace("'", "").replace("-", "") in _NOT_A_PERSON for w in words if w):
         return None, "placeholder"
-    if len(words) >= 2 and words[-1].upper() in _STATES:
+    if cnam and len(words) >= 2 and words[-1].upper() in _STATES:
         return None, "placeholder"
-    if 15 in (len(raw), len(raw.strip())):
+    if cnam and 15 in (len(raw), len(raw.strip())):
         return None, "possibly_truncated"  # the CNAM field limit; the last word may be cut
     # Titles and suffixes are dropped, never spoken: no gender or rank is guessed.
     tokens = [w for w in words if len(w) > 1 and w.upper() not in _SUFFIXES | _TITLES]
@@ -178,15 +189,22 @@ class CallerPolicy:
     lookup_seconds: float = DEFAULT_LOOKUP_SECONDS
     status: str = "loaded"
     everyone: bool = False  # True: every eligible caller, not only the allowlist
+    directory: str = "off"  # "trestle": a paid name directory after bookings and CNAM
+    directory_daily_limit: int = DEFAULT_DIRECTORY_DAILY_LIMIT
 
 
 def parse_policy(raw):
     """Strict private policy: mode, who is looked up, lookup deadline and HMAC digests of listed numbers."""
     value = json.loads(raw.decode("utf-8"))
-    if (not isinstance(value, dict) or set(value) - {"schema", "mode", "callers", "lookup_seconds", "allow"}
+    if (not isinstance(value, dict)
+            or set(value) - {"schema", "mode", "callers", "lookup_seconds", "allow", "directory", "directory_daily_limit"}
             or value.get("schema") != POLICY_SCHEMA or value.get("mode") not in MODES
-            or value.get("callers", "allowlist") not in ("allowlist", "everyone")):
+            or value.get("callers", "allowlist") not in ("allowlist", "everyone")
+            or value.get("directory", "off") not in ("off", "trestle")):
         raise ValueError("caller_policy_schema")
+    limit = value.get("directory_daily_limit", DEFAULT_DIRECTORY_DAILY_LIMIT)
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("caller_policy_bounds")
     seconds = value.get("lookup_seconds", DEFAULT_LOOKUP_SECONDS)
     allow = value.get("allow", [])
     if type(seconds) not in (int, float) or not 0.5 <= seconds <= MAX_LOOKUP_SECONDS or not isinstance(allow, list) or len(allow) > 16:
@@ -205,16 +223,23 @@ def parse_policy(raw):
             if label != "owned_test" or outcome != "found":
                 raise ValueError("caller_policy_fixture")
         entries[digest] = AllowEntry(label, fixture)
-    return CallerPolicy(value["mode"], entries, float(seconds), everyone=value.get("callers") == "everyone")
+    return CallerPolicy(value["mode"], entries, float(seconds), everyone=value.get("callers") == "everyone",
+                        directory=value.get("directory", "off"), directory_daily_limit=limit)
 
 
 class PolicySource:
-    """The private policy file, reread off the call path whenever it changes. Fails closed."""
+    """The private policy file, reread off the call path whenever it changes. Fails closed.
+
+    The optional directory's API key is its own file beside the policy, so it can
+    be installed or removed without a restart and never appears in the policy.
+    """
 
     def __init__(self, path, key):
         self.path, self._key = Path(path), key.encode("utf-8")
+        self.key_path = self.path.parent / DIRECTORY_KEY_FILE
         self.current = CallerPolicy(status="pending")
-        self.stamp = None
+        self.stamp = self.key_stamp = None
+        self._directory_key, self.key_status = None, "missing"
 
     @classmethod
     def from_settings(cls, settings):
@@ -230,15 +255,46 @@ class PolicySource:
     def digest(self, number):
         return hmac.new(self._key, number.encode("ascii"), hashlib.sha256).hexdigest()
 
+    def directory_key(self):
+        """The directory's API key while the live policy enables the directory, else None."""
+        return self._directory_key if self.current.directory == "trestle" else None
+
+    def directory_status(self):
+        if self.current.directory == "off":
+            return "off"
+        return {"present": "ready", "missing": "missing_key"}.get(self.key_status, "invalid_key")
+
+    def _refresh_key(self):
+        try:
+            info = self.key_path.stat()
+            stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        except OSError:
+            info = stamp = None
+        if stamp is not None and stamp == self.key_stamp:
+            return False
+        key, status = None, "missing"
+        if info is not None:
+            try:
+                raw = self.key_path.read_bytes() if info.st_size <= MAX_KEY_BYTES else b""
+            except OSError:
+                raw, stamp = b"", None  # unreadable: no directory requests; retried on the next poll
+            text = raw.decode("ascii", "replace").strip()
+            usable = 16 <= len(text) <= 256 and all(33 <= ord(c) <= 126 for c in text)
+            key, status = (text, "present") if usable else (None, "invalid")
+        changed = status != self.key_status or key != self._directory_key
+        self._directory_key, self.key_status, self.key_stamp = key, status, stamp
+        return changed
+
     def refresh(self):
-        """Blocking file read; returns True when the effective policy changed. Never raises."""
+        """Blocking file reads; returns True when the effective policy or key changed. Never raises."""
+        key_changed = self._refresh_key()
         try:
             info = self.path.stat()
             stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
         except OSError:
             info = stamp = None
         if stamp is not None and stamp == self.stamp:
-            return False
+            return key_changed
         if info is None:
             policy = CallerPolicy(status="missing")
         else:
@@ -252,11 +308,12 @@ class PolicySource:
                 policy = CallerPolicy(status="invalid")
         changed = policy != self.current
         self.current, self.stamp = policy, stamp
-        return changed
+        return changed or key_changed
 
     def fail_closed(self):
         changed = self.current.status != "invalid" or self.current.mode != "off"
         self.current, self.stamp = CallerPolicy(status="invalid"), None
+        self._directory_key, self.key_status, self.key_stamp = None, "missing", None
         return changed
 
 
@@ -268,11 +325,12 @@ class LookupResult:
 
 
 class _HideLookupRequests(logging.Filter):
-    """httpx logs request URLs at INFO, and a Lookup URL contains the caller's number."""
+    """httpx logs request URLs at INFO, and a Lookup or directory URL contains the caller's number."""
 
     def filter(self, record):
         try:
-            return "lookups.twilio.com" not in record.getMessage()
+            message = record.getMessage()
+            return "lookups.twilio.com" not in message and "api.trestleiq.com" not in message
         except Exception:
             return False
 
@@ -280,19 +338,23 @@ class _HideLookupRequests(logging.Filter):
 _LOG_FILTER = _HideLookupRequests()
 
 
+def _lookup_client(client, capacity):
+    for name in ("httpx", "httpcore"):
+        if _LOG_FILTER not in logging.getLogger(name).filters:
+            logging.getLogger(name).addFilter(_LOG_FILTER)
+    # Separate from the conference client: a lookup must never delay a cue.
+    # Per-phase timeouts sit above the policy's longest total deadline.
+    return client or httpx.AsyncClient(timeout=httpx.Timeout(MAX_LOOKUP_SECONDS + 2, connect=3),
+        follow_redirects=False, trust_env=False,
+        limits=httpx.Limits(max_connections=capacity, max_keepalive_connections=capacity, keepalive_expiry=30))
+
+
 class CallerNameLookup:
     """Twilio Lookup caller-name requests on their own bounded pool. No retries, no queue."""
 
     def __init__(self, key_sid, key_secret, *, client=None, capacity=LOOKUP_CAPACITY):
         self._auth = (key_sid, key_secret)
-        for name in ("httpx", "httpcore"):
-            if _LOG_FILTER not in logging.getLogger(name).filters:
-                logging.getLogger(name).addFilter(_LOG_FILTER)
-        # Separate from the conference client: a lookup must never delay a cue.
-        # Per-phase timeouts sit above the policy's longest total deadline.
-        self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(MAX_LOOKUP_SECONDS + 2, connect=3),
-            follow_redirects=False, trust_env=False,
-            limits=httpx.Limits(max_connections=capacity, max_keepalive_connections=capacity, keepalive_expiry=30))
+        self.client = _lookup_client(client, capacity)
         self.owns_client = client is None
         self.capacity, self.active = capacity, 0
 
@@ -351,6 +413,106 @@ class CallerNameLookup:
         return LookupResult(outcome, name)
 
 
+class DirectoryLookup:
+    """Paid Trestle Caller Identification requests: own small pool, a daily cap, no retries, no queue.
+
+    Only ``belongs_to`` is read, and from it only the listing type and the
+    person's name. Addresses, age, gender and every other field are discarded.
+    """
+
+    def __init__(self, *, client=None, capacity=DIRECTORY_CAPACITY, clock=time.time):
+        self.client = _lookup_client(client, capacity)
+        self.owns_client = client is None
+        self.capacity, self.active = capacity, 0
+        self.clock, self.day, self.used = clock, None, 0
+
+    async def close(self):
+        if self.owns_client:
+            await self.client.aclose()
+
+    def _within_daily_limit(self, limit):
+        """Counts every request made this UTC day, answered or not. A lane restart resets the count."""
+        day = time.gmtime(self.clock())[:3]
+        if day != self.day:
+            self.day, self.used = day, 0
+        if self.used >= limit:
+            return False
+        self.used += 1
+        return True
+
+    async def lookup(self, number, key, seconds, daily_limit):
+        if self.active >= self.capacity:
+            return LookupResult("capacity")
+        if not self._within_daily_limit(daily_limit):
+            return LookupResult("capped")
+        self.active += 1
+        started = time.monotonic()
+        try:
+            result = await self._request(number, key, seconds)
+        finally:
+            self.active -= 1
+        result.elapsed_ms = round((time.monotonic()-started)*1000, 3)
+        return result
+
+    async def _request(self, number, key, seconds):
+        try:
+            async with asyncio.timeout(seconds):
+                # The provider's documented local form with a US hint. No paid add-ons.
+                async with self.client.stream("GET", DIRECTORY_URL, params={"phone": number[2:], "phone.country_hint": "US"},
+                                              headers={"x-api-key": key, "accept": "application/json"},
+                                              follow_redirects=False) as response:
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_DIRECTORY_BYTES:
+                            return LookupResult("unusable")
+                    status = response.status_code
+        except (TimeoutError, httpx.TimeoutException):
+            return LookupResult("timeout")
+        except httpx.HTTPError:
+            return LookupResult("error")
+        if status in (401, 403):
+            return LookupResult("unauthorized")  # also a disabled key or an empty prepaid balance
+        if status == 429:
+            return LookupResult("rate_limited")  # the per-second limit or the billing-cycle quota
+        if status != 200:
+            return LookupResult("error")
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeError):
+            return LookupResult("unusable")
+        if not isinstance(data, dict):
+            return LookupResult("unusable")
+        if data.get("error"):
+            return LookupResult("error")  # the provider reports partial failures inside a 200 response
+        listed = data.get("phone_number")
+        if isinstance(listed, str) and re.sub(r"\D", "", listed)[-10:] != number[2:]:
+            return LookupResult("unusable")
+        return self._listed_name(data.get("belongs_to"))
+
+    @staticmethod
+    def _listed_name(owners):
+        # The reference documents one highest-ranked owner but labels the field a list.
+        owners = [owners] if isinstance(owners, dict) else owners
+        if not owners:
+            return LookupResult("no_name")
+        if not isinstance(owners, list):
+            return LookupResult("unusable")
+        kinds = [str(o.get("type")).lower() if isinstance(o, dict) else None for o in owners]
+        people = [o for o, kind in zip(owners, kinds) if kind == "person"]
+        if not people:
+            return LookupResult("business" if "business" in kinds else "no_name")
+        if len(people) > 1:
+            return LookupResult("unusable")  # several people listed: which one is calling is unknown
+        first, last = people[0].get("firstname"), people[0].get("lastname")
+        if isinstance(first, str) and isinstance(last, str) and first.strip() and last.strip():
+            raw = first.strip() + " " + last.strip()  # leaves out a middle name
+        else:
+            raw = people[0].get("name")
+        name, outcome = clean_caller_name(raw, cnam=False)
+        return LookupResult(outcome, name)
+
+
 def _mentioned(text, name):
     """Whether assistant text used the hinted name, including a shortened proper-noun use.
 
@@ -406,12 +568,13 @@ def _returning_block(number, memory, messages):
             "are calling from." + NAME_RULE + shared), "returning_name"
 
 
-def caller_block(number, name, messages, memory=None):
+def caller_block(number, name, messages, memory=None, *, directory=False):
     """Prompt text for the phone assistant from call history, with its hint state.
 
     State comes from what Vapi reports as said, not from generated drafts, so a
     cancelled speculative reply can never count as the question being asked.
     ``memory`` (a returning caller's earlier booking) takes precedence over caller ID.
+    ``directory`` marks ``name`` as a phone-directory listing rather than caller ID.
     """
     if memory:
         return _returning_block(number, memory, messages)
@@ -422,24 +585,31 @@ def caller_block(number, name, messages, memory=None):
               f"calling number {digits}")
     shared = (" If asked how you know their name or number, say it came up on caller ID. Caller ID is not identity "
               "verification. These caller ID details may be real; the synthetic-details note does not apply to them.")
+    label, listing, named = "caller ID name", f'caller ID name "{name}"', shared
+    if directory:
+        # A paid listing for this number, not the network's caller ID: the caller is told so if they ask.
+        label, listing = "listed name", f'name listed for this number in a phone directory "{name}"'
+        named = (" If asked how you know their number, say it came up on caller ID; if asked how you know their name, "
+                 "say it is listed for this phone number in a phone directory. Neither is identity verification. "
+                 "These details may be real; the synthetic-details note does not apply to them.")
     said = [m.get("content") or "" for m in messages if m.get("role") == "assistant"]
     if name and any(_mentioned(text, name) for text in said):
-        return (header + ". You already asked about the caller ID name: use only a name the caller agreed to or "
-                "gave you, and never mention the caller ID name again. Unless the caller also turned down the number, "
+        return (header + f". You already asked about the {label}: use only a name the caller agreed to or "
+                f"gave you, and never mention the {label} again. Unless the caller also turned down the number, "
                 "offer \"the number you're calling from\" for the callback instead of asking them to recite one. If "
-                f"they agree to it, the callback number is {digits}." + NAME_RULE + shared), "name_asked"
+                f"they agree to it, the callback number is {digits}." + NAME_RULE + named), "name_asked"
     if any("calling from" in text.lower() for text in said):
         # The name step already happened without a name (for example the
         # lookup finished late): never introduce a caller-ID name afterwards.
         return (header + ". You already offered the number they are calling from: use a name only as the caller "
                 f"gave it, and if they agreed to that number, the callback number is {digits}." + shared), "number_offered"
     if name:
-        return (header + f'; caller ID name "{name}".\nWhen you are ready to collect the caller\'s name and callback '
+        return (header + f'; {listing}.\nWhen you are ready to collect the caller\'s name and callback '
                 f'number for a booking, ask only: "Should I put this under {name}, at the number you\'re calling from?" '
                 f"If the caller agrees, use that name and callback number {digits}. If they decline or correct either, "
                 "use what they said. If they already told you their name, use theirs and only offer the number they are "
-                "calling from. Never greet or address the caller by the caller ID name and never use it before they "
-                "agree." + NAME_RULE + shared), "name_and_number"
+                f"calling from. Never greet or address the caller by the {label} and never use it before they "
+                "agree." + NAME_RULE + named), "name_and_number"
     return (header + ".\nWhen you are ready to collect the caller's name and callback number for a booking, ask: "
             "\"May I have your name? I can use the number you're calling from.\" If the caller agrees, use callback "
             f"number {digits}; if they give another number, use theirs." + shared), "number_only"
@@ -461,17 +631,23 @@ class CallerState:
     reported: bool = False
     hint_state: str | None = None
     memory: dict | None = field(default=None, repr=False)  # a returning caller's earlier booking
+    directory_outcome: str = "not_called"
+    source: str = "caller_id"  # where the name came from: caller_id, directory or booking
+
+
+_LOOKUP_COMPLETED = frozenset({"found", "fixture", "returning", "no_name", "business", "placeholder", "possibly_truncated"})
 
 
 class CallerContext:
     """Per-process owner of the policy, background lookups and call-scoped hints.
 
     ``recall(number)`` (optional, blocking) returns this number's earlier booking
-    as {"name", "vehicle", ...} or None; it runs in a worker thread.
+    as {"name", "vehicle", ...} or None; it runs in a worker thread. ``directory``
+    (optional) is a DirectoryLookup, asked only when the live policy enables it.
     """
 
-    def __init__(self, source, lookup, *, spawn, observe, recall=None):
-        self.source, self.lookup = source, lookup
+    def __init__(self, source, lookup, *, spawn, observe, recall=None, directory=None):
+        self.source, self.lookup, self.directory = source, lookup, directory
         self.spawn, self.observe, self.recall = spawn, observe, recall
         self.calls = {}
         self.ended = {}  # Finished bridges: a late duplicate webhook never restarts one.
@@ -501,8 +677,10 @@ class CallerContext:
 
     def _policy_observed(self):
         policy = self.source.current
-        self.observe("twilio-caller-policy", "caller_policy", "observed",
-                     {"caller_context_mode": policy.mode, "caller_policy_status": policy.status})
+        attributes = {"caller_context_mode": policy.mode, "caller_policy_status": policy.status}
+        if policy.directory != "off":
+            attributes["caller_directory_status"] = self.source.directory_status()  # never the key itself
+        self.observe("twilio-caller-policy", "caller_policy", "observed", attributes)
 
     async def close(self):
         if self.reloader:
@@ -513,6 +691,8 @@ class CallerContext:
             self.finish(bridge_id)  # each in-progress call still gets its lookup evidence
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.lookup.close()
+        if self.directory is not None:
+            await self.directory.close()
 
     def begin(self, bridge_id, fields):
         """Called from the signed incoming-call webhook; never awaits anything."""
@@ -534,7 +714,7 @@ class CallerContext:
         state.task = self.spawn(self._lookup(state, entry.fixture_name if entry else None, policy.lookup_seconds))
 
     async def _lookup(self, state, fixture, seconds):
-        """Earlier booking first, then a labelled test name, then a Twilio caller-name lookup."""
+        """Earlier booking first, then a labelled test name, then Twilio caller name, then the optional directory."""
         started = time.monotonic()
         try:
             memory = clean_memory(await asyncio.to_thread(self.recall, state.number)) if self.recall else None
@@ -543,20 +723,44 @@ class CallerContext:
         except Exception:
             memory = None  # an unreadable booking store never blocks the caller-ID step
         if memory:
-            state.memory = memory
+            state.memory, state.source = memory, "booking"
             result = LookupResult("returning", memory["name"])
         elif fixture:
             result = LookupResult("fixture", fixture)
         else:
-            try:
-                result = await self.lookup.lookup(state.number, seconds)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                result = LookupResult("error")
+            result = await self._guarded(self.lookup.lookup, state.number, seconds)
+            key = self._directory_key(state) if result.outcome != "found" else None
+            if key:
+                # Only now is the paid directory asked; the caller-name outcome is kept for review.
+                state.outcome, state.directory_outcome = result.outcome, "pending"
+                listing = await self._guarded(self.directory.lookup, state.number, key, seconds,
+                                              self.source.current.directory_daily_limit)
+                state.directory_outcome = listing.outcome
+                if listing.outcome == "found":
+                    result, state.source = LookupResult(result.outcome, listing.name), "directory"
         state.outcome, state.name = result.outcome, result.name
         state.elapsed_ms = round((time.monotonic()-started)*1000, 3)
         self._report(state)
+
+    @staticmethod
+    async def _guarded(request, *args):
+        try:
+            return await request(*args)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return LookupResult("error")
+
+    @staticmethod
+    def _eligible(state, policy):
+        return state.number is not None and (state.digest in policy.allow or policy.everyone and state.label == "caller")
+
+    def _directory_key(self, state):
+        """The directory key, only while the live policy enables the directory for this caller."""
+        policy = self.source.current
+        if self.directory is None or policy.mode == "off" or not self._eligible(state, policy):
+            return None
+        return self.source.directory_key()
 
     def bind(self, bridge_id, call_id):
         """Vapi admission named the call: lookup evidence belongs to that call's review."""
@@ -566,18 +770,22 @@ class CallerContext:
             self._report(state)
 
     def _report(self, state):
-        if state.reported or state.call_id is None or state.outcome == "pending":
+        if state.reported or state.call_id is None or "pending" in (state.outcome, state.directory_outcome):
             return
         state.reported = True
-        self._lookup_observed(state.call_id, state.outcome, state.mode, state.verstat, state.elapsed_ms)
+        self._lookup_observed(state.call_id, state.outcome, state.mode, state.verstat, state.elapsed_ms,
+                              state.directory_outcome)
 
-    def _lookup_observed(self, call_id, outcome, mode, verstat, elapsed_ms=None):
-        status = ("completed" if outcome in {"found", "fixture", "returning", "no_name", "business", "placeholder", "possibly_truncated"}
-                  else "not_applicable" if outcome == "withheld_or_unsupported" else "cancelled" if outcome == "cancelled"
-                  else "failed")
-        self.observe(call_id, "caller_lookup", status,
-                     {"caller_lookup_outcome": outcome, "caller_context_mode": mode, "caller_verstat": verstat},
-                     elapsed_ms)
+    def _lookup_observed(self, call_id, outcome, mode, verstat, elapsed_ms=None, directory="not_called"):
+        attributes = {"caller_lookup_outcome": outcome, "caller_context_mode": mode, "caller_verstat": verstat}
+        final = outcome
+        if directory != "not_called":
+            attributes["caller_directory_outcome"] = directory
+            if directory != "capped":
+                final = directory  # a directory request, when one was made, decides the status
+        status = ("completed" if final in _LOOKUP_COMPLETED else "not_applicable" if final == "withheld_or_unsupported"
+                  else "cancelled" if final == "cancelled" else "failed")
+        self.observe(call_id, "caller_lookup", status, attributes, elapsed_ms)
 
     def finish(self, bridge_id, call_id=None):
         self.ended[bridge_id] = True
@@ -588,7 +796,10 @@ class CallerContext:
             return
         if state.task and not state.task.done():
             state.task.cancel()
-            state.outcome = "cancelled"
+            if state.directory_outcome == "pending":
+                state.directory_outcome = "cancelled"  # the caller-name step had already finished
+            else:
+                state.outcome = "cancelled"
         state.call_id = state.call_id or call_id or bridge_id
         self._report(state)
 
@@ -596,11 +807,14 @@ class CallerContext:
         """Prompt text for this request, or None. Rechecks the live policy every time."""
         state = self.calls.get(bridge_id)
         policy = self.source.current
-        if (state is None or policy.mode != "personalize" or state.number is None
-                or not (state.digest in policy.allow or policy.everyone and state.label == "caller")):
+        if state is None or policy.mode != "personalize" or not self._eligible(state, policy):
             return None
-        name = state.name if state.outcome in ("found", "fixture", "returning") else None
-        block, hint_state = caller_block(state.number, name, messages, state.memory if state.outcome == "returning" else None)
+        # Turning the directory off also stops directory names already found, mid-call.
+        usable = (state.outcome in ("found", "fixture", "returning")
+                  or state.directory_outcome == "found" and policy.directory != "off")
+        name = state.name if usable else None
+        block, hint_state = caller_block(state.number, name, messages, state.memory if state.outcome == "returning" else None,
+                                         directory=state.source == "directory")
         if hint_state != state.hint_state:
             # Each change is recorded once; the reviewer reads these fixed codes
             # to learn that caller ID reached the assistant, never the values.

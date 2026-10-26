@@ -324,7 +324,8 @@ def build_evidence(call, snapshot, tool_ids=None):
     evidence["facts"] = dealership_facts(created.astimezone(TZ).date())
     if snapshot.get("caller_id") in ("number_only", "name_and_number", "returning_customer"):
         evidence["caller_id"] = {"available_to_assistant": snapshot["caller_id"],
-            "provenance": "phone network caller ID for this call; unverified; this item does not contain the caller-ID values"}
+            "provenance": ("caller ID, a phone directory listing or an earlier booking for this calling number; "
+                           "unverified; this item does not contain the caller-ID values")}
     evidence["state"] = {"scheduler_evidence_available":snapshot.get("source_available",True),"appointments":snapshot["appointments"],"proposals":snapshot["proposals"],
         "handoffs":snapshot["handoffs"],"pending_operations":[r for r in snapshot["operations"] if r["status"] in {"queued","running","unknown"}]}
     # Do not send DB session ids, fingerprints, tokens or provider signatures.
