@@ -204,6 +204,9 @@ def test_offline_caller_scenario_preserves_end_to_end_invariants(tmp_path,caller
     assert result['offline_fixture_deadline_seconds']==5
     assert result['production_default_ingress_deadline_seconds']==IngressLimits().deadline_seconds==1
     assert result['admission_event_retries']==0
+    assert result['gateway_wal_anchor_status']=='ready'
+    assert result['fixture_budgets']=={'default_signature_busy_ms':2000,'default_tool_response_seconds':1.5,
+        'signature_busy_ms':5000,'tool_response_seconds':5}
     assert all(result['checks'].values())
 
 
@@ -223,11 +226,14 @@ def test_contended_admission_keeps_default_deadline_failure_visible_but_isolates
     assert strict['exercise_scope']=='strict_default_deadline_offline_stress'
     assert strict['offline_fixture_deadline_seconds'] is None
     assert strict['production_default_ingress_deadline_seconds']==1
+    assert strict['fixture_budgets']=={'default_signature_busy_ms':2000,'default_tool_response_seconds':1.5,
+        'signature_busy_ms':2000,'tool_response_seconds':1.5}
     assert 504 in strict['admission_statuses'] and 'telephony_deadline' in strict['admission_errors']
     fixture=asyncio.run(exercise(tmp_path/'fixture',callers=10,offline_fixture_deadline=5))
     assert fixture['admission_statuses']=={'200':10} and fixture['admission_event_retries']==0
     assert fixture['confirmed_appointments']==1 and fixture['losing_capacity_conflicts']==9
     assert fixture['peak_fake_upstream_header_requests']==10 and all(fixture['checks'].values())
+    assert fixture['gateway_wal_anchor_status']=='ready'
     assert IngressLimits().deadline_seconds==1
 
 
@@ -254,3 +260,40 @@ def test_offline_fixture_deadline_is_explicit_and_bounded(tmp_path,deadline):
     from scripts.stress_ten_callers import exercise
     with pytest.raises(ValueError,match='Offline fixture deadline'):
         asyncio.run(exercise(tmp_path,offline_fixture_deadline=deadline))
+
+
+def test_started_fixture_preserves_signed_command_failures_without_retry(tmp_path,monkeypatch):
+    import asyncio
+    import sqlite3
+    from app.gemini_gateway import SignatureStore
+    from scripts.stress_ten_callers import exercise
+    attempts=[]
+    def fail_save(self,sid,call_id,*args,**kwargs):
+        attempts.append(call_id)
+        raise sqlite3.OperationalError('synthetic persistence failure')
+    monkeypatch.setattr(SignatureStore,'save_group',fail_save)
+    progress={}
+    with pytest.raises(AssertionError,match='Exactly one signed synthetic command.*generation_unavailable'):
+        asyncio.run(exercise(tmp_path,progress,callers=4,offline_fixture_deadline=5))
+    assert progress['gateway_wal_anchor_status']=='ready'
+    assert progress['gateway_failures'] and all(attempts.count(call)==1 for call in set(attempts))
+    assert all(row['command_count']==0 for row in progress['gateway_failures'])
+    with Store(tmp_path/'exercise.sqlite3').read_connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('error',['operation_pending','operation_unknown','status_unavailable'])
+def test_correctness_fixture_still_fails_on_unsettled_tool_results(tmp_path,monkeypatch,error):
+    import asyncio
+    from app.harness import ToolHarness
+    from scripts.stress_ten_callers import exercise
+    attempts=[]
+    async def unsettled(self,sid,name,arguments,call_id,**kwargs):
+        attempts.append((sid,call_id))
+        return {'ok':False,'error':error,'operation_id':'synthetic-pending'}
+    monkeypatch.setattr(ToolHarness,'run',unsettled)
+    with pytest.raises(AssertionError,match='Unexpected unsettled tool.*'+error):
+        asyncio.run(exercise(tmp_path,callers=4,offline_fixture_deadline=5))
+    assert len(attempts)==len(set(attempts))
+    with Store(tmp_path/'exercise.sqlite3').read_connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]==0

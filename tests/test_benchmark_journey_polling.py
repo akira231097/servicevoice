@@ -56,7 +56,9 @@ def test_unavailable_then_pending_recovers_real_receipt_with_one_booking(tmp_pat
     arguments = {"proposal_id": proposal["proposal_id"], "confirmed": True}
 
     async def scenario():
-        real = ToolHarness(store)
+        # This test deliberately withholds completed results; slow CI must not
+        # accidentally exercise the separate real execution-deadline path.
+        real = ToolHarness(store, timeout_seconds=15, status_timeout_seconds=5)
         clock, calls, committed = Clock(), [], None
 
         class WithheldStatus:

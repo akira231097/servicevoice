@@ -217,6 +217,19 @@ class Redactor:
         return value
 
 
+def caller_id_offer(diagnostics):
+    """Strongest caller-ID text the phone assistant received, from content-free events only."""
+    rows = diagnostics.get("events") if isinstance(diagnostics, dict) else None
+    states = {(row.get("attributes") or {}).get("caller_hint_state") for row in rows if isinstance(row, dict)
+              and row.get("component") == "twilio_bridge" and row.get("event") == "caller_hint"} if isinstance(rows, list) else set()
+    if states & {"returning_name", "returning_asked"}:
+        return "returning_customer"
+    # The name is withdrawn only after it was offered, so name_asked implies an earlier offer.
+    if states & {"name_and_number", "name_asked"}:
+        return "name_and_number"
+    return "number_only" if states & {"number_only", "number_offered"} else None
+
+
 def build_evidence(call, snapshot, tool_ids=None):
     """Build the judge package. ``tool_ids`` (optional dict) receives ``tool:N`` -> provider tool call id."""
     snapshot = deepcopy(snapshot)
@@ -309,6 +322,10 @@ def build_evidence(call, snapshot, tool_ids=None):
         issues.append("no_caller_transcript")
     created = datetime.fromtimestamp(snapshot["session"]["created"],timezone.utc)
     evidence["facts"] = dealership_facts(created.astimezone(TZ).date())
+    if snapshot.get("caller_id") in ("number_only", "name_and_number", "returning_customer"):
+        evidence["caller_id"] = {"available_to_assistant": snapshot["caller_id"],
+            "provenance": ("caller ID, a phone directory listing or an earlier booking for this calling number; "
+                           "unverified; this item does not contain the caller-ID values")}
     evidence["state"] = {"scheduler_evidence_available":snapshot.get("source_available",True),"appointments":snapshot["appointments"],"proposals":snapshot["proposals"],
         "handoffs":snapshot["handoffs"],"pending_operations":[r for r in snapshot["operations"] if r["status"] in {"queued","running","unknown"}]}
     # Do not send DB session ids, fingerprints, tokens or provider signatures.

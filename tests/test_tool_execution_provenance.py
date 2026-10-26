@@ -36,6 +36,11 @@ def client(tmp_path, monkeypatch):
         monkeypatch.setenv(name, value)
     module = importlib.import_module("app.main")
     with TestClient(module.create_app(tmp_path / "provenance.sqlite3")) as result:
+        # These cases assert authorization/signatures, not disk latency. Keep
+        # terminal results within the same disposable-fixture five-second
+        # allowance used by the concurrent correctness exercise. Dedicated
+        # harness deadline tests retain the production 1.5-second default.
+        result.app.state.harness.timeout_seconds = 5
         yield result
 
 

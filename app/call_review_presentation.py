@@ -96,10 +96,12 @@ CODE_LABELS = {
     "emitted": "cue played", "primary_ready": "answer ready within the head start",
     "policy_not_ready": "cue policy not ready", "context_unavailable": "call context unavailable",
     "turn_already_acknowledged": "already cued this turn", "cooldown": "too soon after the last cue",
+    "caller_continuation_too_short": "no further caller speech to acknowledge", "repeated_phrase": "avoid repeating the last hold",
     "call_budget": "cue budget for this call used up", "not_eligible": "turn not eligible for a cue",
     "sensitive_context": "sensitive context", "sensitive_utterance": "sensitive wording",
     "sensitive_prior_turn": "sensitive previous turn", "private_detail": "caller gave private details",
     "private_prior_turn": "previous turn had private details", "caller_still_formulating": "caller still formulating",
+    "caller_requested_quiet": "caller asked for quiet or a pause", "caller_turn_finished": "finished response gives priority to the waiting cue",
     "cached_language_unverified": "language not verified for the cached clips", "short_or_ambiguous": "too short or ambiguous",
     "urgent_or_safety": "urgent or safety wording", "classifier_timeout": "classifier timed out",
     "classifier_unavailable": "classifier unavailable", "low_confidence": "classifier not confident",
@@ -311,10 +313,12 @@ def generation_rows(timings):
         if total is None or started is None:
             continue
         usage = source.get("usage") if isinstance(source.get("usage"), dict) else {}
-        route = source.get("route") if source.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq") else "unknown"
+        route = source.get("route") if source.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing") else "unknown"
         generation = source.get("generation_id")
         rows[request] = {
             "request_id": request, "generation_id": generation if isinstance(generation, str) and _UUID.fullmatch(generation) else None,
+            "model": source.get("model") if route == "gemini" and isinstance(source.get("model"), str) and source["model"] in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None,
+            "reasoning_effort": source.get("reasoning_effort") if route == "gemini" and isinstance(source.get("reasoning_effort"), str) and source["reasoning_effort"] in {"low", "minimal"} else None,
             "started_at_unix": started, "total_ms": total, "route": route, "outcome": code(source.get("outcome")) or "unknown",
             "first_text_ms": number(phases.get("first_text")), "tool_emitted_ms": number(phases.get("tool_emitted")),
             "upstream_headers_ms": number(phases.get("upstream_headers")), "preflight_ms": number(phases.get("preflight")),
@@ -376,6 +380,54 @@ def diagnostic_events(diagnostics, call_key):
                      "start_unix": number(row.get("start_unix"), 1_577_836_800, 4_102_444_800),
                      "duration_ms": number(row.get("duration_ms")), "attributes": attributes})
     return rows
+
+
+def listening_summary(diagnostics, call_key):
+    from .listening_audio import VARIATIONS
+    from .backchannel_catalog import PHRASES
+    all_rows = diagnostic_events(diagnostics, call_key)
+    rows = [row for row in all_rows if row["component"] == "listening_cue"]
+    bridge = [row for row in all_rows if row["component"] == "twilio_bridge"]
+    if not rows and not bridge:
+        return None
+    allowed = {"decision", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail"}
+    rows = [row for row in rows if row["event"] in allowed]
+    phrases = {**PHRASES, **VARIATIONS}
+    intervals, opened = [], None
+    speaker_rows = sorted((r for r in bridge if r["attributes"].get("listening_reason") == "caller"
+        and r["start_unix"] is not None and r["event"] in {"speaker_started", "speaker_stopped"}), key=lambda r:r["start_unix"])
+    for row in speaker_rows:
+        if row["event"] == "speaker_started" and opened is None: opened = row["start_unix"]
+        elif row["event"] == "speaker_stopped" and opened is not None:
+            if 0 <= row["start_unix"]-opened <= 120: intervals.append((opened, row["start_unix"]))
+            opened = None
+    seconds = sum(stop-start for start, stop in intervals)
+    waiting = [r for r in all_rows if r["component"] == "gateway" and r["event"] == "backchannel.emitted"]
+    by_turn, followups = {}, {}
+    for row in waiting:
+        if row["turn_id"]:
+            by_turn[row["turn_id"]] = by_turn.get(row["turn_id"], 0)+1
+            if row["attributes"].get("backchannel_follow_up") is True:
+                followups[row["turn_id"]] = followups.get(row["turn_id"], 0)+1
+    fetched = sum(row["event"] == "clip_fetched" for row in rows)
+    return {"timeline": [{"event": row["event"], "start_unix": row["start_unix"],
+                         "phrase_id": row["attributes"].get("backchannel_phrase") if row["attributes"].get("backchannel_phrase") in phrases else None,
+                         "phrase": phrases.get(row["attributes"].get("backchannel_phrase"), "unknown"),
+                         "reason": row["attributes"].get("listening_reason", "unknown")}
+                        for row in rows],
+            "dispatched": sum(row["event"] == "dispatched" for row in rows),
+            "clip_fetches": sum(row["event"] == "clip_fetched" for row in rows),
+            "announcement_failures": sum(row["event"] == "announcement_fail" for row in rows),
+            "caller_energy_seconds": round(seconds, 3) if intervals else None,
+            "clip_fetches_per_10s_caller_energy": round(fetched*10/seconds, 3) if seconds > 0 else None,
+            "waiting_dispatches_during_caller_energy": sum(any(start <= row["start_unix"] < stop for start, stop in intervals)
+                for row in waiting if row["start_unix"] is not None) if intervals else None,
+            "duplicate_waiting_dispatches_by_gateway_turn": sum(max(0, count-1-min(1,followups.get(turn,0))) for turn,count in by_turn.items()),
+            "silent_opening_detections": sum(row["event"] == "media_suspected" for row in bridge),
+            "opening_recovery_redials": sum(row["event"] == "media_recovery_redial" for row in bridge),
+            "guarded_waiting_fallbacks": sum(row["attributes"].get("backchannel_guarded_fallback") is True for row in waiting),
+            "audible_playback": "unverified",
+            "scope": "Caller-only announcement dispatch/fetch and received Twilio speaker-event evidence. Energy is not recognized speech. Gateway turns can split a caller's thought. Captured caller audio is required to verify audibility, audible overlaps, duplicate phrases and preserved words."}
 
 
 def condense_diagnostics(diagnostics, call_key):
@@ -1015,6 +1067,17 @@ def build_review_children(trace, *, root_run_id, root_dotted_order, project_id, 
                      {"classification": span.get("classification"), "first_token_ms": span.get("first_token_ms"), "duration_ms": span.get("duration_ms"), "gateway_generation_id": None},
                      parent=group, tags=["provider-reported"]) is not None:
                 counts["provider_model_spans"] += 1
+    for index, cue in enumerate(trace.get("listening", [])):
+        if isinstance(cue, dict) and cue.get("event") == "dispatched":
+            # Frozen older exports retain their exact labels for immutable readback.
+            # New timelines carry a closed phrase id; never export arbitrary prose.
+            from .listening_audio import VARIATIONS
+            phrases = {"neutral_ack": "Mm-hmm.", "acknowledge": "I hear you.", **VARIATIONS}
+            phrase = cue.get("phrase_id") if "phrase_id" in cue else "neutral_ack"
+            phrase = phrase if isinstance(phrase, str) and phrase in phrases else None
+            child("listening", index, "listen · " + phrases.get(phrase, "unknown"), cue.get("start_unix"), cue.get("start_unix"),
+                  {"phrase": phrase}, {"status": "accepted_unverified", "scope": "Twilio REST acceptance; caller playback unverified"},
+                  tags=["listening-cue", "experimental"])
     if len(runs) > max_children:
         counts["omitted"] += len(runs) - max_children
         runs = runs[:max_children]
@@ -1037,7 +1100,7 @@ def _generation_children(child, generation, group, counts):
                  {"text": cue.get("text"), "yielded_after_ms": cue["emitted_ms"], "classifier_ms": cue.get("classifier_ms"), "follow_up": cue.get("follow_up"), "scope": "gateway yield, not audible playback"},
                  parent=group, tags=["waiting-cue"]) is not None:
             counts["cues"] += 1
-    route = generation.get("route") if generation.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq") else "unknown"
+    route = generation.get("route") if generation.get("route") in ("gemini", "deterministic_receipt", "jev_static_faq", "deterministic_closing") else "unknown"
     outcome = code(generation.get("outcome")) or "unknown"
     first_text, tool_emitted = number(generation.get("first_text_ms")), number(generation.get("tool_emitted_ms"))
     answer = answer_ms({"first_text_ms": first_text, "tool_emitted_ms": tool_emitted})
@@ -1045,6 +1108,8 @@ def _generation_children(child, generation, group, counts):
         name = "receipt readback · verified receipt, no model"
     elif route == "jev_static_faq":
         name = "static faq · Jev classifier, no model"
+    elif route == "deterministic_closing":
+        name = "explicit goodbye · native farewell, no model"
     elif outcome in _SILENT_OUTCOMES and answer is None:
         name = f"gemini · speculative request cancelled ({seconds_text(total)})"
     elif tool_emitted is not None and (first_text is None or tool_emitted <= first_text):
@@ -1063,9 +1128,17 @@ def _generation_children(child, generation, group, counts):
         outputs["usage_metadata"] = {"input_tokens": generation.get("input_tokens") if type(generation.get("input_tokens")) is int else 0,
                                      "output_tokens": generation.get("output_tokens") if type(generation.get("output_tokens")) is int else 0, "total_tokens": tokens}
     generation_id = generation.get("generation_id") if isinstance(generation.get("generation_id"), str) and _UUID.fullmatch(generation["generation_id"]) else None
+    # Missing key denotes a frozen legacy trace. An explicit null means the new
+    # projection did not observe an allowed model; do not guess one in that case.
+    model = generation.get("model", "gemini-3.8-flash") if route == "gemini" else None
+    model = model if isinstance(model, str) and model in {"gemini-3.8-flash", "gemini-3.5-flash-lite"} else None
+    if "model" in generation:
+        outputs["model"] = model
+        effort = generation.get("reasoning_effort") if route == "gemini" else None
+        outputs["reasoning_effort"] = effort if isinstance(effort, str) and effort in {"low", "minimal"} else None
     if child("generation", request, name, start, end, {"generation_id": generation_id, "route": route}, outputs, parent=group,
              run_type="llm" if route == "gemini" else "chain", tags=["gateway-generation", route],
-             metadata={"generation_id": generation_id, "model": "gemini-3.8-flash" if route == "gemini" else None, "not_an_additional_model_call": True}) is not None:
+             metadata={"generation_id": generation_id, "model": model, "not_an_additional_model_call": True}) is not None:
         counts["generations"] += 1
 
 
@@ -1094,6 +1167,21 @@ def review_metadata(report, *, call_id, environment, latency_target_ms):
 
 def feedback_rows(run_id, report):
     """Feedback a person can scan: checks score 1/0, flags, coverage, metric_* values."""
+    listening = report.get("listening_cues")
+    if isinstance(listening, dict):
+        for key, source in (("metric_listening_cues", "dispatched"), ("metric_listening_clip_fetches", "clip_fetches"),
+                ("metric_silent_opening_detections", "silent_opening_detections"), ("metric_opening_recovery_redials", "opening_recovery_redials"),
+                ("metric_waiting_dispatch_overlap", "waiting_dispatches_during_caller_energy"),
+                ("metric_duplicate_waiting_dispatches", "duplicate_waiting_dispatches_by_gateway_turn"),
+                ("metric_guarded_waiting_fallbacks", "guarded_waiting_fallbacks")):
+            value = listening.get(source)
+            if type(value) is int and value >= 0:
+                yield {"key": key, "score": value, "value": value,
+                       "comment": "Measurement of provider acceptance or clip fetch, not proof of audible playback."}
+        value = listening.get("clip_fetches_per_10s_caller_energy")
+        if type(value) in (int, float) and 0 <= value < 99999:
+            yield {"key": "metric_listening_cues_per_10s_energy", "score": value, "value": value,
+                "comment": "Clip fetches per 10s of caller energy from received Twilio speaker events; not an acoustic speech or naturalness grade."}
     checks = report.get("checks") or {}
     for key, item in checks.items():
         if not isinstance(item, dict):
@@ -1127,7 +1215,11 @@ def feedback_rows(run_id, report):
     details = (report.get("3 Turn-by-turn timeline") or {}).get("details")
     details = [d for d in details if isinstance(d, dict)] if isinstance(details, list) else []
     confidences = [d["asr_confidence"] for d in details if number(d.get("asr_confidence"), 0, 1) is not None]
+    reply_length=report.get("reply_length") or {}
     metrics = [
+        ("metric_reply_words_median", reply_length.get("median_words"), "Median ordinary reply word count; greeting, holds and verified readback/options/result turns excluded."),
+        ("metric_reply_words_max", reply_length.get("maximum_words"), "Longest ordinary reply in words; interrupted replies may be partial."),
+        ("reply_length_within_target", reply_length.get("within_20_words_fraction"), "Fraction of ordinary replies within 20 words. Complete verified readbacks and option lists are exempt; this is not a naturalness score."),
         ("metric_call_seconds", summary.get("duration_seconds"), "Call length in seconds."),
         ("metric_caller_turns", summary.get("caller_utterances"), "Caller utterances in the stored transcript."),
         ("metric_bookings", booking.get("appointment_count"), "Appointments saved on this call."),
@@ -1149,6 +1241,9 @@ def feedback_rows(run_id, report):
     ]
     for key, value, comment in metrics:
         if type(value) in (int, float) and math.isfinite(value):
-            # LangSmith accepts at most four decimal places on a feedback score.
+            # LangSmith's score is a bounded decimal, not an arbitrary metric.
+            # Keep large measured counts in value instead of failing the whole
+            # review or clipping the measurement to a misleading maximum.
             value = value if type(value) is int else round(value, 4)
-            yield {"key": key, "score": value, "value": value, "comment": "Measurement, not a score. " + comment}
+            score = value if -99999.9999 <= value <= 99999.9999 else None
+            yield {"key": key, "score": score, "value": value, "comment": "Measurement, not a score. " + comment}

@@ -33,7 +33,7 @@ def test_en_us_proposal_correction_confirmation_keep_exact_receipts_and_signatur
             assert select(env.store, env.sid, env.cid, old).reason == "newer_result"
             revised = text_of(await post(env))
             assert "2022 Toyota Camry" in revised and "2021 Toyota Camry" not in revised
-            assert "plus one; five, one, two; five, five, five; zero, one, four, two" in revised
+            assert "five one two, five five five, zero one four two" in revised
             assert env.store.snapshot(env.sid)["appointment"] is None
             if zone == "America/Los_Angeles":
                 assert "9 AM Central Daylight Time" in revised and "7 AM Pacific Daylight Time" in revised
@@ -44,7 +44,7 @@ def test_en_us_proposal_correction_confirmation_keep_exact_receipts_and_signatur
             assert result["presentation"] == corrected["presentation"] == proposal["presentation"] == context
             assert not env.sent
             rows = env.gateway.latency_snapshot(env.cid)
-            assert len(rows) == 3 and NARRATOR_VERSION == "receipt-en-2026-10-20-7"
+            assert len(rows) == 3 and NARRATOR_VERSION == "receipt-en-2026-10-25-9"
             assert all(row["route"] == "deterministic_receipt" and row["narrator_version"] == NARRATOR_VERSION for row in rows)
             assert all(row["counts"]["upstream_events"] == 0 for row in rows)
             for message in env.history:

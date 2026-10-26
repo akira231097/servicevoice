@@ -41,6 +41,8 @@ def _component(owner, entering, leaving, failures, observation, path):
 
 
 COMPONENTS = {
+    "twilio_bridge": _component("Twilio isolated lane", "Authenticated conference lifecycle", "Owned caller and SIP legs", ["join_failed", "cleanup_pending"], "Signed callbacks and REST terminal readbacks; Vapi end observed separately", "audio"),
+    "listening_cue": _component("ServiceVoice Jev and Twilio", "Fresh partial and observed speaker state", "Caller participant announcement", ["stale_partial", "provider_unavailable", "speaker_priority"], "Selection, dispatch and clip fetch; acoustic playback and overlap require captured audio", "audio"),
     "caller_device": _component("Caller device and carrier", "Microphone sound frames", "Received and played sound", ["muted_microphone", "packet_loss", "playback_failure"], "Controlled endpoint audio capture; not visible to this backend", "audio"),
     "voice_runtime": _component("Vapi and carrier", "Phone or browser audio session", "Audio transport, call events and transcripts", ["connection_failure", "call_drop", "transport_delay"], "Vapi call status, end reason and provider timing", "audio"),
     "stt": _component("Configured speech recognition provider via Vapi", "Caller audio", "Transcript events", ["misrecognized_words", "misrecognized_digits", "missing_speech"], "Provider transcript; independent audio comparison needed for accuracy", "audio"),
@@ -60,13 +62,15 @@ EVENTS = frozenset({"backchannel.selected", "backchannel.emitted", "backchannel.
     "request_finished", "generation_finished", "classification_finished", "render_finished", "http_finished", "final_transcript_received", "call_bound", "execution_finished", "receipt_observed",
     "http_response_headers", "tts.request_started", "tts.upstream_connected", "tts.first_audio_ready", "tts.audio_stream_started",
     "tts.started", "tts.first_audio", "tts.completed", "tts.failed", "tts.cancelled", "tts.request", "tts.response", "tts.error"})
+EVENTS |= frozenset({"decision", "suppressed", "dispatched", "clip_fetched", "clip_silenced", "announcement_end", "announcement_fail", "call_admitted", "cleanup_verified", "cleanup_pending"})
 OUTCOMES = frozenset({"started", "completed", "success", "failure", "rejected", "failed", "pending", "unknown", "unavailable", "cancelled", "superseded", "interrupted", "observed", "not_applicable"})
+EVENTS |= frozenset({"background_failure", "dial_failed", "listening_unavailable"})
 _ENUM_ATTRIBUTES = {
     "backchannel_language": frozenset({"cache_compatible","not_compatible","uncertain"}),
     "backchannel_phrase": frozenset({"silence","neutral_ack","acknowledge","moment","one_sec","just_a_sec","let_me_see","checking","taking_a_look"}),
     "backchannel_content_kind": frozenset({"information_question","scheduling_request","ordinary_detail","factual_correction","other"}),
     "backchannel_reason": frozenset({"emitted","primary_ready","policy_not_ready","context_unavailable","turn_already_acknowledged","cooldown","call_budget","budget_capacity","not_eligible","sensitive_context","sensitive_utterance","sensitive_prior_turn","cached_language_unverified","short_or_ambiguous","urgent_or_safety","untrusted_control_content","classifier_timeout","classifier_unavailable","low_confidence","selected","silence","invalid_context","turn_not_allowed","invalid_messages","not_final_user_turn","input_bounds","prior_context_bounds","credential_missing","classification_capacity","provider_unavailable","invalid_response","response_bounds","model_mismatch","policy_closed","classification_deadline","classifier_silence","classification_uncertain","eligible_classification","classification_unavailable"}),
-    "synthesis_source": frozenset({"pregenerated_cache","live_google"}),
+    "synthesis_source": frozenset({"pregenerated_cache","live_google","buffered_farewell"}),
     "error_code": frozenset({"none", "unknown", "invalid_arguments", "unauthorized", "authentication_rejected", "capacity_rejected", "invalid_history", "invalid_event", "deadline_exceeded", "timeout", "upstream_unavailable", "state_unavailable", "operation_pending", "operation_unknown", "operation_missing", "operation_failed", "idempotency_conflict", "harness_overloaded", "harness_closed", "session_ended", "slot_unavailable", "receipt_missing", "receipt_mismatch", "validation_error", "internal_error", "cancelled", "waiter_interrupted", "budget_exhausted", "missing_evidence", "export_failure", "quota_exhausted", "invalid_audio", "transport_error",
         "tts_resampler_unavailable", "tts_resampling_failed", "tts_upstream_missing_sample_rate", "tts_upstream_wrong_channel_count", "tts_upstream_sample_rate_changed", "tts_upstream_audio_after_completion",
         "classifier_timeout", "classifier_unavailable", "classifier_rate_limited", "classification_deadline",
@@ -90,12 +94,57 @@ _ENUM_ATTRIBUTES = {
     "tool_name": frozenset({"get_dealership_info", "begin_service_request", "search_availability", "prepare_first_available_booking", "prepare_booking", "confirm_action", "dismiss_proposal", "get_appointment", "get_session_context", "get_operation", "prepare_reschedule", "prepare_cancellation", "request_handoff", "withdraw_handoff", "unknown_tool"}),
 }
 _ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"scheduler_changed", "private_detail", "private_prior_turn", "caller_still_formulating"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"speaker_state_unavailable", "caller_speaking",
+    "assistant_speaking", "caller_end_unobserved", "caller_pause_too_short", "caller_resumed", "listening_clip_pending"})
 # A cue Vapi discarded with a cancelled or replaced request is refunded; the
 # refund cause is recorded beside the original emission reason, never over it.
 _ENUM_ATTRIBUTES["backchannel_refund_reason"] = frozenset({"generation_cancelled_before_answer", "generation_superseded_before_answer"})
 _ENUM_ATTRIBUTES["backchannel_reason"] |= _ENUM_ATTRIBUTES["backchannel_refund_reason"]
+_ENUM_ATTRIBUTES["listening_reason"] = frozenset({"approved", "accepted_unverified", "twilio_legs_only",
+    "sensitive_context", "input_bounds", "language_unverified", "control_content", "sensitive_content",
+    "private_content", "sensitive_prior_turn", "question", "policy_unavailable", "provider_unavailable",
+    "invalid_response", "classifier_silence", "speaker_priority", "speech_too_short", "stale_partial",
+    "insufficient_words", "cue_budget", "cue_cooldown", "superseded", "context_changed", "unavailable"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"capacity", "silent_refusal"})
+EVENTS |= frozenset({"answer_released"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"fetched_clip_active", "not_dispatched", "question_finished"})
+EVENTS |= frozenset({"clip_refusal_alert"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"prefer_pause", "excess_clip_refusals", "recovery_disabled",
+    "clip_unavailable", "invalid_selection", "bridge_unavailable", "ticket_missing", "binding_mismatch",
+    "ticket_expired", "no_neutral_clip", "clip_internal_error", "lane_unavailable"})
+_ENUM_ATTRIBUTES["model"] |= frozenset({"gemini-3.5-flash-lite"})
+_ENUM_ATTRIBUTES["backchannel_phrase"] |= frozenset({f"{name}_{take}" for name in ("uh_huh", "yeah", "okay", "right") for take in (1, 2)})
+EVENTS |= frozenset({"caller_words_observed", "media_suspected", "media_recovery_started", "media_recovery_aborted",
+    "media_recovery_failed", "media_recovery_redial", "speaker_started", "speaker_stopped"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_energy_without_words", "opening_only", "words_resumed", "caller", "agent"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"fallback_turn_unverified"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_requested_quiet"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"caller_turn_finished"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"growing_partials"})
+_ENUM_ATTRIBUTES["listening_reason"] |= frozenset({"cancelled_without_observed_speech", "cancelled_before_meaningful_speech"})
+_ENUM_ATTRIBUTES["backchannel_reason"] |= frozenset({"caller_continuation_too_short", "repeated_phrase"})
+_ENUM_ATTRIBUTES["route"] |= frozenset({"deterministic_closing"})
+EVENTS |= frozenset({"waiting_reclaimed"})
+EVENTS |= frozenset({"closing_checked"})
+_ENUM_ATTRIBUTES["closing_reason"] = frozenset({"ready","speaker_state_unavailable","caller_speaking",
+    "assistant_speaking","caller_end_unobserved","caller_pause_too_short","closing_text_stale",
+    "closing_text_unverified","state_unavailable","proposal_or_operation_pending"})
+# Optional caller-ID personalization: fixed codes only, never a number or name.
+EVENTS |= frozenset({"caller_lookup", "caller_hint", "caller_policy"})
+_ENUM_ATTRIBUTES["caller_lookup_outcome"] = frozenset({"found", "fixture", "returning", "no_name", "business", "placeholder",
+    "possibly_truncated", "unusable", "error", "timeout", "capacity", "unauthorized", "rate_limited", "cancelled",
+    "withheld_or_unsupported"})
+_ENUM_ATTRIBUTES["caller_directory_outcome"] = frozenset({"found", "no_name", "business", "placeholder", "unusable",
+    "error", "timeout", "capacity", "capped", "unauthorized", "rate_limited", "cancelled"})
+_ENUM_ATTRIBUTES["caller_directory_status"] = frozenset({"off", "ready", "missing_key", "invalid_key"})
+_ENUM_ATTRIBUTES["caller_context_mode"] = frozenset({"off", "shadow", "personalize"})
+_ENUM_ATTRIBUTES["caller_policy_status"] = frozenset({"loaded", "missing", "invalid", "pending"})
+_ENUM_ATTRIBUTES["caller_hint_state"] = frozenset({"name_and_number", "number_only", "name_asked", "number_offered",
+    "details_saved", "returning_name", "returning_asked"})
+_ENUM_ATTRIBUTES["caller_verstat"] = frozenset({"passed_a", "passed_b", "passed_c", "failed", "no_validation", "absent", "other"})
 _COUNTS = frozenset({"classifier_requests","cached_sample_rate","input_bytes", "output_bytes", "input_messages", "input_characters", "output_chunks", "tool_calls", "user_ordinal", "http_status", "upstream_http_status", "attempt", "input_tokens", "output_tokens", "total_tokens", "sample_rate_ppm", "sample_rate", "upstream_sample_rate", "response_audio_bytes", "audio_bytes", "caller_utterances", "assistant_utterances"})
 _FLAGS = frozenset({"backchannel_refunded","backchannel_follow_up","cache_text_normalized","cache_hit","ok", "receipt_present", "admitted", "authenticated", "partial", "replayed", "terminal", "audio_available", "transcript_final", "resampled", "response_started", "response_complete"})
+_FLAGS |= frozenset({"backchannel_guarded_fallback"})
 _DURATIONS = frozenset({"policy_elapsed_ms","classifier_ms","queue_ms", "first_byte_ms", "first_text_ms", "first_audio_ms", "upstream_ms", "commit_ms", "preflight_ms", "audio_duration_ms"})
 _HASHES = frozenset({"cache_asset_id","cache_request_sha256","cache_manifest_sha256","input_sha256", "output_sha256", "prompt_sha256", "receipt_sha256", "provider_config_sha256", "source_result_sha256", "output_text_sha256"})
 

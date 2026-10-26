@@ -341,15 +341,19 @@ def test_completed_earlier_reviews_stay_complete_and_a_restart_never_requeues_th
     assert claimed['report'] is None and claimed['session_id']==''
 
 
-def test_status_runs_are_rare_and_labelled(scenario,tmp_path):
+@pytest.mark.parametrize('started,day_extra', [('2026-10-23T08:00:00+00:00',0),('2026-10-23T23:00:00+00:00',1)])
+def test_status_runs_are_rare_and_labelled(scenario,tmp_path,started,day_extra):
     worker,mock,now=worker_fixture(tmp_path,scenario)
+    # Coverage IDs include the UTC day. A wall-clock fixture started after
+    # 17:53 UTC can cross midnight during this six-hour jump on a real runner.
+    now[0]=datetime.fromisoformat(started).timestamp()
     worker.heartbeat();first=len(mock.runs)
     now[0]+=1000;worker.heartbeat()
     assert len(mock.runs)==first  # a quarter hour of unchanged status is not a new trace
     now[0]+=21000;worker.heartbeat()
-    assert len(mock.runs)==first  # the six-hour heartbeat reuses the same-day fingerprint for an unchanged status
+    assert len(mock.runs)==first+day_extra  # same-day fingerprint is reused; a new day gets a fresh status row
     worker.outbox.set_setting('provider_discovery_error','provider_discovery_incomplete');now[0]+=20;worker.heartbeat()
-    assert len(mock.runs)==first+1  # a changed status is a new immutable row
+    assert len(mock.runs)==first+day_extra+1  # a changed status is a new immutable row
     status=next(r for r in mock.runs.values() if r['name']=='voice.review.coverage')
     assert 'reviewer-status' in status['tags'] and 'not a call' in status['inputs']['scope']
 
@@ -362,3 +366,47 @@ def test_metric_feedback_scores_fit_langsmith_precision():
     # LangSmith refuses a feedback score with more than four decimal places.
     assert rows['metric_asr_confidence_min']['score']==rows['metric_asr_confidence_min']['value']==0.9838
     assert rows['metric_cost_usd']['score']==0.0176 and rows['metric_call_seconds']['score']==19.418 and rows['metric_tokens_total']['score']==12
+
+
+@pytest.mark.parametrize('tokens,score',[(99999,99999),(100000,None),(160096,None)])
+def test_large_call_metric_keeps_value_without_overflowing_feedback_score(tokens,score):
+    report={'checks':{},'review_process':{},'3 Turn-by-turn timeline':{'details':[{'tokens':tokens}]}}
+    rows={r['key']:r for r in feedback_rows(str(uuid4()),report)}
+    assert rows['metric_tokens_total']['score']==score
+    assert rows['metric_tokens_total']['value']==tokens
+
+
+@pytest.mark.parametrize('model,effort,expected', [
+    ('gemini-3.8-flash','low','gemini-3.8-flash'),
+    ('gemini-3.5-flash-lite','minimal','gemini-3.5-flash-lite'),
+    (None,None,None), ('PRIVATE MODEL','PRIVATE EFFORT',None), ({'private':True},[],None),
+])
+def test_readable_generations_preserve_observed_model_without_guessing(scenario,model,effort,expected):
+    from app.call_review_presentation import generation_rows
+    row=timing_row(scenario[1]);row.update(model=model,reasoning_effort=effort)
+    generation=next(iter(generation_rows([row]).values()))
+    trace={'unassigned_generations':[generation]}
+    plan=build_review_children(trace,root_run_id=ROOT,root_dotted_order=ORDER,project_id=PROJECT)
+    child=next(r for r in plan['runs'] if r['run_type']=='llm')
+    assert child['outputs']['model']==child['extra']['metadata']['model']==expected
+    assert child['outputs']['reasoning_effort']==(effort if expected else None)
+    assert 'PRIVATE' not in canonical(plan)
+    # Existing immutable traces must still rebuild byte-identical legacy labels.
+    generation.pop('model');generation.pop('reasoning_effort')
+    old=build_review_children(trace,root_run_id=ROOT,root_dotted_order=ORDER,project_id=PROJECT)
+    child=next(r for r in old['runs'] if r['run_type']=='llm')
+    assert 'model' not in child['outputs'] and child['extra']['metadata']['model']=='gemini-3.8-flash'
+
+
+def test_listening_children_use_actual_closed_phrase_ids_and_keep_frozen_legacy_labels():
+    start=datetime.fromisoformat('2026-10-24T17:00:00+00:00').timestamp()
+    trace={'listening':[
+        {'event':'dispatched','start_unix':start,'phrase_id':'uh_huh_2','phrase':'PRIVATE OVERRIDE'},
+        {'event':'dispatched','start_unix':start+5,'phrase_id':'right_1'},
+        {'event':'dispatched','start_unix':start+10,'phrase_id':'PRIVATE'},
+        {'event':'dispatched','start_unix':start+15,'phrase':'Right.'},
+    ]}
+    plan=build_review_children(trace,root_run_id=ROOT,root_dotted_order=ORDER,project_id=PROJECT)
+    assert [r['name'] for r in plan['runs']]==['listen · Uh-huh.','listen · Right.','listen · unknown','listen · Mm-hmm.']
+    assert [r['inputs']['phrase'] for r in plan['runs']]==['uh_huh_2','right_1',None,'neutral_ack']
+    assert 'PRIVATE' not in canonical(plan)

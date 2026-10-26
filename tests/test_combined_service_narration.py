@@ -24,7 +24,7 @@ def test_complete_scope_readback_and_single_commit(tmp_path, monkeypatch):
         try:
             prepared = await proposal(env)
             text = text_of(await post(env))
-            for expected in ("Diagnostic appointment", "Brake inspection", "One 60-minute intake visit", "2022 Toyota Camry", "Alex Morgan", "Callback plus one", "confirm this booking?"):
+            for expected in ("Diagnostic appointment", "Brake inspection", "One 60-minute intake visit", "2022 Toyota Camry", "Alex Morgan", "Callback five one two, five five five, zero one four two", "confirm this booking?"):
                 assert expected in text
             assert env.store.snapshot(env.sid)["appointment"] is None
             result = await confirm(env, prepared)

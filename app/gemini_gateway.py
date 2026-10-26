@@ -30,7 +30,7 @@ from .tool_observations import ObservationError, ToolObservationStore
 from .receipt_narration import BoundedSelector, NARRATOR_VERSION
 from .jev_faq import FAQ_VERSION, JevFaqRouter
 from .jev_classifier import JEV_MODEL
-from .backchannel_policy import BackchannelPolicy, WAITING_PHRASE_IDS, waiting_phrase, waiting_state
+from .backchannel_policy import BackchannelPolicy, WAITING_PHRASE_IDS, waiting_phrase, waiting_state, guarded_waiting_fallback
 from .backchannel_catalog import PHRASES
 from .backchannel_budget import BackchannelBudget
 from .issuance_context import user_context
@@ -38,6 +38,7 @@ from .diagnostics import turn_identifier
 from .call_lifecycle import END_CALL, CLOSING_POLICY, UNKNOWN_ATTEMPT_CONTEXT, enabled as closing_enabled, schema as closing_schema
 
 MODEL = "gemini-3.8-flash"
+UPSTREAM_MODELS = {MODEL: "low", "gemini-3.5-flash-lite": "minimal"}
 # A low reasoning setting still spends output budget on hidden reasoning.
 # 1024 truncated a constrained scheduling turn before it could emit a tool.
 # This is a ceiling, not a target response length; voice prose stays concise.
@@ -47,6 +48,27 @@ TIMING_CAPACITY = 256
 EOF_DRAIN_SECONDS = 0.05
 EOF_DRAIN_BYTES = 16 * 1024
 ACK_DELAY_SECONDS = 0.55
+SERIAL_TOOL_POLICY = ("\nThis phone transport requires sequential actions: return at most ONE function call per response. "
+    "For multiple requests, choose the next action, wait for its verified result, then handle the remaining request. "
+    "Never combine an advisor request with an intake or booking command in one response.")
+SERIAL_TOOL_RETRY = ("\nYour private candidate contained several function calls. NONE of that candidate's commands "
+    "were issued or executed. Regenerate exactly ONE next function call, or a concise clarification. "
+    "Do not claim that any of those actions succeeded.")
+SERIAL_TOOL_CLARIFICATION = "Let's take those one at a time. Which request would you like me to handle first?"
+PHONE_CONVERSATION_POLICY = ("\nPhone delivery: say one idea per turn, normally at most two short sentences and about "
+    "20 words. Ask one question at a time. Do not repeat confirmed details or repeatedly use the caller's name. "
+    "Complete booking readbacks, verified references and a short list of options are exceptions: never omit "
+    "required information for brevity. The separate cue system handles waiting; do not add routine filler.")
+PHONE_PRESENTATION_POLICY = ("\nFor this phone assistant, use the verified receipt reader for ordinary scheduling. "
+    "For begin_service_request or search_availability, when the next reply only needs the returned offers, "
+    "set presentation to an object. For prepare_booking, when the next reply is the complete readback, "
+    "also set it to an object. For an English conversation about dealership-local appointments, use "
+    '{"response_scope":"receipt_only","response_language":"en","caller_timezone":"dealership"}. '
+    "The question asking the caller to choose an offer or confirm the readback is included in that receipt; "
+    "it is NOT an extra unanswered question requiring presentation=null. Do not choose null just because "
+    "the caller has not booked yet or has not explicitly named their language/timezone. Still use null for "
+    "an additional unanswered policy/diagnostic question, unresolved correction, or uncertain language/timezone. "
+    "Use the actual current language and resolved timezone, never this example blindly.")
 
 
 class RequestTiming:
@@ -787,6 +809,20 @@ class GeminiGateway:
         self.backchannel_budget = BackchannelBudget()
         self.backchannel_cache_ready = False
         self.backchannel_reads = set()
+        # Installed only by the isolated conference lane. Other assistants keep
+        # their existing transport; timing checks never authorize business work.
+        self.waiting_cue_state = None
+        self.closing_ready = None
+        self.closing_status = None
+        self.waiting_neutral_only = None
+        self.waiting_cue_commit = None
+        self.waiting_cue_assistant = None
+        self.before_answer = None
+        self.waiting_fallback_ready = None
+        self.waiting_content_finished = None
+        self.waiting_cue_track = None
+        # Optional, in-memory caller-ID text for the same isolated assistant.
+        self.caller_hint = None
 
     def _observe_timing(self,row,sid,context=None):
         if self.timing_sink is not None:
@@ -801,7 +837,7 @@ class GeminiGateway:
                         call_id=call_id,turn_id=turn_id,request_id=row["request_id"],
                         start_unix=phase_started or row["started_at_unix"],duration_ms=duration,attributes=attributes)
                 event("gateway","request_finished",row["milestones_ms"].get("total"),{
-                    "route":row["route"],"model":MODEL,"user_ordinal":context.get("user_count"),
+                    "route":row["route"],"model":row.get("model", MODEL),"user_ordinal":context.get("user_count"),
                     "first_text_ms":row["milestones_ms"].get("first_text"),"preflight_ms":row["milestones_ms"].get("preflight"),
                     "input_tokens":row["usage"].get("input_tokens"),"output_tokens":row["usage"].get("output_tokens"),
                     "total_tokens":row["usage"].get("total_tokens"),"evidence_source":"server_observed",
@@ -814,7 +850,7 @@ class GeminiGateway:
                     llm_end=row["milestones_ms"].get("upstream_done")
                     if llm_end is None:llm_end=row["milestones_ms"]["total"]
                     event("llm","generation_finished",max(0,(row["started_at_unix"]+llm_end/1000-context["llm_started_at"])*1000),{
-                        "model":MODEL,"input_tokens":row["usage"].get("input_tokens"),"output_tokens":row["usage"].get("output_tokens"),"evidence_source":"server_observed"},context["llm_started_at"])
+                        "model":row.get("model", MODEL),"input_tokens":row["usage"].get("input_tokens"),"output_tokens":row["usage"].get("output_tokens"),"evidence_source":"server_observed"},context["llm_started_at"])
                 if row["counts"].get("jev_requests"):
                     reason=row.get("jev_reason","")
                     failed=reason=="classification_deadline" or reason.startswith("classifier_")
@@ -828,7 +864,7 @@ class GeminiGateway:
                         "output_text_sha256":row.get("output_text_sha256"),"evidence_source":"server_observed"},context.get("receipt_started_at"))
             except Exception:pass
         if self.telemetry is None:return
-        attributes={"route":row["route"],"outcome":row["outcome"],"model":MODEL,
+        attributes={"route":row["route"],"outcome":row["outcome"],"model":row.get("model", MODEL),
                     "prompt_sha256":row["system_prompt_sha256"],"prompt_version":SYSTEM_PROMPT_VERSION,
                     "narrator_version":row["narrator_version"]}
         for key in ("generation_id","generation_sequence","generation_sequence_scope","predecessor_generation_id",
@@ -1164,12 +1200,13 @@ class GeminiGateway:
         sid = await run_in_threadpool(self.bind_call, call, body.get("assistant"))
         call_id = call["id"]
         request.state.diagnostic_call_id=call_id
-        diagnostic_context={"call_id":call_id}
+        diagnostic_context={"call_id":call_id, "assistant_id":call.get("assistantId")}
         expected_backchannel_assistant = config.get("VAPI_BACKCHANNEL_ASSISTANT_ID")
         diagnostic_context["backchannel_enabled"] = (
             config.get("SERVICEVOICE_BACKCHANNELS") == "on"
-            and isinstance(expected_backchannel_assistant, str) and bool(expected_backchannel_assistant)
-            and call.get("assistantId") == expected_backchannel_assistant)
+            and isinstance(call.get("assistantId"), str) and bool(call.get("assistantId"))
+            and (call.get("assistantId") == expected_backchannel_assistant
+                 or call.get("assistantId") == self.waiting_cue_assistant))
         timing = RequestTiming(call_id, received_at, self.timings,
             lambda row,session:self._observe_timing(row,session,diagnostic_context),sid)
         timing.row["generation_sequence"]=sequence
@@ -1181,6 +1218,17 @@ class GeminiGateway:
             await run_in_threadpool(self.store.check_live, sid, call_id)
             upstream = await run_in_threadpool(prepare_request, body, sid, call_id, self.store, self.limits, self.observations,
                                                **({"allow_end_call":True} if closing_enabled(config) else {}))
+            selected_model = MODEL
+            if self.waiting_cue_assistant and call.get("assistantId") == self.waiting_cue_assistant:
+                diagnostic_context["serial_tools"] = True
+                upstream["messages"][0]["content"] += SERIAL_TOOL_POLICY + PHONE_CONVERSATION_POLICY + PHONE_PRESENTATION_POLICY
+                selected_model = config.get("SERVICEVOICE_TWILIO_MODEL", MODEL)
+                if selected_model not in UPSTREAM_MODELS:
+                    raise GatewayError("candidate_model_not_allowed", 503)
+            upstream["model"] = selected_model
+            upstream["reasoning_effort"] = UPSTREAM_MODELS[selected_model]
+            timing.row["model"] = selected_model
+            timing.row["reasoning_effort"] = UPSTREAM_MODELS[selected_model]
         except (GatewayError, ObservationError) as exc:
             timing.outcome = "rejected"
             timing.finish()
@@ -1194,6 +1242,12 @@ class GeminiGateway:
         if context:
             diagnostic_context.update(user_count=context["user_count"],turn_id=turn_identifier(call_id,context["user_count"]))
         timing.row["system_prompt_sha256"] = hashlib.sha256(upstream["messages"][0]["content"].encode("utf-8")).hexdigest()
+        if diagnostic_context.get("serial_tools") and self.caller_hint is not None:
+            # Appended after hashing, so the policy hash never covers caller data.
+            # A memory read only: an absent or failed hint leaves the turn unchanged.
+            try:hint=self.caller_hint(call_id,sid,upstream["messages"])
+            except Exception:hint=None
+            if isinstance(hint,str) and hint:upstream["messages"][0]["content"]+=hint
         timing.row["counts"]["history_messages"] = len(upstream["messages"])
         timing.row["counts"]["history_tool_results"] = sum(message["role"] == "tool" for message in upstream["messages"])
         try:
@@ -1235,11 +1289,43 @@ class GeminiGateway:
             self._phase(timing,False)
 
     async def _generate(self,request,config,key,upstream,sid,call_id,started,timing):
+        if (self.waiting_cue_assistant and timing.diagnostic_context.get("assistant_id")==self.waiting_cue_assistant
+                and closing_enabled(config) and any(t["function"]["name"]==END_CALL for t in upstream.get("tools",[]))):
+            from .phone_closing import candidate as closing_candidate
+            closing = closing_candidate(upstream["messages"])
+            if closing and self.closing_ready is not None:
+                try:
+                    state=await run_in_threadpool(self._backchannel_context,sid,call_id)
+                    operations_ready=await run_in_threadpool(self.store.end_call_ready,sid)
+                except sqlite3.Error:state=None;operations_ready=False
+                self._checkpoint(timing)
+                closing_reason="state_unavailable" if state is None else "proposal_or_operation_pending"
+                if (state and state.get("allow_turn") is True and state.get("has_pending_proposal") is False
+                        and state.get("has_pending_operation") is False and state.get("ended") is False
+                        and operations_ready):
+                    # The generation can precede the VAD stop webhook. Wait a
+                    # bounded interval for that evidence; text alone cannot hang
+                    # up a caller who is still speaking. No business work occurs.
+                    closing_deadline=time.monotonic()+1.25
+                    while not self.closing_ready(call_id,sid,closing) and time.monotonic()<closing_deadline:
+                        self._checkpoint(timing)
+                        if await request.is_disconnected():break
+                        await asyncio.sleep(.04)
+                    self._checkpoint(timing)
+                    closing_reason=(self.closing_status(call_id,sid,closing) if self.closing_status is not None
+                        else "ready" if self.closing_ready(call_id,sid,closing) else "speaker_state_unavailable")
+                    if self.closing_ready(call_id,sid,closing):
+                        self._observe_closing(timing,"ready")
+                        timing.row["route"]="deterministic_closing"
+                        return OwnedStream(self._close_phone(request,upstream,sid,call_id,timing,closing),
+                            lambda:self._cleanup_narration(call_id,timing))
+                self._observe_closing(timing,closing_reason)
         if config.get("SERVICEVOICE_RECEIPT_NARRATION") == "on":
             try:
                 timing.diagnostic_context["receipt_started_at"]=time.time()
                 receipt_started=time.monotonic()
-                decision = await self.narration.choose(sid, call_id, upstream["messages"])
+                decision = await self.narration.choose(sid, call_id, upstream["messages"],
+                    **({"phone":True} if self.waiting_cue_assistant and timing.diagnostic_context.get("assistant_id")==self.waiting_cue_assistant else {}))
                 timing.diagnostic_context["receipt_elapsed_ms"]=(time.monotonic()-receipt_started)*1000
                 self._checkpoint(timing)
                 timing.row["narration_reason"] = decision.reason
@@ -1317,9 +1403,25 @@ class GeminiGateway:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher
+        async def retry_single():
+            retry = deepcopy(upstream)
+            retry["messages"][0]["content"] += SERIAL_TOOL_RETRY
+            retry_request = self.client.build_request("POST", GOOGLE_URL, json=retry, headers={"Authorization": "Bearer " + key})
+            retry_request.extensions["trace"] = timing.transport_event
+            fresh = await self.client.send(retry_request, stream=True)
+            timing.generation.response = fresh
+            try:
+                self._checkpoint(timing)
+                if fresh.status_code != 200 or "text/event-stream" not in fresh.headers.get("content-type", ""):
+                    raise GatewayError("upstream_unavailable", 502)
+                return fresh
+            except BaseException:
+                await fresh.aclose()
+                raise
         return OwnedStream(self._relay(request, response, sid, call_id, started, timing,
                                        issuance_context=user_context(upstream["messages"]),
-                                       allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[]))),
+                                       allow_end_call=any(tool["function"]["name"]==END_CALL for tool in upstream.get("tools",[])),
+                                       serial_tools=timing.diagnostic_context.get("serial_tools", False), retry_single=retry_single),
                            lambda: self._cleanup(response, call_id, timing))
 
     def _backchannel_context(self,sid,call_id):
@@ -1351,6 +1453,42 @@ class GeminiGateway:
                 f"SELECT provider_call_id FROM sessions WHERE provider_call_id IN ({marks}) AND (ended!=0 OR created<?)",
                 (*call_ids,time.time()-4*3600)))
 
+    def _waiting_status(self, call_id, sid, ticket, follow_up=False):
+        if self.waiting_cue_state is None:
+            return "eligible"
+        try:
+            current, reason = self.waiting_cue_state(call_id, sid, *([True] if follow_up else []))
+            if current is None or ticket is None:
+                return "speaker_state_unavailable"
+            return reason if current == ticket else "caller_resumed"
+        except Exception:
+            return "speaker_state_unavailable"
+
+    def _waiting_applies(self, timing):
+        return (self.waiting_cue_assistant is None
+                or timing.diagnostic_context.get("assistant_id") == self.waiting_cue_assistant)
+
+    async def _coordinate_answer(self, timing):
+        if self.before_answer is not None and self._waiting_applies(timing):
+            await self.before_answer(timing.diagnostic_context["call_id"], timing.correlation)
+            self._checkpoint(timing)
+
+    async def _wait_for_caller_pause(self, primary, call_id, sid, ticket, follow_up=False):
+        # Bounded, optional wait concurrent with the main answer. Caller events
+        # arrive on the same event loop; no locks, provider calls or disk reads.
+        deadline = time.monotonic()+1.25
+        while True:
+            if primary.done():
+                primary.result()
+                return "primary_ready"
+            reason = self._waiting_status(call_id, sid, ticket, follow_up)
+            if reason in {"eligible", "caller_resumed", "speaker_state_unavailable", "turn_already_acknowledged"}:
+                return reason
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                return reason
+            await asyncio.wait((primary,), timeout=min(.04, remaining))
+
     async def _backchannel_stream(self,request,config,key,upstream,sid,call_id,started,timing):
         """One bounded acknowledgment in the existing owned Vapi stream.
 
@@ -1358,6 +1496,11 @@ class GeminiGateway:
         speculative tool prose, dynamic name or booking authority is added.
         """
         streams=[]
+        scoped_waiting = self._waiting_applies(timing)
+        try:
+            speaker_ticket = self.waiting_cue_state(call_id, sid)[0] if self.waiting_cue_state and scoped_waiting else None
+        except Exception:
+            speaker_ticket = None
         selection_context = None
         policy_messages=upstream["messages"]
         follow_up=False
@@ -1388,6 +1531,9 @@ class GeminiGateway:
                 read.add_done_callback(read_done)
                 context,retired=await asyncio.shield(read)
                 self.backchannel_budget.retire_confirmed(retired)
+                if (self.waiting_cue_assistant is not None and scoped_waiting
+                        and config.get("SERVICEVOICE_TWILIO_WAITING_FALLBACK") == "on"):
+                    context={**context,"neutral_waiting":True}
                 return context
         async def prime_answer():
             self._phase(timing,True)
@@ -1401,9 +1547,15 @@ class GeminiGateway:
             try:
                 async with asyncio.timeout(.48):
                     selection_context=await read_context()
-                    def requested():timing.row["backchannel"]["requests"]=1
-                    return await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
+                    def requested():timing.row["backchannel"]["requests"]+=1
+                    decision=await self.backchannel_policy.choose(policy_messages,config.get("TYPESAFE_API_KEY"),
                         context=selection_context,on_request=requested,native_waiting=True)
+                    if (scoped_waiting and not follow_up and self.waiting_content_finished is not None
+                            and decision.reason=="eligible_classification" and decision.phrase_id in WAITING_PHRASE_IDS):
+                        state,_=waiting_state(policy_messages,selection_context)
+                        if state is not None:
+                            self.waiting_content_finished(call_id,sid,state["utterance"],speaker_ticket)
+                    return decision
             except Exception:
                 return BackchannelDecision(reason="context_unavailable")
         timing.row["backchannel"]={"phrase_id":"silence","reason":"pending","emitted_ms":None,
@@ -1440,7 +1592,12 @@ class GeminiGateway:
                 record["reason"]="primary_ready"
             elif decision is not None:
                 self._backchannel_observation(timing,"backchannel.selected",None)
-                if decision.phrase_id in WAITING_PHRASE_IDS and decision.reason=="eligible_classification":
+                fallback = (not follow_up and scoped_waiting and config.get("SERVICEVOICE_TWILIO_WAITING_FALLBACK") == "on"
+                    and self.waiting_fallback_ready is not None
+                    and guarded_waiting_fallback(decision, waiting_state(policy_messages, selection_context)[0], selection_context))
+                if fallback or decision.phrase_id in WAITING_PHRASE_IDS and decision.reason=="eligible_classification":
+                    speaker_reason = (await self._wait_for_caller_pause(primary, call_id, sid, speaker_ticket, follow_up)
+                                      if scoped_waiting else "eligible")
                     # Never wait for this optional fresh read ahead of a ready
                     # main answer. A context change cannot grant new authority.
                     fresh=asyncio.create_task(read_context())
@@ -1456,19 +1613,39 @@ class GeminiGateway:
                         if not fresh.done():fresh.cancel()
                         await asyncio.gather(fresh,return_exceptions=True)
                     state,reason=waiting_state(policy_messages,current) if current is not None else (None,record["reason"])
+                    # Recheck after the asynchronous context read. This check,
+                    # budget reservation and SSE yield have no intervening await.
+                    if speaker_reason == "eligible" and scoped_waiting:
+                        speaker_reason = self._waiting_status(call_id, sid, speaker_ticket, follow_up)
+                    if speaker_reason != "eligible":
+                        state,reason = None,speaker_reason
+                    if state is not None and fallback and not self.waiting_fallback_ready(call_id, sid, state["utterance"]):
+                        state,reason = None,"fallback_turn_unverified"
                     if state is None:record["reason"]=reason
                     elif selection_context is None or current!=selection_context:record["reason"]="scheduler_changed"
                     elif not primary.done():
                         # A follow-up after a tool result is always a neutral
                         # hold and avoids the phrase the turn already heard.
-                        phrase=waiting_phrase(decision,state["user_count"],self.backchannel_budget.previous_phrase(call_id),
-                            neutral_only=state["neutral_confirmation"] or follow_up)
+                        phrase=waiting_phrase(decision,state["user_count"],
+                            self.backchannel_budget.previous_phrase(call_id),neutral_only=fallback or state["neutral_confirmation"] or state.get("neutral_only",False) or follow_up
+                            or (scoped_waiting and self.waiting_neutral_only is not None and self.waiting_neutral_only(call_id,sid)))
+                        if fallback and self.backchannel_budget.previous_phrase(call_id)!="one_sec":phrase="one_sec"
                         record["phrase_id"]=phrase
-                        allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up)
+                        record["guarded_fallback"]=fallback
+                        allowed,reason=self.backchannel_budget.consume(call_id,state["user_count"],phrase,follow_up=follow_up,
+                            observed_spacing=scoped_waiting and self.waiting_cue_commit is not None)
                         record["reason"]=reason
                         if allowed:
+                            if scoped_waiting and self.waiting_cue_commit is not None and not self.waiting_cue_commit(call_id, sid, *([True] if follow_up else [])):
+                                allowed = False
+                                self.backchannel_budget.refund(call_id,self.backchannel_budget.receipt(call_id))
+                                record["reason"] = "turn_already_acknowledged"
+                        if allowed:
+                            timing.waiting_cue_committed = scoped_waiting and self.waiting_cue_commit is not None
                             record["follow_up"]=follow_up
                             timing.backchannel_budget_stamp=self.backchannel_budget.receipt(call_id)
+                            if timing.waiting_cue_committed and self.waiting_cue_track is not None:
+                                self.waiting_cue_track(call_id,sid,timing.backchannel_budget_stamp)
                             timing.before_finish=lambda:self._backchannel_refund(call_id,timing)
                     else:allowed=False; record["reason"]="primary_ready"
                     if state is not None and current==selection_context and not primary.done() and allowed:
@@ -1477,9 +1654,11 @@ class GeminiGateway:
                         record["emitted_ms"]=elapsed
                         self._payload(timing)
                         self._backchannel_observation(timing,"backchannel.emitted",elapsed)
+                        # A trailing space after flush becomes a separate blank
+                        # voice request when the next payload is a tool call.
                         yield sse({"id":timing.row["sse_response_id"],"object":"chat.completion.chunk",
                             "created":int(time.time()),"model":MODEL,"choices":[{"index":0,"delta":{
-                                "role":"assistant","content":PHRASES[record["phrase_id"]]+" <flush /> "},"finish_reason":None}]})
+                                "role":"assistant","content":PHRASES[record["phrase_id"]]+" <flush />"},"finish_reason":None}]})
             else:record["reason"]="policy_not_ready"
             if record["emitted_ms"] is None:self._backchannel_observation(timing,"backchannel.suppressed",None)
             stream,first=await asyncio.shield(primary)
@@ -1543,6 +1722,13 @@ class GeminiGateway:
         if self._obsolete(timing):cause="generation_superseded_before_answer"
         elif timing.outcome in ("cancelled","interrupted"):cause="generation_cancelled_before_answer"
         else:return
+        # Do not refund the phone lane immediately. It reconciles only after
+        # the caller resumed and stopped, a lateness grace elapsed, and no
+        # meaningful playback was observed. Measured blips keep their spacing.
+        if getattr(timing, "waiting_cue_committed", False):
+            if self.waiting_cue_track is not None:
+                self.waiting_cue_track(call_id,timing.correlation,stamp,abandoned=True)
+            return
         timing.backchannel_budget_stamp=None
         refunded,_=self.backchannel_budget.refund(call_id,stamp)
         if not refunded:return
@@ -1561,6 +1747,7 @@ class GeminiGateway:
                     "backchannel_reason":record.get("refund_reason") if event=="backchannel.refunded" else record["reason"],
                     **({"backchannel_refunded":True,"backchannel_refund_reason":record.get("refund_reason")} if record.get("refunded") else {}),
                     "backchannel_follow_up":record.get("follow_up") is True,
+                    "backchannel_guarded_fallback":record.get("guarded_fallback") is True,
                     "classifier_ms":record["classification_ms"],
                     "backchannel_probability":record["probability"],"backchannel_confidence":record["confidence"],
                     "classifier_requests":record["requests"],"policy_elapsed_ms":record["policy_elapsed_ms"],
@@ -1578,6 +1765,47 @@ class GeminiGateway:
         self._release(call_id, timing)
         timing.finish()
 
+    def _observe_closing(self,timing,reason):
+        try:
+            if self.diagnostics is not None:
+                self.diagnostics.record("gateway","closing_checked","observed",
+                    call_id=timing.diagnostic_context["call_id"],request_id=timing.row["request_id"],
+                    attributes={"closing_reason":reason,"generation_id":timing.row["generation_id"],"evidence_source":"server_observed"})
+        except Exception:pass  # Optional observations must not break call control.
+
+    async def _close_phone(self,request,upstream,sid,call_id,timing,text):
+        try:
+            self._phase(timing,True)
+            self._checkpoint(timing)
+            if await request.is_disconnected():return
+            if not self.closing_ready(call_id,sid,text):
+                timing.outcome="interrupted"
+                async for part in self._neutral_stream(request,timing):yield part
+                return
+            tool={"id":"call_"+uuid4().hex,"type":"function","function":{"name":END_CALL,"arguments":"{}"}}
+            await run_in_threadpool(self.store.save_group,sid,call_id,[tool],
+                context=user_context(upstream["messages"]),allow_end_call=True)
+            self._checkpoint(timing)
+            if not self.closing_ready(call_id,sid,text) or not await run_in_threadpool(self.store.end_call_ready,sid):
+                timing.outcome="interrupted"
+                async for part in self._neutral_stream(request,timing):yield part
+                return
+            self._checkpoint(timing)
+            response_id="chatcmpl-"+uuid4().hex
+            timing.row["sse_response_id"]=response_id
+            timing.row["counts"]["tool_calls"]=1
+            timing.mark("tool_emitted")
+            self._payload(timing)
+            def chunk(delta,reason=None):
+                return {"id":response_id,"object":"chat.completion.chunk","created":int(time.time()),
+                    "model":"servicevoice-closing","choices":[{"index":0,"delta":delta,"finish_reason":reason}]}
+            yield sse(chunk({"role":"assistant","tool_calls":[{"index":0,**tool}]}))
+            yield sse(chunk({},"tool_calls"))
+            timing.outcome="completed"
+            yield b"data: [DONE]\n\n"
+        finally:
+            self._phase(timing,False)
+
     async def _narrate(self, request, text, timing, source="servicevoice-receipt"):
         response_id = timing.row.get("sse_response_id") or "chatcmpl-" + uuid4().hex
         timing.row["sse_response_id"]=response_id
@@ -1588,6 +1816,7 @@ class GeminiGateway:
             self._phase(timing,True)
             if await request.is_disconnected():return
             self._checkpoint(timing)
+            await self._coordinate_answer(timing)
             timing.mark("first_text")
             timing.row["counts"]["text_chunks"] = 1
             timing.row["counts"]["text_utf8_bytes"] = len(text.encode("utf-8"))
@@ -1611,7 +1840,8 @@ class GeminiGateway:
         finally:
             self._phase(timing,False)
 
-    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None, allow_end_call=False):
+    async def _relay(self, request, response, sid, call_id, started, timing=None, *, issuance_context=None, allow_end_call=False,
+                     serial_tools=False, retry_single=None, owns_generation=True):
         timing = timing or RequestTiming(call_id, started, self.timings)
         transport = {"iterator": response.aiter_bytes(), "buffer_bytes": 0, "received_bytes": 0}
         assembler = ToolAssembler(self.limits,allow_end_call=allow_end_call)
@@ -1644,6 +1874,36 @@ class GeminiGateway:
                         if time.monotonic() - started >= self.limits.total_seconds:
                             raise TimeoutError()
                         self._checkpoint(timing)
+                        if serial_tools and pending_calls and len(pending_calls) > 1:
+                            # Nothing from this candidate has crossed the tool
+                            # boundary. Replan, never trim or forge a signed group.
+                            if retry_single is not None:
+                                prior_usage = dict(timing.row["usage"])
+                                timing.row["usage"] = {key: None for key in prior_usage}
+                                timing.row["counts"]["serial_tool_replans"] = 1
+                                await response.aclose()
+                                try:
+                                    fresh = await retry_single()
+                                    watch_stop.set(); watcher.cancel()
+                                    with suppress(asyncio.CancelledError):await watcher
+                                    async for part in self._relay(request, fresh, sid, call_id, started, timing,
+                                            issuance_context=issuance_context, allow_end_call=allow_end_call,
+                                            serial_tools=True, owns_generation=False):
+                                        yield part
+                                finally:
+                                    for key, value in prior_usage.items():
+                                        if value is not None:
+                                            timing.row["usage"][key] = value+(timing.row["usage"].get(key) or 0)
+                                return
+                            # A model that ignores the serial rule must not end
+                            # the phone call or authorize part of a hidden batch.
+                            pending_calls = None
+                            text_parts = [SERIAL_TOOL_CLARIFICATION]
+                            text_bytes = len(SERIAL_TOOL_CLARIFICATION.encode())
+                            finish_reason = "stop"
+                            timing.row["counts"]["serial_tool_clarifications"] = 1
+                            timing.row["output_text_source"] = "application_clarification"
+                            timing.row["output_text_sha256"] = hashlib.sha256(SERIAL_TOOL_CLARIFICATION.encode()).hexdigest()
                         if pending_calls:
                             if pending_calls[0]["function"]["name"]==END_CALL:
                                 if not await run_in_threadpool(self.store.end_call_ready,sid):
@@ -1661,6 +1921,7 @@ class GeminiGateway:
                             yield sse(chunk({"role": "assistant", "tool_calls": public_calls}))
                         elif text_parts:
                             text = "".join(text_parts)
+                            await self._coordinate_answer(timing)
                             timing.mark("first_text")
                             if timing.row["milestones_ms"]["first_upstream_text"] is not None:
                                 timing.row["durations_ms"]["validated_text_hold"] = round(max(0,
@@ -1669,6 +1930,10 @@ class GeminiGateway:
                             timing.row["counts"]["text_utf8_bytes"] = text_bytes
                             self._payload(timing)
                             yield sse(chunk({"role": "assistant", "content": text}))
+                        else:
+                            # A successful HTTP response with no answer and no
+                            # command is not a successful conversational turn.
+                            raise GatewayError("upstream_empty_response")
                         self._phase(timing,False)
                         yield sse(chunk({}, finish_reason))
                         completed = True
@@ -1679,7 +1944,8 @@ class GeminiGateway:
                     if not isinstance(event, dict) or "error" in event:
                         raise GatewayError("upstream_stream_failed")
                     upstream_model = event.get("model")
-                    if upstream_model is not None and (not isinstance(upstream_model, str) or not (upstream_model == MODEL or upstream_model.startswith(MODEL + "-"))):
+                    expected_model = timing.row.get("model", MODEL)
+                    if upstream_model is not None and (not isinstance(upstream_model, str) or not (upstream_model == expected_model or upstream_model.startswith(expected_model + "-"))):
                         raise GatewayError("upstream_model_mismatch")
                     usage = event.get("usage")
                     if isinstance(usage, dict):
@@ -1752,7 +2018,10 @@ class GeminiGateway:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher
-            await self._cleanup(response, call_id, timing)
+            if owns_generation:
+                await self._cleanup(response, call_id, timing)
+            else:
+                await response.aclose()
 
 
 class OwnedStream(StreamingResponse):

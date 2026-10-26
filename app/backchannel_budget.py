@@ -29,7 +29,7 @@ class BackchannelBudget:
             self.calls.pop(call_id, None)
             self.receipts.pop(call_id, None)
 
-    def consume(self, call_id, user_count, phrase_id=None, *, follow_up=False):
+    def consume(self, call_id, user_count, phrase_id=None, *, follow_up=False, observed_spacing=False):
         """One cue per caller turn, plus one follow-up while a tool result is being answered.
 
         A follow-up is the gateway's claim that this request continues the same
@@ -45,9 +45,12 @@ class BackchannelBudget:
         if old is not None:
             ordinal, emitted, timestamps, previous, followed = old
             same_turn = user_count == ordinal
-            if user_count < ordinal or (same_turn and (not follow_up or followed == ordinal)):
+            # Only the isolated speaker coordinator can replace the ordinal
+            # rule with observed caller continuation and playback spacing.
+            if user_count < ordinal or (same_turn and not observed_spacing and (not follow_up or followed == ordinal)):
                 return False, "turn_already_acknowledged"
-            if now-emitted < (self.follow_up if same_turn else self.cooldown):return False, "cooldown"
+            if observed_spacing and phrase_id == previous:return False, "repeated_phrase"
+            if now-emitted < (self.follow_up if same_turn and follow_up else self.cooldown):return False, "cooldown"
             timestamps = [stamp for stamp in timestamps if now-stamp < self.window]
             if len(timestamps) >= self.per_call:return False, "call_budget"
             followed = ordinal if same_turn else None
@@ -59,7 +62,7 @@ class BackchannelBudget:
         self.receipts[call_id] = (now, old)
         return True, "emitted"
 
-    def refund(self, call_id, stamp):
+    def refund(self, call_id, stamp, *, preserve_phrase=False):
         """Give back the latest consumption when its cue provably never reached playback.
 
         Only the gateway decides that: a generation Vapi cancelled or replaced
@@ -72,6 +75,6 @@ class BackchannelBudget:
             return False, "not_refundable"
         previous = receipt[1]
         ordinal, emitted, timestamps, phrase, followed = previous if previous is not None else (current[0]-1, stamp, [], None, None)
-        self.calls[call_id] = (ordinal, max(emitted, stamp), list(timestamps), phrase, followed)
+        self.calls[call_id] = (ordinal, max(emitted, stamp), list(timestamps), current[3] if preserve_phrase else phrase, followed)
         del self.receipts[call_id]
         return True, "refunded"

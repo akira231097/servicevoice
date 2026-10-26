@@ -24,7 +24,7 @@ def test_contact_only_replacement_uses_receipt_slot_without_new_availability(tmp
             with env.store.read_connection() as db:
                 old=json.loads(db.execute("SELECT payload FROM proposals WHERE id=?",(original["proposal_id"],)).fetchone()[0])
             assert original["slot_id"]==old["slot_id"]
-            assert "five, five, zero" in text_of(await post(env)) and not env.sent
+            assert "five five zero" in text_of(await post(env)) and not env.sent
             prior_event_count=len(env.store.snapshot(env.sid)["events"])
             # The direct correction path must not silently search again.
             monkeypatch.setattr(env.store,"availability_result",lambda *a,**k:pytest.fail("Contact correction must not search availability"))
@@ -45,7 +45,7 @@ def test_contact_only_replacement_uses_receipt_slot_without_new_availability(tmp
             events=env.store.snapshot(env.sid)['events']
             assert len(events)==prior_event_count+1 and events[-1]['name']=="prepare_booking"
             text=text_of(await post(env))
-            assert "five, one, two; five, five, five; zero, one, four, two" in text
+            assert "five one two, five five five, zero one four two" in text
             assert "confirm this booking?" in text and not env.sent
             # Replacement itself grants no assent; the old proposal cannot win.
             old_confirm=await env.harness.run(env.sid,"confirm_action",{"proposal_id":original['proposal_id'],"confirmed":True},"old-confirm")

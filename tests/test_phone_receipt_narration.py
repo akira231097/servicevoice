@@ -14,11 +14,12 @@ INTAKE = {"service": "oil_change", "customer_name": "Alex Morgan", "vehicle": "2
 
 
 def decode_phone_span(span):
-    assert span.startswith("plus ")
+    """A North American readback omits the implied +1; anything else says "plus"."""
+    international = span.startswith("plus ")
     words = re.findall(r"[a-z]+", span.removeprefix("plus "))
     assert words and all(word in WORDS for word in words)
     assert not re.search(r"[0-9]", span)
-    return "+" + "".join(WORDS[word] for word in words)
+    return ("+" if international else "+1") + "".join(WORDS[word] for word in words)
 
 
 def callback_span(text):
@@ -32,13 +33,14 @@ def callback_span(text):
 def test_each_digit_round_trips_without_dropping_country_repeats_or_zeros(phone):
     rendered = spoken_phone(phone)
     assert decode_phone_span(rendered) == phone
-    assert len(re.findall(r"[a-z]+", rendered)) - 1 == len(phone) - 1
-    assert ", " in rendered
+    assert ";" not in rendered
     if phone.startswith("+1") and len(phone) == 12:
-        groups = rendered.removeprefix("plus ").split("; ")
-        assert [len(group.split(", ")) for group in groups] == [1, 3, 3, 4]
+        # Spoken the way people say a US number: no "plus one", three runs of digits.
+        assert not rendered.startswith("plus")
+        assert [len(group.split(" ")) for group in rendered.split(", ")] == [3, 3, 4]
     else:
-        assert ";" not in rendered  # Do not guess other countries' code/group lengths.
+        assert rendered.startswith("plus ") and "," not in rendered  # Do not guess other countries' groups.
+        assert len(re.findall(r"[a-z]+", rendered)) - 1 == len(phone) - 1
 
 
 @pytest.mark.parametrize("phone", [None, "15125550142", "++15125550142", "+1 5125550142", "+15125550142 ext 5",

@@ -76,7 +76,7 @@ def test_delayed_primary_releases_one_flushed_prefix_then_exact_answer_with_same
             release.set()
             result = await asyncio.wait_for(pending, 2)
             assert result.status_code == 200
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> Exact primary answer, complete."
+            assert speech(result.text) == PHRASES["moment"]+" <flush />Exact primary answer, complete."
             assert len({event["id"] for event in events(result.text) if "choices" in event}) == 1
             assert result.text.count("<flush />") == 1 and result.text.endswith(DONE.decode())
             row = gateway.latency_snapshot("call-a")[-1]
@@ -102,6 +102,70 @@ def test_fast_primary_wins_and_no_acknowledgment_is_released(tmp_path, monkeypat
             assert gateway.latency_snapshot("call-a")[-1]["backchannel"]["reason"] == "primary_ready"
             assert not gateway.active
         finally:await gateway.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["speaking", "brief_pause", "resumed", "quiet", "fast_answer", "read_race", "missing"])
+def test_phone_waiting_cues_follow_speaker_state_without_delaying_main(tmp_path, monkeypatch, case):
+    async def scenario():
+        release, checked, suppressed, emitted = (asyncio.Event() for _ in range(4))
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                await release.wait()
+                yield frame({"content": "Exact primary answer."})
+                yield frame(reason="stop")
+                yield DONE
+        app, gateway, _ = setup(tmp_path, lambda r: httpx.Response(200,
+            headers={"content-type": "text/event-stream"}, stream=Stream()))
+        enable(gateway, monkeypatch)
+        state = {"ticket": 1, "reason": "caller_speaking", "reads": 0}
+        if case == "brief_pause": state["reason"] = "caller_pause_too_short"
+        if case == "read_race": state["reason"] = "eligible"
+        if case == "missing": state["ticket"] = None
+        def status(*args):
+            state["reads"] += 1
+            if state["reads"] > 1: checked.set()
+            return state["ticket"], state["reason"]
+        gateway.waiting_cue_state = status
+        observe = gateway._backchannel_observation
+        def observation(timing, event, elapsed):
+            observe(timing, event, elapsed)
+            if event == "backchannel.suppressed": suppressed.set()
+            if event == "backchannel.emitted": emitted.set()
+        monkeypatch.setattr(gateway, "_backchannel_observation", observation)
+        if case == "read_race":
+            context = gateway._backchannel_context
+            reads = []
+            def racing_context(*args):
+                reads.append(1)
+                if len(reads) == 2:
+                    state["ticket"] = 2
+                    state["reason"] = "caller_speaking"
+                return context(*args)
+            monkeypatch.setattr(gateway, "_backchannel_context", racing_context)
+        pending = asyncio.create_task(post(app, request_body()))
+        try:
+            await asyncio.wait_for(checked.wait(), 3)
+            if case == "quiet": state["reason"] = "eligible"
+            if case == "resumed": state["ticket"] = 2
+            if case == "fast_answer": release.set()
+            await asyncio.wait_for((emitted if case == "quiet" else suppressed).wait(), 3)
+            release.set()
+            result = await asyncio.wait_for(pending, 2)
+            assert result.status_code == 200
+            assert "Exact primary answer." in speech(result.text)
+            assert ("<flush />" in result.text) is (case == "quiet")
+            row = gateway.latency_snapshot("call-a")[-1]
+            expected = {"speaking":"caller_speaking", "brief_pause":"caller_pause_too_short",
+                "resumed":"caller_resumed", "quiet":"emitted", "fast_answer":"primary_ready",
+                "read_race":"caller_resumed", "missing":"speaker_state_unavailable"}
+            assert row["backchannel"]["reason"] == expected[case]
+            if case != "quiet": assert gateway.backchannel_budget.receipt("call-a") is None
+            assert not gateway.active and not gateway.owners
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+            await gateway.close()
     asyncio.run(scenario())
 
 
@@ -178,7 +242,7 @@ def test_delayed_tool_prose_stays_discarded_and_exact_signature_authority_is_pre
             await asyncio.wait_for(cue.wait(), 2)
             release.set()
             result = await asyncio.wait_for(pending, 2)
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> "
+            assert speech(result.text) == PHRASES["moment"]+" <flush />"
             assert "PRIVATE" not in result.text and "Let me check" not in result.text and SIG not in result.text
             tools = issued(result.text)
             assert len(tools) == 1 and tools[0]["function"] == {"name": "get_appointment", "arguments": "{}"}
@@ -344,7 +408,7 @@ def test_cancelled_header_worker_retains_physical_lease_until_cleanup_really_fin
             previous = await asyncio.wait_for(old, 2)
             assert "OBSOLETE" not in previous.text and issued(previous.text) == []
             assert previous.text.count("<flush />") <= 1
-            assert speech(previous.text) in ("", PHRASES["moment"]+" <flush /> ")
+            assert speech(previous.text) in ("", PHRASES["moment"]+" <flush />")
             after_supersession = b"".join(body for superseded, body in offered if superseded)
             assert b"<flush />" not in after_supersession and b"OBSOLETE" not in after_supersession
             assert after_supersession.endswith(DONE)
@@ -420,7 +484,7 @@ def test_upstream_failure_after_offered_cue_never_becomes_a_false_success(tmp_pa
             release.set()
             result = await asyncio.wait_for(pending, 2)
             assert "generation_unavailable" in result.text and "PRIVATE" not in result.text
-            assert speech(result.text) == PHRASES["moment"]+" <flush /> "
+            assert speech(result.text) == PHRASES["moment"]+" <flush />"
             assert result.text.count("<flush />") == 1 and issued(result.text) == []
             assert DONE.decode() not in result.text and '"finish_reason":"stop"' not in result.text
             assert not gateway.active and not gateway.owners and not gateway.successors

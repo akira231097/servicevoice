@@ -23,10 +23,11 @@ from uuid import UUID, uuid5, NAMESPACE_URL
 
 import httpx
 
-from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evidence,
+from .live_eval_evidence import (DIMENSIONS, VERSION, EvidenceError, build_evidence, caller_id_offer,
     canonical, check, latency, missing_snapshot, read_snapshot, read_timings, readonly)
 from .observability import OFFICIAL_ENDPOINTS, TOOLS
 from .generation_observability import project_gateway_timings
+from .conversation_metrics import reply_lengths
 from .provider_logs import capture_provider_log_sync, safe_provider_capture, validate_trusted_hosts
 from .diagnostics import (REVIEW_DIAGNOSTICS_REVISION, read_review_diagnostics, component_coverage,
     turn_identifier, operation_identifier)
@@ -96,7 +97,14 @@ acknowledged or clarification was requested, use uncertain with incomplete_evide
 do not invent a definite caller intent or a definitive hallucination finding.
 booking_accuracy: compare caller intent/corrections, spoken details and reference
 with proposals, returned receipts and saved appointment. A clean saved record
-alone does not prove the assistant understood or described it correctly. If no
+alone does not prove the assistant understood or described it correctly. When the
+evidence item caller_id is present, the assistant had the phone network's caller
+ID (its name may instead come from a phone directory listing for the calling
+number), or for returning_customer the name and vehicle of this number's earlier
+booking. A name, vehicle or callback number that the assistant explicitly offered
+from it (for example "the number you're calling from" or "under ... again") and
+the caller then clearly accepted is caller-confirmed intake information; any
+other unsupported name, vehicle or number is still a mismatch. If no
 booking/change was requested or claimed and no appointment exists, not_applicable.
 confirmation_compliance: before EVERY committed booking/change/cancellation,
 require an assistant readback of the exact current proposal and explicit caller
@@ -123,7 +131,7 @@ Evaluate all languages by meaning. Never infer exact audio, pronunciation, ASR
 accuracy or what the caller actually heard from a stored transcript. This is an
 advisory text review, not a guarantee of zero hallucinations or verified consent.
 """
-JUDGE_PROMPT_REVISION = "2026-10-20-vehicle-grounding-1"
+JUDGE_PROMPT_REVISION = "2026-10-25-caller-id-4"
 JUDGE_PROMPT_SHA256 = hashlib.sha256(JUDGE_SYSTEM.encode("utf-8")).hexdigest()
 FIXED_REASONS = {
     "hallucination_free":"Assistant claims reviewed against dealership facts and recorded tool evidence.",
@@ -195,7 +203,7 @@ class Config:
                 or any(not 16 <= len(k) <= 512 or any(ord(c)<33 or ord(c)>126 for c in k) for k in (self.vapi_key,self.gemini_key,self.langsmith_key))
                 or str(UUID(self.workspace)) != self.workspace
                 or self.organization and str(UUID(self.organization)) != self.organization
-                or self.assistant_id and str(UUID(self.assistant_id)) != self.assistant_id
+                or self.assistant_id and (not 1 <= len(self.assistant_ids) <= 4 or any(str(UUID(v)) != v for v in self.assistant_ids))
                 or not 1 <= self.monthly_limit <= 1000 or not 1 <= self.lookback_hours <= 168
                 or not 10 <= self.poll_seconds <= 300 or not 250 <= self.latency_target_ms <= 10_000
                 or type(self.max_failures) is not int or not 1 <= self.max_failures <= 30
@@ -204,6 +212,10 @@ class Config:
                 or self.provider_log_hosts and not self.organization
                 or self.environment not in {"local","development","staging","production"}):
             raise ValueError("invalid_evaluation_configuration")
+
+    @property
+    def assistant_ids(self):
+        return tuple(dict.fromkeys(v.strip() for v in self.assistant_id.split(","))) if self.assistant_id else ()
 
 
 class Outbox:
@@ -601,6 +613,7 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
         "diagnostics":diagnostics,
         "gateway_generations":gateway_generations,
         "call_summary":call_summary,
+        "reply_length":reply_lengths(package["evidence"]),
         "latency_targets_ms":{"turn_average":config.latency_target_ms,"turn_p95":config.latency_target_ms*1.5,"server_answer_p95":answer_target},
         "evidence_index":index,
         "booking":{"scheduler_evidence_available":state["scheduler_evidence_available"],
@@ -621,14 +634,28 @@ def public_report(package,judgment,call,timings,config,*,diagnostics=None,semant
         own_rows=[r for r in timings if isinstance(r,dict) and r.get("call_key")==expected_key[:16]]
         trace=build_timeline(call,package,own_rows,diagnostics,call_key=expected_key,
             turn_ids={k:turn_identifier(call["id"],k) for k in range(1,MAX_TURNS+1)},operation_ids=operation_ids,provider=capture)
+        from .call_review_presentation import listening_summary
+        listening=listening_summary(diagnostics,expected_key)
+        if listening is not None:
+            checks["listening_cues_safe"]={"verdict":"uncertain",
+                "issue_code":"caller_audio_capture_required","evidence_refs":["listening_cues"],
+                "reason":"Dispatch and fetch do not prove intact caller speech or absence of audio overlap."}
+            report["needs_review"]=needs_review=True
         overview=build_overview(checks=checks,latency=metrics,timeline=trace,booking=report["booking"],call_summary=call_summary,
             evidence_index=index,duration_s=call_summary["duration_seconds"],needs_review=needs_review,slow_call=slow_call,
             ended_reason=call_summary["ended_reason"],targets=report["latency_targets_ms"],cost=call_cost(call),review_process=report["review_process"])
         started=call_started(call)
         report.update(overview)
+        if listening is not None:
+            report["listening_cues"]=listening
+            trace["listening"]=listening["timeline"]
         report["review_trace"]=trace
         report["0 Report (markdown)"]=markdown_report(overview,call_id=call["id"],
             started=datetime.fromtimestamp(started,timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if started is not None else None)
+        if listening is not None:
+            report["0 Report (markdown)"] += ("\n\n## Experimental listening cues\n\n"
+                + str(listening["dispatched"]) + " announcements accepted; " + str(listening["clip_fetches"])
+                + " clip fetches. Audible playback, preserved caller words and audio overlap still require a captured phone test.\n")
         report["diagnostics"]=condense_diagnostics(report["diagnostics"],expected_key)
         report["presentation_status"]="ready"
     except Exception as exc:
@@ -914,24 +941,24 @@ class Worker:
         self.outbox.set_setting("last_provider_attempt",self.clock())
         low=max(float(self.outbox.setting("capture_since")),float(self.outbox.setting("provider_watermark","0"))-3600)
         high=self.clock()
-        windows=[(low,high)];found={};requests=0
+        windows=[(assistant,low,high) for assistant in self.config.assistant_ids];found={};requests=0
         while windows:
-            start,end=windows.pop();requests+=1
+            assistant,start,end=windows.pop();requests+=1
             if requests>63:raise EvidenceError("provider_discovery_window_capacity")
             rows=request_json(self.client,"GET","https://api.vapi.ai/call",headers={"Authorization":"Bearer "+self.config.vapi_key},
-                params={"assistantId":self.config.assistant_id,"createdAtGe":utc(start),"createdAtLe":utc(end),"limit":20},limit=12*1024*1024)
+                params={"assistantId":assistant,"createdAtGe":utc(start),"createdAtLe":utc(end),"limit":20},limit=12*1024*1024)
             if not isinstance(rows,list) or len(rows)>20:raise EvidenceError("provider_discovery_invalid_list")
             # Ordering is not promised by Vapi. Partition full time windows rather
             # than assuming a truncated page contains the newest/oldest calls.
             if len(rows)==20:
                 if end-start<.001:raise EvidenceError("provider_discovery_timestamp_capacity")
-                mid=(start+end)/2;windows.extend([(start,mid),(mid,end)])
+                mid=(start+end)/2;windows.extend([(assistant,start,mid),(assistant,mid,end)])
                 continue
             for row in rows:
                 try:
                     cid=str(UUID(row["id"]));created=datetime.fromisoformat(row["createdAt"].replace("Z","+00:00")).timestamp()
                 except (ValueError,KeyError,TypeError):raise EvidenceError("provider_discovery_invalid_identity") from None
-                if row.get("assistantId")!=self.config.assistant_id or self.config.organization and row.get("orgId")!=self.config.organization or not start-.001<=created<=end+.001:
+                if row.get("assistantId")!=assistant or self.config.organization and row.get("orgId")!=self.config.organization or not start-.001<=created<=end+.001:
                     raise EvidenceError("provider_discovery_scope_mismatch")
                 found[cid]=created
         self.outbox.discover_provider_calls(list(found.items()))
@@ -956,7 +983,7 @@ class Worker:
                 headers={"Authorization":"Bearer "+self.config.vapi_key},limit=12*1024*1024)
             if (not isinstance(call,dict) or call.get("id")!=cid
                     or self.config.organization and call.get("orgId")!=self.config.organization
-                    or self.config.assistant_id and call.get("assistantId")!=self.config.assistant_id):
+                    or self.config.assistant_ids and call.get("assistantId") not in self.config.assistant_ids):
                 raise EvidenceError("provider_call_identity_mismatch")
             if call.get("status")!="ended":
                 self.outbox.mark_eligibility(cid,False)
@@ -985,6 +1012,10 @@ class Worker:
                     snapshot=missing_snapshot(call)
                 except (sqlite3.Error,OSError):snapshot=missing_snapshot(call)
                 if snapshot.get("source_available",True) and job["session_id"] and snapshot["session"]["id"]!=job["session_id"]:raise EvidenceError("session_binding_changed")
+                # Content-free events only: whether caller ID reached the assistant.
+                # Coverage is still read after judging, exactly as before.
+                try:snapshot["caller_id"]=caller_id_offer(read_review_diagnostics(self.config.source,cid,self.config.diagnostics_path))
+                except (ImportError,sqlite3.Error,OSError,ValueError,TypeError):snapshot["caller_id"]=None
                 tool_ids={}
                 package=build_evidence(call,snapshot,tool_ids=tool_ids)
                 operation_ids={ref:operation_identifier(snapshot["session"]["id"],tid) for ref,tid in tool_ids.items()} if snapshot.get("source_available",True) else {}
@@ -1023,7 +1054,7 @@ class Worker:
                     provider_capture=cached.get("provider_observations") if isinstance(cached.get("provider_observations"),dict) else capture_provider_log_sync(call,frozen_report=cached)
                 else:
                     provider_capture=capture_provider_log_sync(call,expected_call_id=cid,
-                        expected_org_id=self.config.organization,expected_assistant_id=self.config.assistant_id or None,
+                        expected_org_id=self.config.organization,expected_assistant_id=call.get("assistantId") if self.config.assistant_ids else None,
                         trusted_hosts=self.config.provider_log_hosts)
                 report=public_report(package,judgment,call,read_timings(timing_path,cid),self.config,
                     diagnostics=diagnostics,semantic_status=semantic_status,provider_capture=provider_capture,operation_ids=operation_ids)
