@@ -427,10 +427,12 @@ the count). Only a single listed person's first and last name are read; a
 business listing, several people or an unusable name are skipped, and addresses,
 ages and every other field are discarded. The key file is reread like the
 policy, so it can be installed or removed without a restart. Without it, or with
-`"directory": "off"` (the default), the directory is never called, and turning it
-off also stops directory names already found. The assistant asks the same name
-question; asked how it knows the name, it says the name is listed for this phone
-number in a phone directory.
+`"directory": "off"` (the default), the directory is never called; turning it off
+mid-call also withdraws a listed name that has not been offered yet. `shadow`
+makes the paid request too (within the cap), so coverage can be measured. The
+assistant asks the same name question; asked how it knows the name, it says the
+name is listed for this phone number in a phone directory. A directory's own
+capitalization (LaToya, DeShawn) is kept.
 
 In `personalize`, the phone assistant receives unverified caller-ID text after
 the policy hash. It replaces the existing name-and-number question with "Should
